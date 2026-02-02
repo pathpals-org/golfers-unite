@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+
+    <!-- App identity -->
+    <title>Golfers Unite</title>
+    <meta name="description" content="Golf-only banter, leagues, and friendly competition." />
+
+    <!-- Mobile-first -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
+    <!-- App-like behaviour on iOS -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+
+    <!-- Favicon (swap later) -->
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+
+    <!-- Tailwind CDN (INTENTIONAL: no PostCSS) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Tailwind config -->
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              emerald: {
+                600: "#059669",
+                500: "#10b981",
+              },
+            },
+          },
+        },
+      };
+    </script>
+  </head>
+
+  <body class="bg-slate-100 text-slate-900 antialiased">
+    <div id="root"></div>
+
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
