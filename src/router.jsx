@@ -13,21 +13,66 @@ import Profile from "./pages/Profile";
 import Rules from "./pages/Rules";
 import Majors from "./pages/Majors";
 
+// Auth pages
+import Login from "./pages/Login";
+import Signup from "./pages/Signup";
+
+// Guard
+import RequireAuth from "./auth/RequireAuth";
+
 const router = createBrowserRouter([
   {
     path: "/",
-    element: <App />, // App renders TopNav + Outlet + BottomTabs
+    element: <App />,
     children: [
-      // Feed-first
-      { index: true, element: <Feed /> },
+      // Auth (public)
+      { path: "login", element: <Login /> },
+      { path: "signup", element: <Signup /> },
 
-      // Core tabs
-      { path: "leagues", element: <League /> },
-      { path: "post", element: <SubmitRound /> },
-      { path: "friends", element: <FindGolfers /> },
-      { path: "profile", element: <Profile /> },
+      // Protected app (must be logged in)
+      {
+        index: true,
+        element: (
+          <RequireAuth>
+            <Feed />
+          </RequireAuth>
+        ),
+      },
 
-      // Secondary
+      {
+        path: "leagues",
+        element: (
+          <RequireAuth>
+            <League />
+          </RequireAuth>
+        ),
+      },
+      {
+        path: "post",
+        element: (
+          <RequireAuth>
+            <SubmitRound />
+          </RequireAuth>
+        ),
+      },
+      {
+        path: "friends",
+        element: (
+          <RequireAuth>
+            <FindGolfers />
+          </RequireAuth>
+        ),
+      },
+      {
+        path: "profile",
+        element: (
+          <RequireAuth>
+            <Profile />
+          </RequireAuth>
+        ),
+      },
+
+      // Secondary (public for now — safe)
       { path: "rules", element: <Rules /> },
       { path: "majors", element: <Majors /> },
 
@@ -39,10 +84,12 @@ const router = createBrowserRouter([
       // Kill marketplace
       { path: "marketplace", element: <Navigate to="/" replace /> },
 
-      // Fallback (optional but safe)
+      // Fallback
       { path: "*", element: <Navigate to="/" replace /> },
     ],
   },
 ]);
 
 export default router;
+
+

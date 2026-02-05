@@ -14,8 +14,15 @@ function isActivePath(pathname, to) {
   return pathname.startsWith(to);
 }
 
+function isAuthRoute(pathname) {
+  return pathname === "/login" || pathname === "/signup";
+}
+
 export default function BottomTabs() {
   const { pathname } = useLocation();
+
+  // Hide tabs on auth pages
+  if (isAuthRoute(pathname)) return null;
 
   return (
     <nav

@@ -1,5 +1,7 @@
 // src/components/nav/TopNav.jsx
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
+import { useAuth } from "../../auth/useAuth";
+import { signOut } from "../../auth/auth";
 
 const main = [
   { to: "/", label: "Feed" },
@@ -19,8 +21,26 @@ function isActivePath(to, pathname) {
   return pathname.startsWith(to);
 }
 
+function isAuthRoute(pathname) {
+  return pathname === "/login" || pathname === "/signup";
+}
+
 export default function TopNav() {
   const { pathname } = useLocation();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+
+  // Hide top nav on auth pages (cleaner auth UI)
+  if (isAuthRoute(pathname)) return null;
+
+  const handleLogout = async () => {
+    try {
+      await signOut();
+      navigate("/login", { replace: true });
+    } catch (e) {
+      console.error("Logout failed:", e);
+    }
+  };
 
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/92 backdrop-blur">
@@ -43,8 +63,9 @@ export default function TopNav() {
             </div>
           </div>
 
-          {/* Secondary (always visible) */}
+          {/* Right side actions */}
           <div className="flex items-center gap-2">
+            {/* Secondary links */}
             {secondary.map((l) => {
               const active = isActivePath(l.to, pathname);
               return (
@@ -63,13 +84,35 @@ export default function TopNav() {
                 </NavLink>
               );
             })}
+
+            {/* Auth button */}
+            {!user ? (
+              <NavLink
+                to="/login"
+                className="inline-flex items-center rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white ring-1 ring-slate-900 transition hover:opacity-95"
+              >
+                Log in
+              </NavLink>
+            ) : (
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="inline-flex items-center rounded-full bg-white px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+              >
+                Log out
+              </button>
+            )}
           </div>
         </div>
 
-        {/* Desktop main nav */}
+        {/* Desktop main nav (only useful when logged in) */}
         <div className="mt-3 hidden md:flex items-center gap-2">
           {main.map((l) => {
             const active = isActivePath(l.to, pathname);
+
+            // If logged out, don’t show the main protected nav buttons
+            if (!user) return null;
+
             return (
               <NavLink
                 key={l.to}
@@ -93,3 +136,5 @@ export default function TopNav() {
     </header>
   );
 }
+
+

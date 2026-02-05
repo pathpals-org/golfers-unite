@@ -5,15 +5,19 @@ import router from "./router";
 import "./index.css";
 
 import { seedIfNeeded } from "./utils/storage";
+import { AuthProvider } from "./auth/useAuth";
 
 // Bootstrap once (safe in dev + StrictMode)
 seedIfNeeded();
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <RouterProvider router={router} />
+    <AuthProvider>
+      <RouterProvider router={router} />
+    </AuthProvider>
   </React.StrictMode>
 );
+
 
 
 
