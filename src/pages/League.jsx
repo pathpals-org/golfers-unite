@@ -18,13 +18,8 @@ import {
 import { buildStandings } from "../utils/stats";
 
 const DEFAULT_POINTS_SYSTEM = {
-  // Placement table: places not listed = 0 points
   placementPoints: { 1: 3, 2: 2, 3: 0 },
-
-  // Optional “just for playing” point
   participation: { enabled: false, points: 1 },
-
-  // Optional bonuses (simple toggles)
   bonuses: {
     enabled: false,
     birdie: { enabled: false, points: 1 },
@@ -170,32 +165,20 @@ function mergePointsSystem(raw) {
   const base = DEFAULT_POINTS_SYSTEM;
   const ps = raw && typeof raw === "object" ? raw : {};
 
-  const placementPoints = normalizePlacement(
-    ps.placementPoints || base.placementPoints
-  );
+  const placementPoints = normalizePlacement(ps.placementPoints || base.placementPoints);
 
-  const participation =
-    ps.participation && typeof ps.participation === "object"
-      ? ps.participation
-      : {};
-  const bonuses =
-    ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
+  const participation = ps.participation && typeof ps.participation === "object" ? ps.participation : {};
+  const bonuses = ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
 
-  const birdie =
-    bonuses.birdie && typeof bonuses.birdie === "object" ? bonuses.birdie : {};
-  const eagle =
-    bonuses.eagle && typeof bonuses.eagle === "object" ? bonuses.eagle : {};
+  const birdie = bonuses.birdie && typeof bonuses.birdie === "object" ? bonuses.birdie : {};
+  const eagle = bonuses.eagle && typeof bonuses.eagle === "object" ? bonuses.eagle : {};
   const hio = bonuses.hio && typeof bonuses.hio === "object" ? bonuses.hio : {};
 
   return {
-    placementPoints: Object.keys(placementPoints).length
-      ? placementPoints
-      : base.placementPoints,
+    placementPoints: Object.keys(placementPoints).length ? placementPoints : base.placementPoints,
     participation: {
       enabled: Boolean(participation.enabled ?? base.participation.enabled),
-      points: Math.trunc(
-        safeNum(participation.points, base.participation.points)
-      ),
+      points: Math.trunc(safeNum(participation.points, base.participation.points)),
     },
     bonuses: {
       enabled: Boolean(bonuses.enabled ?? base.bonuses.enabled),
@@ -224,52 +207,16 @@ export default function League() {
   const [rounds, setRoundsState] = useState(() => getRounds([]));
 
   const [toast, setToast] = useState("");
-  const [showMore, setShowMore] = useState(false);
   const [showEndSeason, setShowEndSeason] = useState(false);
-  const [showPoints, setShowPoints] = useState(false);
 
   const pointsSystem = useMemo(() => {
     return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
   }, [league?.pointsSystem]);
 
-  // local UI state for editing points (we save on click)
-  const [pointsDraft, setPointsDraft] = useState(() => {
-    const ps = mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
-    return {
-      placementPoints: normalizePlacement(ps.placementPoints),
-      participationEnabled: Boolean(ps.participation.enabled),
-      participationPoints: safeNum(ps.participation.points, 1),
-
-      bonusesEnabled: Boolean(ps.bonuses.enabled),
-      birdieEnabled: Boolean(ps.bonuses.birdie.enabled),
-      birdiePoints: safeNum(ps.bonuses.birdie.points, 1),
-      eagleEnabled: Boolean(ps.bonuses.eagle.enabled),
-      eaglePoints: safeNum(ps.bonuses.eagle.points, 2),
-      hioEnabled: Boolean(ps.bonuses.hio.enabled),
-      hioPoints: safeNum(ps.bonuses.hio.points, 5),
-    };
-  });
-
   useEffect(() => {
     setLeagueState(getLeague(null));
     setUsersState(getUsers([]));
     setRoundsState(getRounds([]));
-
-    // refresh points draft when navigating back here
-    const ps = mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
-    setPointsDraft({
-      placementPoints: normalizePlacement(ps.placementPoints),
-      participationEnabled: Boolean(ps.participation.enabled),
-      participationPoints: safeNum(ps.participation.points, 1),
-
-      bonusesEnabled: Boolean(ps.bonuses.enabled),
-      birdieEnabled: Boolean(ps.bonuses.birdie.enabled),
-      birdiePoints: safeNum(ps.bonuses.birdie.points, 1),
-      eagleEnabled: Boolean(ps.bonuses.eagle.enabled),
-      eaglePoints: safeNum(ps.bonuses.eagle.points, 2),
-      hioEnabled: Boolean(ps.bonuses.hio.enabled),
-      hioPoints: safeNum(ps.bonuses.hio.points, 5),
-    });
   }, [location.pathname]);
 
   // Ensure league has a pointsSystem once we have a league (safe default)
@@ -295,8 +242,6 @@ export default function League() {
     if (!league) return [];
     const members = Array.isArray(league?.members) ? league.members : [];
     const memberUsers = users.filter((u) => members.includes(u.id || u._id));
-
-    // IMPORTANT: pass points rules so standings can recompute if needed
     return buildStandings(memberUsers, leagueRounds, pointsSystem);
   }, [league, users, leagueRounds, pointsSystem]);
 
@@ -395,113 +340,12 @@ export default function League() {
     setToast("Season ended — trophies awarded + standings archived 🏆");
   }
 
-  function applyPointsSettings() {
-    const placementPoints = normalizePlacement(pointsDraft.placementPoints);
-    const safePlacement =
-      Object.keys(placementPoints).length > 0
-        ? placementPoints
-        : DEFAULT_POINTS_SYSTEM.placementPoints;
-
-    const merged = mergePointsSystem({
-      placementPoints: safePlacement,
-      participation: {
-        enabled: Boolean(pointsDraft.participationEnabled),
-        points: Math.trunc(safeNum(pointsDraft.participationPoints, 1)),
-      },
-      bonuses: {
-        enabled: Boolean(pointsDraft.bonusesEnabled),
-        birdie: {
-          enabled: Boolean(pointsDraft.birdieEnabled),
-          points: Math.trunc(safeNum(pointsDraft.birdiePoints, 1)),
-        },
-        eagle: {
-          enabled: Boolean(pointsDraft.eagleEnabled),
-          points: Math.trunc(safeNum(pointsDraft.eaglePoints, 2)),
-        },
-        hio: {
-          enabled: Boolean(pointsDraft.hioEnabled),
-          points: Math.trunc(safeNum(pointsDraft.hioPoints, 5)),
-        },
-      },
-    });
-
-    // Persist to league.pointsSystem via storage helper
-    setPointsSystem(merged);
-
-    const nextLeague = { ...league, pointsSystem: merged };
-    setLeague(nextLeague);
-    setLeagueState(nextLeague);
-
-    setShowPoints(false);
-    setToast("Points system saved ✅");
-  }
-
-  function setPreset(preset) {
-    if (preset === "default") {
-      setPointsDraft((d) => ({
-        ...d,
-        placementPoints: normalizePlacement({ 1: 3, 2: 2, 3: 0 }),
-      }));
-      return;
-    }
-    if (preset === "yourLeague") {
-      setPointsDraft((d) => ({
-        ...d,
-        placementPoints: normalizePlacement({ 1: 3, 2: 1, 3: 0 }),
-      }));
-      return;
-    }
-    if (preset === "winnerOnly") {
-      setPointsDraft((d) => ({
-        ...d,
-        placementPoints: normalizePlacement({ 1: 3 }),
-      }));
-      return;
-    }
-  }
-
-  function updatePlacement(place, value) {
-    const p = Math.trunc(safeNum(place, NaN));
-    if (!Number.isFinite(p) || p <= 0) return;
-    const v = Math.trunc(safeNum(value, 0));
-    setPointsDraft((d) => ({
-      ...d,
-      placementPoints: { ...(d.placementPoints || {}), [p]: v },
-    }));
-  }
-
-  function removePlacement(place) {
-    const p = Math.trunc(safeNum(place, NaN));
-    if (!Number.isFinite(p) || p <= 0) return;
-    setPointsDraft((d) => {
-      const next = { ...(d.placementPoints || {}) };
-      delete next[p];
-      return { ...d, placementPoints: next };
-    });
-  }
-
-  function addPlacementRow() {
-    setPointsDraft((d) => {
-      const cur = normalizePlacement(d.placementPoints);
-      const existingPlaces = Object.keys(cur).map((k) => Number(k));
-      const nextPlace = existingPlaces.length ? Math.max(...existingPlaces) + 1 : 4;
-      return { ...d, placementPoints: { ...cur, [nextPlace]: 0 } };
-    });
-  }
-
   const seasonRange = formatSeasonRange(league.seasonStartISO);
   const week = getWeekNumber(league.seasonStartISO);
-
   const placementSummary = placementToLabel(pointsSystem?.placementPoints);
-
-  const placementRows = Object.keys(normalizePlacement(pointsDraft.placementPoints))
-    .map((k) => Number(k))
-    .filter((n) => Number.isFinite(n))
-    .sort((a, b) => a - b);
 
   return (
     <div className="space-y-4">
-      {/* Header card */}
       <Card>
         <div className="flex items-center gap-3">
           <Crest />
@@ -516,7 +360,6 @@ export default function League() {
               {seasonRange}
             </div>
 
-            {/* Points summary */}
             <div className="mt-2 text-xs font-semibold text-slate-500">
               Points:{" "}
               <span className="font-extrabold text-slate-700">{placementSummary}</span>
@@ -532,7 +375,6 @@ export default function League() {
               ) : null}
             </div>
 
-            {/* Discovery hint */}
             <div className="mt-1 text-[11px] font-semibold text-slate-500">
               League admins can edit points in{" "}
               <span className="font-extrabold text-slate-700">League Settings</span>.
@@ -557,7 +399,6 @@ export default function League() {
             + Submit Round
           </button>
 
-          {/* go to league scope */}
           <button
             onClick={() => navigate("/?scope=league")}
             className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
@@ -567,7 +408,7 @@ export default function League() {
           </button>
 
           <button
-            onClick={() => setShowMore(true)}
+            onClick={() => navigate("/league-settings")}
             className="ml-auto rounded-xl bg-white px-4 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
           >
             League Settings
@@ -575,7 +416,6 @@ export default function League() {
         </div>
       </Card>
 
-      {/* Table card */}
       <div className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
         <div className="border-b border-slate-200 bg-slate-50 px-4 py-2">
           <div className="grid grid-cols-[56px_1fr_44px_44px_44px_44px_70px] items-center gap-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
@@ -664,120 +504,6 @@ export default function League() {
         </div>
       </div>
 
-      {/* League Settings modal */}
-      <Modal open={showMore} title="League Settings" onClose={() => setShowMore(false)}>
-        <div className="space-y-3">
-          <button
-            onClick={() => {
-              setShowMore(false);
-              setShowPoints(true);
-            }}
-            className="w-full rounded-2xl bg-slate-100 px-4 py-3 text-left text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-          >
-            Points System
-            <div className="mt-1 text-xs font-semibold text-slate-600">
-              Configure how points are awarded in this league.
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setShowMore(false);
-              navigate("/rules");
-            }}
-            className="w-full rounded-2xl bg-slate-100 px-4 py-3 text-left text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-          >
-            Rules
-            <div className="mt-1 text-xs font-semibold text-slate-600">
-              Scoring, agreements, and how you play.
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setShowMore(false);
-              navigate("/majors");
-            }}
-            className="w-full rounded-2xl bg-slate-100 px-4 py-3 text-left text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-          >
-            Majors
-            <div className="mt-1 text-xs font-semibold text-slate-600">
-              Manage major days.
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setShowMore(false);
-              setShowEndSeason(true);
-            }}
-            className="w-full rounded-2xl bg-rose-600 px-4 py-3 text-left text-sm font-extrabold text-white hover:bg-rose-500"
-          >
-            End Season
-            <div className="mt-1 text-xs font-semibold text-white/90">
-              Archive standings + award trophies.
-            </div>
-          </button>
-        </div>
-      </Modal>
-
-      {/* Points modal */}
-      <Modal open={showPoints} title="Points System" onClose={() => setShowPoints(false)}>
-        {/* unchanged content below except label text on save */}
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-            <div className="font-extrabold text-slate-900">Quick presets:</div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => setPreset("default")}
-                className="rounded-xl bg-white px-3 py-2 text-xs font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
-                title="1st=3, 2nd=2, 3rd=0"
-              >
-                Default (3/2/0)
-              </button>
-              <button
-                type="button"
-                onClick={() => setPreset("yourLeague")}
-                className="rounded-xl bg-white px-3 py-2 text-xs font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
-                title="1st=3, 2nd=1, 3rd=0"
-              >
-                Your League (3/1/0)
-              </button>
-              <button
-                type="button"
-                onClick={() => setPreset("winnerOnly")}
-                className="rounded-xl bg-white px-3 py-2 text-xs font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
-                title="Winner only"
-              >
-                Winner only
-              </button>
-            </div>
-          </div>
-
-          {/* (rest of Points modal unchanged from your file) */}
-          {/* ... keep your existing Points modal code exactly as-is ... */}
-
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={applyPointsSettings}
-              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
-            >
-              Save points system
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowPoints(false)}
-              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      </Modal>
-
-      {/* End season modal */}
       <Modal open={showEndSeason} title="End season?" onClose={() => setShowEndSeason(false)}>
         <div className="space-y-4">
           <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">

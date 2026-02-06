@@ -12,84 +12,48 @@ import FindGolfers from "./pages/FindGolfers";
 import Profile from "./pages/Profile";
 import Rules from "./pages/Rules";
 import Majors from "./pages/Majors";
+import LeagueSettings from "./pages/LeagueSettings"; // ✅ ADD
 
-// Auth pages
+// Auth
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 
-// Guard
-import RequireAuth from "./auth/RequireAuth";
-
 const router = createBrowserRouter([
+  // Auth routes OUTSIDE the App layout (no TopNav/BottomTabs)
+  { path: "/login", element: <Login /> },
+  { path: "/signup", element: <Signup /> },
+
+  // Main app (with nav)
   {
     path: "/",
     element: <App />,
     children: [
-      // Auth (public)
-      { path: "login", element: <Login /> },
-      { path: "signup", element: <Signup /> },
+      { index: true, element: <Feed /> },
 
-      // Protected app (must be logged in)
-      {
-        index: true,
-        element: (
-          <RequireAuth>
-            <Feed />
-          </RequireAuth>
-        ),
-      },
+      { path: "leagues", element: <League /> },
+      { path: "league-settings", element: <LeagueSettings /> }, // ✅ ADD ROUTE
 
-      {
-        path: "leagues",
-        element: (
-          <RequireAuth>
-            <League />
-          </RequireAuth>
-        ),
-      },
-      {
-        path: "post",
-        element: (
-          <RequireAuth>
-            <SubmitRound />
-          </RequireAuth>
-        ),
-      },
-      {
-        path: "friends",
-        element: (
-          <RequireAuth>
-            <FindGolfers />
-          </RequireAuth>
-        ),
-      },
-      {
-        path: "profile",
-        element: (
-          <RequireAuth>
-            <Profile />
-          </RequireAuth>
-        ),
-      },
+      { path: "post", element: <SubmitRound /> },
+      { path: "friends", element: <FindGolfers /> },
+      { path: "profile", element: <Profile /> },
 
-      // Secondary (public for now — safe)
       { path: "rules", element: <Rules /> },
       { path: "majors", element: <Majors /> },
 
-      // Backward-compatible redirects
       { path: "league", element: <Navigate to="/leagues" replace /> },
       { path: "submit", element: <Navigate to="/post" replace /> },
       { path: "find", element: <Navigate to="/friends" replace /> },
 
-      // Kill marketplace
       { path: "marketplace", element: <Navigate to="/" replace /> },
 
-      // Fallback
       { path: "*", element: <Navigate to="/" replace /> },
     ],
   },
 ]);
 
 export default router;
+
+
+
 
 
