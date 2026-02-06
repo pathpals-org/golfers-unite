@@ -41,7 +41,6 @@ function toISODateInput(iso) {
 
 function fromISODateInput(dateStr) {
   if (!dateStr) return null;
-  // store as ISO string at midnight local-ish; good enough for MVP localStorage
   const d = new Date(dateStr + "T00:00:00");
   return d.toISOString();
 }
@@ -51,7 +50,7 @@ function getUserId(u) {
 }
 
 function getUserName(u) {
-  return u?.name || u?.fullName || u?.displayName || u?.username || "Golfer";
+  return u?.name || u?.fullName || u?.displayName || u?.username || u?.display_name || "Golfer";
 }
 
 function normalizePlacement(v) {
@@ -78,20 +77,14 @@ function roleLabel(role) {
   return "Member";
 }
 
-function normalizeEmail(v) {
-  return String(v || "").trim().toLowerCase();
-}
-
-function isValidEmail(v) {
-  const s = normalizeEmail(v);
-  // simple MVP-safe check
-  return s.length >= 5 && s.includes("@") && s.includes(".");
-}
-
 function humanizeSupabaseError(err) {
   const msg = err?.message || String(err || "");
   if (!msg) return "Something went wrong.";
   return msg;
+}
+
+function isUniqueViolation(err) {
+  return String(err?.code || "") === "23505";
 }
 
 export default function LeagueSettings() {
@@ -104,15 +97,22 @@ export default function LeagueSettings() {
   // ✅ Real auth user (Supabase)
   const [authUserId, setAuthUserId] = useState(null);
 
-  // Invite UI
-  const [inviteEmail, setInviteEmail] = useState("");
+  // Invite status UI
   const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
-  const [inviteLoading, setInviteLoading] = useState(false);
+
+  // Friends for invite list (Supabase source of truth)
+  const [friends, setFriends] = useState([]);
+  const [friendsLoading, setFriendsLoading] = useState(false);
+
+  // Pending invites UI
+  const [pendingInvites, setPendingInvites] = useState([]);
+  const [invitesLoading, setInvitesLoading] = useState(false);
+  const [inviteActionId, setInviteActionId] = useState(null); // for per-row loading
 
   // points system
   const pointsSystem = useMemo(() => getPointsSystem(null), [league?.pointsSystem]);
 
-  // points draft (edit then save)
+  // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
     const ps = getPointsSystem(null);
     return {
@@ -165,13 +165,126 @@ export default function LeagueSettings() {
     };
   }, []);
 
+  // ✅ Current user = auth user if possible, otherwise fallback to first cached user
+  const me = useMemo(() => {
+    if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
+    return users?.[0] || null;
+  }, [authUserId, users]);
+
+  const myId = authUserId || getUserId(me);
+  const myRole = getLeagueRole(myId);
+  const iAmAdmin = isLeagueAdmin(myId);
+
+  // If you’re not admin, you can still view, but editing is disabled
+  const canEdit = Boolean(iAmAdmin);
+
+  async function loadPendingInvites({ leagueId }) {
+    if (!leagueId) return;
+    if (!canEdit) {
+      setPendingInvites([]);
+      return;
+    }
+
+    setInvitesLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("league_invites")
+        .select(
+          `
+          id,
+          league_id,
+          inviter_user_id,
+          invitee_user_id,
+          status,
+          created_at,
+          responded_at,
+          invitee:profiles!league_invites_invitee_user_id_fkey (
+            id,
+            email,
+            display_name
+          )
+        `
+        )
+        .eq("league_id", leagueId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setPendingInvites(ensureArr(data));
+    } catch {
+      setPendingInvites([]);
+    } finally {
+      setInvitesLoading(false);
+    }
+  }
+
+  async function loadFriendsForInvites({ userId }) {
+    if (!userId) {
+      setFriends([]);
+      return;
+    }
+
+    setFriendsLoading(true);
+    try {
+      // friendships table assumed columns:
+      // user_low, user_high, status, requester_id, addressee_id
+      // friends are rows where status == 'accepted' and user is user_low or user_high
+      const { data: rows, error } = await supabase
+        .from("friendships")
+        .select("id,user_low,user_high,status")
+        .eq("status", "accepted")
+        .or(`user_low.eq.${userId},user_high.eq.${userId}`);
+
+      if (error) throw error;
+
+      const rels = ensureArr(rows);
+      const friendIds = rels
+        .map((r) => {
+          const low = r?.user_low || null;
+          const high = r?.user_high || null;
+          if (!low || !high) return null;
+          return low === userId ? high : low;
+        })
+        .filter(Boolean);
+
+      // Deduplicate
+      const uniq = Array.from(new Set(friendIds));
+
+      if (uniq.length === 0) {
+        setFriends([]);
+        return;
+      }
+
+      // Pull friend profiles for display
+      const { data: profs, error: profErr } = await supabase
+        .from("profiles")
+        .select("id,email,display_name")
+        .in("id", uniq);
+
+      if (profErr) throw profErr;
+
+      // Preserve stable ordering: alphabetical by display/email
+      const next = ensureArr(profs).sort((a, b) => {
+        const an = String(a?.display_name || a?.email || "").toLowerCase();
+        const bn = String(b?.display_name || b?.email || "").toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      setFriends(next);
+    } catch (e) {
+      setFriends([]);
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setFriendsLoading(false);
+    }
+  }
+
   // ✅ Keep local cache in sync on navigation
   useEffect(() => {
-    // resync on navigation
-    setLeagueState(getLeagueSafe({}));
+    const l = getLeagueSafe({});
+    setLeagueState(l);
     setUsersState(ensureArr(getUsers([])));
 
-    const l = getLeagueSafe({});
     setSeasonStart(toISODateInput(l?.seasonStartISO));
     setSeasonEnd(toISODateInput(l?.seasonEndISO));
 
@@ -190,17 +303,17 @@ export default function LeagueSettings() {
       hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
       hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
     });
-  }, [location.key]);
 
-  // ✅ Current user = auth user if possible, otherwise fallback to first cached user
-  const me = useMemo(() => {
-    if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
-    return users?.[0] || null;
-  }, [authUserId, users]);
+    if (l?.id) loadPendingInvites({ leagueId: l.id });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key, canEdit]);
 
-  const myId = authUserId || getUserId(me);
-  const myRole = getLeagueRole(myId);
-  const iAmAdmin = isLeagueAdmin(myId);
+  // load friends when we have auth user
+  useEffect(() => {
+    if (!myId) return;
+    loadFriendsForInvites({ userId: myId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myId]);
 
   if (!league?.id) {
     return (
@@ -221,9 +334,6 @@ export default function LeagueSettings() {
       </div>
     );
   }
-
-  // If you’re not admin, you can still view, but editing is disabled
-  const canEdit = Boolean(iAmAdmin);
 
   function setPreset(preset) {
     if (!canEdit) return;
@@ -333,83 +443,91 @@ export default function LeagueSettings() {
     if (!canEdit) return;
     if (!userId) return;
 
-    // Prevent demoting yourself if you're the only admin? We'll keep MVP simple here.
     setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
     setLeagueState(getLeagueSafe({}));
   }
 
-  async function inviteToLeague() {
+  async function sendInviteToFriend(friendProfile) {
     if (!canEdit) return;
-
-    const email = normalizeEmail(inviteEmail);
-    if (!isValidEmail(email)) {
-      setInviteStatus({ type: "error", message: "Enter a valid email address." });
+    if (!league?.id) return;
+    if (!myId) {
+      setInviteStatus({ type: "error", message: "You must be signed in to invite." });
       return;
     }
 
-    if (!league?.id) {
-      setInviteStatus({ type: "error", message: "No active league loaded." });
+    const inviteeUserId = friendProfile?.id || null;
+    if (!inviteeUserId) return;
+
+    // Already a member?
+    const memberSet = new Set(ensureArr(members));
+    if (memberSet.has(inviteeUserId)) {
+      setInviteStatus({ type: "info", message: "They’re already in this league." });
       return;
     }
 
-    setInviteLoading(true);
+    setInviteActionId(inviteeUserId);
     setInviteStatus({ type: "", message: "" });
 
     try {
-      // 1) Find profile by email
-      const { data: prof, error: profErr } = await supabase
-        .from("profiles")
-        .select("id,email,display_name")
-        .eq("email", email)
-        .maybeSingle();
-
-      if (profErr) throw profErr;
-
-      if (!prof?.id) {
-        setInviteStatus({
-          type: "info",
-          message: "That golfer hasn’t signed up yet. Ask them to create an account first, then invite again.",
-        });
-        setInviteLoading(false);
-        return;
-      }
-
-      const userId = prof.id;
-
-      // 2) Add as a member (idempotent-ish)
-      const { error: insErr } = await supabase.from("league_members").insert({
+      const { error: invErr } = await supabase.from("league_invites").insert({
         league_id: league.id,
-        user_id: userId,
-        role: "member",
+        inviter_user_id: myId,
+        invitee_user_id: inviteeUserId,
+        status: "pending",
       });
 
-      if (insErr) {
-        // unique violation -> already in league
-        if (String(insErr.code) === "23505") {
-          setInviteStatus({ type: "info", message: "They’re already in this league." });
-          setInviteLoading(false);
+      if (invErr) {
+        if (isUniqueViolation(invErr)) {
+          setInviteStatus({ type: "info", message: "Invite already pending for that golfer." });
           return;
         }
-        throw insErr;
+        throw invErr;
       }
 
-      // 3) Refresh local cache for UI
-      await syncActiveLeagueFromSupabase({ leagueId: league.id });
+      await loadPendingInvites({ leagueId: league.id });
 
-      // 4) Re-sync page state from cache
-      setLeagueState(getLeagueSafe({}));
-      setUsersState(ensureArr(getUsers([])));
-
-      setInviteEmail("");
-      setInviteStatus({ type: "success", message: "Invite added — they’re now in the league ✅" });
+      setInviteStatus({
+        type: "success",
+        message: "Invite sent ✅ They’ll see it in their invites and can accept to join.",
+      });
     } catch (e) {
       setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
     } finally {
-      setInviteLoading(false);
+      setInviteActionId(null);
+    }
+  }
+
+  async function cancelInvite(inviteId) {
+    if (!canEdit) return;
+    if (!inviteId) return;
+
+    try {
+      const { error } = await supabase.from("league_invites").delete().eq("id", inviteId);
+      if (error) throw error;
+
+      await loadPendingInvites({ leagueId: league.id });
+      setInviteStatus({ type: "info", message: "Invite cancelled." });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
     }
   }
 
   const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
+
+  const memberSet = useMemo(() => new Set(ensureArr(members)), [members]);
+  const pendingInviteeSet = useMemo(
+    () => new Set(ensureArr(pendingInvites).map((x) => x?.invitee_user_id).filter(Boolean)),
+    [pendingInvites]
+  );
+
+  const friendsNotInLeague = useMemo(() => {
+    return ensureArr(friends).filter((p) => {
+      const id = p?.id;
+      if (!id) return false;
+      if (memberSet.has(id)) return false;
+      return true;
+    });
+  }, [friends, memberSet]);
 
   return (
     <div className="space-y-6">
@@ -451,13 +569,13 @@ export default function LeagueSettings() {
         </div>
       </Card>
 
-      {/* ✅ Invite golfers */}
+      {/* ✅ Invite to league (locked flow: from Friends list) */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-sm font-extrabold text-slate-900">Invite golfers</div>
+            <div className="text-sm font-extrabold text-slate-900">Invite friends</div>
             <div className="mt-1 text-xs font-semibold text-slate-600">
-              Add your mates by email. They must have signed up first.
+              Host/co-host can invite accepted friends. They join only after they accept.
             </div>
           </div>
 
@@ -466,43 +584,160 @@ export default function LeagueSettings() {
           </span>
         </div>
 
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
-          <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Email</div>
-            <input
-              value={inviteEmail}
-              onChange={(e) => setInviteEmail(e.target.value)}
-              placeholder="friend@email.com"
-              inputMode="email"
-              disabled={!canEdit || inviteLoading}
+        <div className="mt-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Friends not in this league
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || friendsLoading}
+              onClick={() => loadFriendsForInvites({ userId: myId })}
               className={[
-                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                !canEdit || inviteLoading
-                  ? "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed"
-                  : "border-slate-200 bg-white text-slate-900",
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || friendsLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
               ].join(" ")}
-            />
+            >
+              {friendsLoading ? "Refreshing…" : "Refresh"}
+            </button>
           </div>
 
-          <button
-            type="button"
-            onClick={inviteToLeague}
-            disabled={!canEdit || inviteLoading || !isValidEmail(inviteEmail)}
-            className={[
-              "rounded-xl px-4 py-2 text-sm font-extrabold",
-              !canEdit || inviteLoading || !isValidEmail(inviteEmail)
-                ? "bg-slate-200 text-slate-500 cursor-not-allowed"
-                : "bg-slate-900 text-white hover:bg-slate-800",
-            ].join(" ")}
-          >
-            {inviteLoading ? "Inviting…" : "Invite"}
-          </button>
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can invite friends to the league.
+              </div>
+            ) : friendsLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading friends…</div>
+            ) : friendsNotInLeague.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">
+                No inviteable friends found (either none accepted yet, or they’re already in the league).
+              </div>
+            ) : (
+              friendsNotInLeague.map((p) => {
+                const pid = p?.id;
+                const name = p?.display_name || p?.email || "Friend";
+                const alreadyInvited = pendingInviteeSet.has(pid);
+                const busy = inviteActionId === pid;
+
+                return (
+                  <div
+                    key={pid}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
+                      <div className="mt-0.5 truncate text-xs font-semibold text-slate-600">
+                        {p?.email ? p.email : null}
+                      </div>
+                    </div>
+
+                    {alreadyInvited ? (
+                      <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+                        Invited
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => sendInviteToFriend(p)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold",
+                          busy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-slate-900 text-white hover:bg-slate-800",
+                        ].join(" ")}
+                      >
+                        {busy ? "Inviting…" : "Invite"}
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* Pending invites list */}
+        <div className="mt-6">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Pending invites
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || invitesLoading}
+              onClick={() => loadPendingInvites({ leagueId: league.id })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || invitesLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {invitesLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can view and manage league invites.
+              </div>
+            ) : invitesLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
+            ) : pendingInvites.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">No pending invites.</div>
+            ) : (
+              pendingInvites.map((inv) => {
+                const invitee = inv?.invitee || null;
+                const display =
+                  invitee?.display_name ||
+                  invitee?.email ||
+                  String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+
+                const created = inv?.created_at ? new Date(inv.created_at) : null;
+
+                return (
+                  <div
+                    key={inv.id}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
+                      <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                        Status: <span className="font-extrabold">Pending</span>
+                        {created ? (
+                          <>
+                            {" "}
+                            · Sent {created.toLocaleDateString()}{" "}
+                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => cancelInvite(inv.id)}
+                      className="rounded-xl bg-rose-600 px-3 py-2 text-xs font-extrabold text-white hover:bg-rose-500"
+                      title="Cancel invite"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </div>
         </div>
 
         {inviteStatus?.message ? (
           <div
             className={[
-              "mt-3 rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+              "mt-4 rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
               inviteStatus.type === "success"
                 ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
                 : inviteStatus.type === "info"
@@ -993,4 +1228,5 @@ export default function LeagueSettings() {
     </div>
   );
 }
+
 
