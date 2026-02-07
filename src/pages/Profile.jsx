@@ -6,18 +6,12 @@ import PageHeader from "../components/ui/PageHeader";
 import Card from "../components/ui/Card";
 import EmptyState from "../components/ui/EmptyState";
 
-import { getUsers, getRounds, getBadges, getTrophiesMap } from "../utils/storage";
+import { useAuth } from "../auth/useAuth";
+import { supabase } from "../lib/supabaseClient";
+import { getRounds, getBadges, getTrophiesMap } from "../utils/storage";
 
 function ensureArr(v) {
   return Array.isArray(v) ? v : [];
-}
-
-function getUserId(u) {
-  return u?.id || u?._id || null;
-}
-
-function getUserName(u) {
-  return u?.name || u?.fullName || u?.displayName || u?.username || "Golfer";
 }
 
 function sum(nums) {
@@ -37,25 +31,33 @@ function formatDateShort(iso) {
   }
 }
 
+function humanErr(e) {
+  return e?.message || String(e || "Something went wrong.");
+}
+
+function safeNum(v, fallback = null) {
+  if (v === null || v === undefined) return fallback;
+  const n = typeof v === "string" ? Number(v) : v;
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getUserNameFromProfile(p) {
+  return p?.display_name || p?.username || (p?.email ? p.email.split("@")[0] : "Golfer");
+}
+
 function Stat({ label, value }) {
   return (
     <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
-      <div className="text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
-        {label}
-      </div>
+      <div className="text-[11px] font-extrabold uppercase tracking-wide text-slate-500">{label}</div>
       <div className="mt-1 text-lg font-extrabold text-slate-900">{value}</div>
     </div>
   );
 }
 
-/**
- * Color system for awards (MVP-safe, based on award key/title)
- */
 function getAwardTone(award) {
   const key = String(award?.key || "").toLowerCase();
   const title = String(award?.title || "").toLowerCase();
 
-  // Birdie / pointsy badges
   if (key.includes("birdie") || title.includes("birdie")) {
     return {
       bg: "bg-emerald-50",
@@ -71,7 +73,6 @@ function getAwardTone(award) {
     };
   }
 
-  // Eagle trophy
   if (key.includes("eagle") || title.includes("eagle")) {
     return {
       bg: "bg-amber-50",
@@ -87,7 +88,6 @@ function getAwardTone(award) {
     };
   }
 
-  // Hole in one
   if (key.includes("hole_in_one") || key.includes("hio") || title.includes("hole in one")) {
     return {
       bg: "bg-violet-50",
@@ -103,7 +103,6 @@ function getAwardTone(award) {
     };
   }
 
-  // Majors
   if (key.includes("major") || title.includes("major")) {
     return {
       bg: "bg-sky-50",
@@ -119,7 +118,6 @@ function getAwardTone(award) {
     };
   }
 
-  // Break 80 / elite
   if (key.includes("break_80") || title.includes("break 80")) {
     return {
       bg: "bg-fuchsia-50",
@@ -135,7 +133,6 @@ function getAwardTone(award) {
     };
   }
 
-  // Default
   return {
     bg: "bg-slate-50",
     ring: "ring-slate-200",
@@ -150,32 +147,15 @@ function getAwardTone(award) {
   };
 }
 
-/**
- * New: Achievement tile (replaces the plain AwardChip list feel)
- */
 function AchievementTile({ award, kind = "award" }) {
   const tone = getAwardTone(award);
   const icon = award?.icon || (kind === "trophy" ? "🏆" : "🏅");
 
   return (
-    <div
-      className={[
-        "relative overflow-hidden rounded-2xl p-4 ring-1 shadow-sm",
-        tone.bg,
-        tone.ring,
-      ].join(" ")}
-    >
-      {/* subtle highlight */}
+    <div className={["relative overflow-hidden rounded-2xl p-4 ring-1 shadow-sm", tone.bg, tone.ring].join(" ")}>
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/60 to-transparent" />
-
       <div className="flex items-start gap-3">
-        <div
-          className={[
-            "grid h-11 w-11 place-items-center rounded-2xl shadow-sm ring-1 ring-white/40",
-            tone.iconBg,
-            tone.iconText,
-          ].join(" ")}
-        >
+        <div className={["grid h-11 w-11 place-items-center rounded-2xl shadow-sm ring-1 ring-white/40", tone.iconBg, tone.iconText].join(" ")}>
           <span className="text-xl">{icon}</span>
         </div>
 
@@ -185,23 +165,12 @@ function AchievementTile({ award, kind = "award" }) {
               {award?.title || (kind === "trophy" ? "Trophy" : "Badge")}
             </div>
 
-            <span
-              className={[
-                "rounded-full px-2 py-1 text-[10px] font-extrabold uppercase tracking-wide ring-1",
-                tone.tagBg,
-                tone.tagText,
-                tone.tagRing,
-              ].join(" ")}
-            >
+            <span className={["rounded-full px-2 py-1 text-[10px] font-extrabold uppercase tracking-wide ring-1", tone.tagBg, tone.tagText, tone.tagRing].join(" ")}>
               {kind === "trophy" ? "Trophy" : "Badge"} · {tone.tag}
             </span>
           </div>
 
-          {award?.desc ? (
-            <div className={["mt-1 text-xs font-semibold", tone.sub].join(" ")}>
-              {award.desc}
-            </div>
-          ) : null}
+          {award?.desc ? <div className={["mt-1 text-xs font-semibold", tone.sub].join(" ")}>{award.desc}</div> : null}
 
           {award?.earnedAt ? (
             <div className="mt-2 text-[11px] font-semibold text-slate-500">
@@ -218,33 +187,30 @@ export default function Profile() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const [users, setUsers] = useState(() => ensureArr(getUsers([])));
+  const { user, profile, loading } = useAuth();
+
   const [rounds, setRounds] = useState(() => ensureArr(getRounds([])));
   const [badgesMap, setBadgesMap] = useState(() => getBadges({}));
   const [trophiesMap, setTrophiesMapState] = useState(() => getTrophiesMap());
 
-  // MVP assumption: current user = first user
-  const me = users?.[0] || null;
-  const myId = getUserId(me);
+  const [editing, setEditing] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [draftHandicap, setDraftHandicap] = useState("");
+  const [saveLoading, setSaveLoading] = useState(false);
+  const [status, setStatus] = useState({ type: "", message: "" });
 
-  function resync() {
-    setUsers(ensureArr(getUsers([])));
+  function resyncLocal() {
     setRounds(ensureArr(getRounds([])));
     setBadgesMap(getBadges({}));
     setTrophiesMapState(getTrophiesMap());
   }
 
   useEffect(() => {
-    resync();
+    resyncLocal();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
 
-  useEffect(() => {
-    const onFocus = () => resync();
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const myId = user?.id || null;
 
   const myRounds = useMemo(() => {
     if (!myId) return [];
@@ -263,31 +229,17 @@ export default function Profile() {
     return Array.isArray(list) ? list : [];
   }, [trophiesMap, myId]);
 
-  // Sort awards newest-first (helps cabinet feel real)
   const myTrophiesSorted = useMemo(() => {
-    return [...myTrophies].sort((a, b) => {
-      const ta = new Date(a?.earnedAt || 0).getTime();
-      const tb = new Date(b?.earnedAt || 0).getTime();
-      return tb - ta;
-    });
+    return [...myTrophies].sort((a, b) => new Date(b?.earnedAt || 0).getTime() - new Date(a?.earnedAt || 0).getTime());
   }, [myTrophies]);
 
   const myBadgesSorted = useMemo(() => {
-    return [...myBadges].sort((a, b) => {
-      const ta = new Date(a?.earnedAt || 0).getTime();
-      const tb = new Date(b?.earnedAt || 0).getTime();
-      return tb - ta;
-    });
+    return [...myBadges].sort((a, b) => new Date(b?.earnedAt || 0).getTime() - new Date(a?.earnedAt || 0).getTime());
   }, [myBadges]);
 
   const stats = useMemo(() => {
-    const grossScores = myRounds
-      .map((r) => Number(r?.grossScore))
-      .filter((n) => Number.isFinite(n));
-
-    const points = myRounds
-      .map((r) => Number(r?.points))
-      .filter((n) => Number.isFinite(n));
+    const grossScores = myRounds.map((r) => Number(r?.grossScore)).filter((n) => Number.isFinite(n));
+    const points = myRounds.map((r) => Number(r?.points)).filter((n) => Number.isFinite(n));
 
     const birdies = sum(myRounds.map((r) => r?.birdies));
     const eagles = sum(myRounds.map((r) => r?.eagles));
@@ -297,40 +249,68 @@ export default function Profile() {
     const best = grossScores.length ? Math.min(...grossScores) : null;
     const totalPoints = points.length ? sum(points) : 0;
 
-    const lastRound = myRounds[0] || null; // newest-first (addRound prepends)
-    return {
-      rounds: myRounds.length,
-      totalPoints,
-      birdies,
-      eagles,
-      hio,
-      majors,
-      best,
-      lastRound,
-    };
+    const lastRound = myRounds[0] || null;
+    return { rounds: myRounds.length, totalPoints, birdies, eagles, hio, majors, best, lastRound };
   }, [myRounds]);
 
-  const handicap =
-    me?.handicap ??
-    me?.hcp ??
-    me?.index ??
-    me?.handicapIndex ??
-    null;
+  const handicap = profile?.handicap_index ?? profile?.handicap ?? null;
 
-  if (!me) {
+  async function saveProfile() {
+    if (!myId) return;
+
+    const nextName = String(draftName || "").trim();
+    const nextHandicapRaw = String(draftHandicap || "").trim();
+    const nextHandicap = nextHandicapRaw === "" ? null : safeNum(nextHandicapRaw, null);
+
+    if (!nextName) {
+      setStatus({ type: "error", message: "Display name can’t be empty." });
+      return;
+    }
+
+    setSaveLoading(true);
+    setStatus({ type: "", message: "" });
+
+    try {
+      const payload = { display_name: nextName };
+      if (nextHandicap !== null) payload.handicap_index = nextHandicap;
+
+      const { error } = await supabase.from("profiles").update(payload).eq("id", myId);
+      if (error) throw error;
+
+      setEditing(false);
+      setStatus({ type: "success", message: "Profile updated ✅" });
+    } catch (e) {
+      setStatus({ type: "error", message: humanErr(e) });
+    } finally {
+      setSaveLoading(false);
+    }
+  }
+
+  if (loading) {
     return (
       <div className="space-y-4">
-        <PageHeader title="Profile" subtitle="Set up a golfer to see your stats." />
+        <PageHeader title="Profile" subtitle="Career cabinet, stats, and play history." />
+        <Card className="p-5">
+          <div className="text-sm font-semibold text-slate-600">Loading profile…</div>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="space-y-4">
+        <PageHeader title="Profile" subtitle="Career cabinet, stats, and play history." />
         <EmptyState
-          icon="🙂"
-          title="No golfer found"
-          description="Your seed/users list is empty. Add a user in localStorage or seed data."
+          icon="🔒"
+          title="Not logged in"
+          description="Please log in to view and edit your profile."
           actions={
             <button
-              onClick={() => navigate("/leagues")}
+              onClick={() => navigate("/login")}
               className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
             >
-              Go to League
+              Go to Login
             </button>
           }
         />
@@ -346,6 +326,13 @@ export default function Profile() {
         right={
           <button
             type="button"
+            onClick={() => {
+              setDraftName(profile?.display_name || profile?.username || "");
+              const h = profile?.handicap_index ?? profile?.handicap ?? "";
+              setDraftHandicap(h === null || h === undefined ? "" : String(h));
+              setStatus({ type: "", message: "" });
+              setEditing(true);
+            }}
             className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
           >
             Edit Profile
@@ -353,7 +340,21 @@ export default function Profile() {
         }
       />
 
-      {/* Profile card */}
+      {status?.message ? (
+        <Card className="p-4">
+          <div
+            className={[
+              "rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+              status.type === "success"
+                ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
+                : "bg-rose-50 text-rose-900 ring-rose-200",
+            ].join(" ")}
+          >
+            {status.message}
+          </div>
+        </Card>
+      ) : null}
+
       <Card className="p-5">
         <div className="flex items-center gap-4">
           <div className="grid h-14 w-14 place-items-center rounded-2xl bg-slate-50 text-2xl ring-1 ring-slate-200">
@@ -362,93 +363,29 @@ export default function Profile() {
 
           <div className="min-w-0 flex-1">
             <div className="truncate text-base font-extrabold text-slate-900">
-              {getUserName(me)}
+              {getUserNameFromProfile(profile)}
             </div>
             <div className="mt-0.5 text-xs font-semibold text-slate-600">
               Handicap:{" "}
               <span className="font-extrabold text-slate-900">
-                {handicap === null || handicap === undefined || handicap === ""
-                  ? "—"
-                  : handicap}
+                handicap === null || handicap === undefined || handicap === "" ? "—" : handicap
               </span>
             </div>
+            <div className="mt-0.5 text-[11px] font-semibold text-slate-500">{user?.email || ""}</div>
           </div>
 
           <div className="rounded-2xl bg-slate-50 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
             {stats.rounds} rounds
           </div>
         </div>
-
-        {stats.lastRound ? (
-          <div className="mt-4 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Last round
-            </div>
-            <div className="mt-1 flex flex-wrap items-center gap-3">
-              <div className="text-lg font-extrabold text-slate-900">
-                {stats.lastRound.grossScore ?? "--"}
-              </div>
-              <div className="text-sm font-extrabold text-emerald-700">
-                +{stats.lastRound.points ?? 0} pts
-              </div>
-              <div className="text-sm font-extrabold text-slate-700">
-                {stats.lastRound.course || "Course"}
-              </div>
-              <div className="text-xs font-semibold text-slate-500">
-                {stats.lastRound.date || ""}
-              </div>
-            </div>
-          </div>
-        ) : null}
       </Card>
-
-      {/* Career stats */}
-      {stats.rounds === 0 ? (
-        <EmptyState
-          icon="📊"
-          title="No rounds yet"
-          description="Submit your first round and your stats will appear here."
-          actions={
-            <button
-              onClick={() => navigate("/post")}
-              className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-extrabold text-white hover:bg-emerald-500"
-            >
-              Submit a round
-            </button>
-          }
-        />
-      ) : (
-        <Card className="p-5">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-extrabold text-slate-900">Career stats</div>
-              <div className="mt-0.5 text-xs font-semibold text-slate-600">
-                Quick snapshot from your submitted rounds.
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
-            <Stat label="Total points" value={stats.totalPoints} />
-            <Stat label="Best score" value={stats.best ?? "—"} />
-            <Stat label="Majors" value={stats.majors} />
-            <Stat label="Birdies" value={stats.birdies} />
-            <Stat label="Eagles" value={stats.eagles} />
-            <Stat label="HIO" value={stats.hio} />
-          </div>
-        </Card>
-      )}
 
       {/* Awards */}
       <Card className="p-5">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-extrabold text-slate-900">
-              Trophy cabinet & badge wall
-            </div>
-            <div className="mt-0.5 text-xs font-semibold text-slate-600">
-              Earned from submitted rounds.
-            </div>
+            <div className="text-sm font-extrabold text-slate-900">Trophy cabinet & badge wall</div>
+            <div className="mt-0.5 text-xs font-semibold text-slate-600">Earned from submitted rounds.</div>
           </div>
 
           <div className="rounded-2xl bg-slate-50 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
@@ -474,37 +411,23 @@ export default function Profile() {
           </div>
         ) : (
           <div className="mt-4 space-y-5">
-            {/* TROPHIES */}
             {myTrophiesSorted.length ? (
               <div>
-                <div className="mb-2 text-xs font-extrabold uppercase tracking-wide text-slate-500">
-                  Trophies
-                </div>
+                <div className="mb-2 text-xs font-extrabold uppercase tracking-wide text-slate-500">Trophies</div>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   {myTrophiesSorted.map((t) => (
-                    <AchievementTile
-                      key={t.key || t.id || `${t.title}-${t.earnedAt}`}
-                      award={t}
-                      kind="trophy"
-                    />
+                    <AchievementTile key={t.key || t.id || `${t.title}-${t.earnedAt}`} award={t} kind="trophy" />
                   ))}
                 </div>
               </div>
             ) : null}
 
-            {/* BADGES */}
             {myBadgesSorted.length ? (
               <div>
-                <div className="mb-2 text-xs font-extrabold uppercase tracking-wide text-slate-500">
-                  Badges
-                </div>
+                <div className="mb-2 text-xs font-extrabold uppercase tracking-wide text-slate-500">Badges</div>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   {myBadgesSorted.map((b) => (
-                    <AchievementTile
-                      key={b.key || b.id || `${b.title}-${b.earnedAt}`}
-                      award={b}
-                      kind="badge"
-                    />
+                    <AchievementTile key={b.key || b.id || `${b.title}-${b.earnedAt}`} award={b} kind="badge" />
                   ))}
                 </div>
               </div>
@@ -512,8 +435,67 @@ export default function Profile() {
           </div>
         )}
       </Card>
+
+      {/* Edit modal */}
+      {editing ? (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-3xl bg-white p-5 shadow-xl ring-1 ring-slate-200">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-extrabold text-slate-900">Edit profile</div>
+                <div className="mt-1 text-xs font-semibold text-slate-600">This edits your Supabase profile.</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-900 hover:bg-slate-200"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <div>
+                <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Display name</div>
+                <input
+                  value={draftName}
+                  onChange={(e) => setDraftName(e.target.value)}
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-extrabold text-slate-900 outline-none ring-emerald-200 focus:ring-4"
+                />
+              </div>
+
+              <div>
+                <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Handicap (optional)</div>
+                <input
+                  value={draftHandicap}
+                  onChange={(e) => setDraftHandicap(e.target.value)}
+                  inputMode="decimal"
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-extrabold text-slate-900 outline-none ring-emerald-200 focus:ring-4"
+                />
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditing(false)}
+                  disabled={saveLoading}
+                  className="w-full rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200 disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={saveProfile}
+                  disabled={saveLoading}
+                  className="w-full rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800 disabled:opacity-60"
+                >
+                  {saveLoading ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
-
-

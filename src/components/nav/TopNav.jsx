@@ -28,7 +28,7 @@ function isAuthRoute(pathname) {
 export default function TopNav() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
 
   // Hide top nav on auth pages (cleaner auth UI)
   if (isAuthRoute(pathname)) return null;
@@ -36,7 +36,18 @@ export default function TopNav() {
   const handleLogout = async () => {
     try {
       await signOut();
+
+      // Replace so you can’t “Back” into protected pages
       navigate("/login", { replace: true });
+
+      // Hard refresh to kill any stale cached state in memory
+      setTimeout(() => {
+        try {
+          window.location.reload();
+        } catch {
+          // ignore
+        }
+      }, 50);
     } catch (e) {
       console.error("Logout failed:", e);
     }
@@ -65,7 +76,6 @@ export default function TopNav() {
 
           {/* Right side actions */}
           <div className="flex items-center gap-2">
-            {/* Secondary links */}
             {secondary.map((l) => {
               const active = isActivePath(l.to, pathname);
               return (
@@ -85,7 +95,6 @@ export default function TopNav() {
               );
             })}
 
-            {/* Auth button */}
             {!user ? (
               <NavLink
                 to="/login"
@@ -97,7 +106,13 @@ export default function TopNav() {
               <button
                 type="button"
                 onClick={handleLogout}
-                className="inline-flex items-center rounded-full bg-white px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+                disabled={loading}
+                className={[
+                  "inline-flex items-center rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
+                  loading
+                    ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
+                    : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
+                ].join(" ")}
               >
                 Log out
               </button>
@@ -109,8 +124,6 @@ export default function TopNav() {
         <div className="mt-3 hidden md:flex items-center gap-2">
           {main.map((l) => {
             const active = isActivePath(l.to, pathname);
-
-            // If logged out, don’t show the main protected nav buttons
             if (!user) return null;
 
             return (
@@ -131,10 +144,11 @@ export default function TopNav() {
         </div>
       </div>
 
-      {/* subtle bottom highlight line */}
       <div className="pointer-events-none h-px w-full bg-gradient-to-r from-transparent via-slate-200 to-transparent" />
     </header>
   );
 }
+
+
 
 

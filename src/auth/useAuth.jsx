@@ -1,24 +1,30 @@
 // src/auth/useAuth.jsx
-import React, {
-  createContext,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
 const AuthContext = createContext(null);
 
+function withTimeout(promise, ms, label = "Request") {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
 async function fetchMyProfile(userId) {
   if (!userId) return null;
 
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, username, display_name, avatar_url, created_at, updated_at")
-    .eq("id", userId)
-    .single();
+  // ✅ Never allow profile fetch to hang forever
+  const { data, error } = await withTimeout(
+    supabase
+      .from("profiles")
+      .select("id, username, display_name, avatar_url, handicap_index, created_at, updated_at")
+      .eq("id", userId)
+      .maybeSingle(),
+    8000,
+    "Load profile"
+  );
 
   // RLS block or missing row = null (never block UI)
   if (error) return null;
@@ -30,7 +36,7 @@ function isInvalidRefreshTokenError(err) {
   return (
     msg.includes("invalid refresh token") ||
     msg.includes("refresh token not found") ||
-    msg.includes("invalid token") // extra safety for auth edge cases
+    msg.includes("invalid token")
   );
 }
 
@@ -40,9 +46,8 @@ function clearSupabaseAuthStorageKeys() {
     const keys = Object.keys(localStorage);
     keys.forEach((k) => {
       // Supabase v2 stores tokens under sb-<project-ref>-auth-token
-      if (k.startsWith("sb-") && k.includes("-auth-token")) {
-        localStorage.removeItem(k);
-      }
+      if (k.startsWith("sb-") && k.includes("-auth-token")) localStorage.removeItem(k);
+
       // Extra safety (some setups)
       if (k.toLowerCase().includes("supabase") && k.toLowerCase().includes("auth")) {
         localStorage.removeItem(k);
@@ -75,15 +80,14 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     mountedRef.current = true;
 
-    // Safety: never allow infinite loading
+    // ✅ Safety: never allow infinite loading
     const watchdog = setTimeout(() => {
       if (mountedRef.current) setLoading(false);
-    }, 4000);
+    }, 4500);
 
     const safeClearSession = async (reason) => {
       try {
         console.warn("Clearing auth session:", reason);
-        // Try to properly sign out (clears stored session in most cases)
         await supabase.auth.signOut();
       } catch (e) {
         console.warn("supabase.auth.signOut failed, doing local cleanup:", e);
@@ -100,14 +104,20 @@ export function AuthProvider({ children }) {
       setLoading(true);
 
       try {
-        const { data, error } = await supabase.auth.getSession();
+        /**
+         * ✅ Use getSession() first (LOCAL)
+         * This does NOT require a network request, so it won’t hang behind blockers.
+         */
+        const { data, error } = await withTimeout(
+          supabase.auth.getSession(),
+          3000,
+          "Auth session"
+        );
 
         if (!mountedRef.current) return;
 
         if (error) {
           console.error("supabase.auth.getSession error:", error);
-
-          // ✅ Key fix: stale refresh token → purge it so the app recovers on reload
           if (isInvalidRefreshTokenError(error)) {
             await safeClearSession("Invalid refresh token during getSession()");
           } else {
@@ -131,13 +141,12 @@ export function AuthProvider({ children }) {
         }
       } catch (e) {
         console.error("Auth bootstrap error:", e);
-
         if (!mountedRef.current) return;
 
-        // Also handle stale refresh token if it bubbles as a thrown error
         if (isInvalidRefreshTokenError(e)) {
           await safeClearSession("Invalid refresh token thrown during bootstrap");
         } else {
+          // If session read times out, fail open (no user), don’t hang the app
           setSession(null);
           setUser(null);
           setProfile(null);
@@ -149,38 +158,35 @@ export function AuthProvider({ children }) {
 
     bootstrap();
 
-    const { data: sub } = supabase.auth.onAuthStateChange(
-      async (_event, newSession) => {
+    const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
+      if (!mountedRef.current) return;
+
+      // ✅ Don’t keep the whole app in “loading” during events.
+      // Just update state quickly; profile fetch is still protected by timeout.
+      setSession(newSession ?? null);
+      setUser(newSession?.user ?? null);
+
+      try {
+        if (newSession?.user?.id) {
+          const p = await fetchMyProfile(newSession.user.id);
+          if (!mountedRef.current) return;
+          setProfile(p);
+        } else {
+          setProfile(null);
+        }
+      } catch (e) {
+        console.error("Profile refresh after auth change failed:", e);
         if (!mountedRef.current) return;
 
-        try {
-          setLoading(true);
-
-          setSession(newSession ?? null);
-          setUser(newSession?.user ?? null);
-
-          if (newSession?.user?.id) {
-            const p = await fetchMyProfile(newSession.user.id);
-            if (!mountedRef.current) return;
-            setProfile(p);
-          } else {
-            setProfile(null);
-          }
-        } catch (e) {
-          console.error("onAuthStateChange error:", e);
-          if (!mountedRef.current) return;
-
-          // If auth events fail due to token issues, clear cleanly
-          if (isInvalidRefreshTokenError(e)) {
-            await safeClearSession("Invalid refresh token during onAuthStateChange");
-          } else {
-            setProfile(null);
-          }
-        } finally {
-          if (mountedRef.current) setLoading(false);
+        if (isInvalidRefreshTokenError(e)) {
+          await safeClearSession("Invalid refresh token during onAuthStateChange");
+        } else {
+          setProfile(null);
         }
+      } finally {
+        if (mountedRef.current) setLoading(false);
       }
-    );
+    });
 
     return () => {
       mountedRef.current = false;
@@ -208,6 +214,4 @@ export function useAuth() {
   if (!ctx) throw new Error("useAuth must be used inside <AuthProvider />");
   return ctx;
 }
-
-
 
