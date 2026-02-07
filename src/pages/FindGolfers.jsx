@@ -75,12 +75,7 @@ export default function FindGolfers() {
     setStatus({ type: "", message: "" });
 
     try {
-      // ✅ getSession is reliable + fast; wrap in timeout so we never hang forever
-      const sessionRes = await withTimeout(
-        supabase.auth.getSession(),
-        8000,
-        "Auth session"
-      );
+      const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, "Auth session");
 
       const uid = sessionRes?.data?.session?.user?.id || null;
       setAuthId(uid);
@@ -93,13 +88,8 @@ export default function FindGolfers() {
         return;
       }
 
-      // My profile
       const meRes = await withTimeout(
-        supabase
-          .from("profiles")
-          .select("id,email,display_name,created_at")
-          .eq("id", uid)
-          .maybeSingle(),
+        supabase.from("profiles").select("id,email,display_name,created_at").eq("id", uid).maybeSingle(),
         8000,
         "Load profile"
       );
@@ -107,7 +97,6 @@ export default function FindGolfers() {
       if (meRes.error) throw meRes.error;
       setMeProfile(meRes.data || null);
 
-      // Friendships
       const frRes = await withTimeout(
         supabase
           .from("friendships")
@@ -123,7 +112,6 @@ export default function FindGolfers() {
       const rows = ensureArr(frRes.data);
       setFriendships(rows);
 
-      // Other profiles
       const ids = Array.from(new Set(rows.map((r) => otherId(r)).filter(Boolean)));
 
       if (!ids.length) {
@@ -132,10 +120,7 @@ export default function FindGolfers() {
       }
 
       const profRes = await withTimeout(
-        supabase
-          .from("profiles")
-          .select("id,email,display_name,created_at")
-          .in("id", ids),
+        supabase.from("profiles").select("id,email,display_name,created_at").in("id", ids),
         8000,
         "Load friend profiles"
       );
@@ -181,11 +166,7 @@ export default function FindGolfers() {
 
     try {
       const profRes = await withTimeout(
-        supabase
-          .from("profiles")
-          .select("id,email,display_name")
-          .eq("email", targetEmail)
-          .maybeSingle(),
+        supabase.from("profiles").select("id,email,display_name").eq("email", targetEmail).maybeSingle(),
         8000,
         "Find profile by email"
       );
@@ -244,11 +225,7 @@ export default function FindGolfers() {
 
     try {
       const upRes = await withTimeout(
-        supabase
-          .from("friendships")
-          .update({ status: "accepted" })
-          .eq("id", rowId)
-          .eq("addressee_id", authId),
+        supabase.from("friendships").update({ status: "accepted" }).eq("id", rowId).eq("addressee_id", authId),
         8000,
         "Accept request"
       );
@@ -307,9 +284,7 @@ export default function FindGolfers() {
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-white">Add a friend</div>
-            <div className="mt-1 text-xs font-semibold text-slate-300">
-              They must already have an account.
-            </div>
+            <div className="mt-1 text-xs font-semibold text-slate-300">They must already have an account.</div>
           </div>
 
           {meProfile?.email ? (
@@ -321,16 +296,18 @@ export default function FindGolfers() {
 
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-300">
-              Email
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-300">Email</div>
             <input
+              type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="mate@email.com"
               inputMode="email"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               disabled={actionLoading}
-              className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-extrabold text-white outline-none ring-emerald-200 focus:ring-4"
+              className="mt-2 w-full rounded-xl border border-white/10 bg-slate-950/40 px-3 py-2 text-sm font-extrabold text-white caret-white placeholder:text-slate-400 outline-none ring-emerald-200 focus:ring-4"
             />
           </div>
 
@@ -364,6 +341,7 @@ export default function FindGolfers() {
         ) : null}
       </Card>
 
+      {/* rest of your file unchanged */}
       <Card className="p-5 space-y-3">
         <div className="text-sm font-extrabold text-white">Incoming requests</div>
 
@@ -381,12 +359,8 @@ export default function FindGolfers() {
                   className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-white">
-                      {shortName(other)}
-                    </div>
-                    <div className="truncate text-xs font-semibold text-slate-300">
-                      {other?.email || "—"}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-white">{shortName(other)}</div>
+                    <div className="truncate text-xs font-semibold text-slate-300">{other?.email || "—"}</div>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -430,12 +404,8 @@ export default function FindGolfers() {
                   className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-white">
-                      {shortName(other)}
-                    </div>
-                    <div className="truncate text-xs font-semibold text-slate-300">
-                      {other?.email || "—"}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-white">{shortName(other)}</div>
+                    <div className="truncate text-xs font-semibold text-slate-300">{other?.email || "—"}</div>
                   </div>
 
                   <button
@@ -459,11 +429,7 @@ export default function FindGolfers() {
         {loading ? (
           <div className="text-sm font-semibold text-slate-300">Loading…</div>
         ) : friends.length === 0 ? (
-          <EmptyState
-            icon="👥"
-            title="No friends yet"
-            description="Add your mates by email to start a proper league circle."
-          />
+          <EmptyState icon="👥" title="No friends yet" description="Add your mates by email to start a proper league circle." />
         ) : (
           <div className="space-y-2">
             {friends.map((r) => {
@@ -474,12 +440,8 @@ export default function FindGolfers() {
                   className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-white">
-                      {shortName(other)}
-                    </div>
-                    <div className="truncate text-xs font-semibold text-slate-300">
-                      {other?.email || "—"}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-white">{shortName(other)}</div>
+                    <div className="truncate text-xs font-semibold text-slate-300">{other?.email || "—"}</div>
                   </div>
 
                   <button
@@ -499,5 +461,6 @@ export default function FindGolfers() {
     </div>
   );
 }
+
 
 
