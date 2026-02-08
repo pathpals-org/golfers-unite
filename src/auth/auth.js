@@ -40,47 +40,88 @@ function clearIdentityCaches() {
   }
 }
 
+function normEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+function normUsername(v) {
+  return String(v || "").trim();
+}
+
+/**
+ * Signup flow:
+ * 1) Create auth user
+ * 2) Create/Upsert matching profiles row (so friends search works)
+ *
+ * IMPORTANT:
+ * - We store email in profiles because your Friends page searches profiles.email
+ * - We use upsert to avoid “retry creates duplicate” failures
+ */
 export async function signUp({ email, password, username }) {
+  const cleanEmail = normEmail(email);
+  const cleanUsername = normUsername(username);
+
+  // Basic client-side safety (don’t rely on this for security)
+  if (!cleanEmail.includes("@")) throw new Error("Please enter a valid email.");
+  if (!password || String(password).length < 6) {
+    throw new Error("Password must be at least 6 characters.");
+  }
+  if (!cleanUsername) throw new Error("Please enter a username.");
+
   const { data, error } = await supabase.auth.signUp({
-    email,
+    email: cleanEmail,
     password,
   });
 
-  if (error) throw error;
+  if (error) {
+    // Throw the REAL supabase message so the UI can show it (no more guessing)
+    throw error;
+  }
 
-  const user = data.user;
-  if (!user) throw new Error("No user returned from signUp");
+  const user = data?.user ?? null;
+  if (!user?.id) throw new Error("No user returned from signUp");
 
-  const { error: profileError } = await supabase.from("profiles").insert({
-    id: user.id,
-    username,
-    display_name: username,
-  });
+  // ✅ Make sure profiles row exists and has email
+  const { error: profileError } = await supabase
+    .from("profiles")
+    .upsert(
+      {
+        id: user.id,
+        email: user.email ?? cleanEmail,
+        username: cleanUsername,
+        display_name: cleanUsername,
+      },
+      { onConflict: "id" }
+    );
 
-  if (profileError) throw profileError;
+  if (profileError) {
+    // If this fails, you’ll see the real DB error in the UI/console
+    throw profileError;
+  }
 
   return user;
 }
 
 export async function signIn({ email, password }) {
+  const cleanEmail = normEmail(email);
+
   const { data, error } = await supabase.auth.signInWithPassword({
-    email,
+    email: cleanEmail,
     password,
   });
 
   if (error) throw error;
-  return data.user;
+  return data?.user ?? null;
 }
 
 export async function signOut() {
-  // Always try “proper” sign-out first
   try {
     await supabase.auth.signOut();
   } catch {
     // ignore
   } finally {
-    // Then hard-clear any leftover tokens/cached identity
     clearSupabaseAuthStorageKeys();
     clearIdentityCaches();
   }
 }
+
