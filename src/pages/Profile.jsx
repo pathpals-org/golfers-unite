@@ -41,14 +41,26 @@ function safeNum(v, fallback = null) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function getUserNameFromProfile(p) {
-  return p?.display_name || p?.username || (p?.email ? p.email.split("@")[0] : "Golfer");
+function emailPrefix(email) {
+  return email ? String(email).split("@")[0] : "";
+}
+
+function displayNameFrom(p, email) {
+  // Supabase-first, never show "Golfer" if we can help it
+  return (
+    p?.display_name ||
+    p?.username ||
+    emailPrefix(email) ||
+    "Golfer"
+  );
 }
 
 function Stat({ label, value }) {
   return (
     <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
-      <div className="text-[11px] font-extrabold uppercase tracking-wide text-slate-500">{label}</div>
+      <div className="text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
+        {label}
+      </div>
       <div className="mt-1 text-lg font-extrabold text-slate-900">{value}</div>
     </div>
   );
@@ -187,11 +199,15 @@ export default function Profile() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const { user, profile, loading } = useAuth();
+  const { user, profile, loading, refreshProfile } = useAuth();
 
   const [rounds, setRounds] = useState(() => ensureArr(getRounds([])));
   const [badgesMap, setBadgesMap] = useState(() => getBadges({}));
   const [trophiesMap, setTrophiesMapState] = useState(() => getTrophiesMap());
+
+  // ✅ Supabase-first profile state (fixes “falls back to email”)
+  const [liveProfile, setLiveProfile] = useState(profile || null);
+  const [profileLoading, setProfileLoading] = useState(false);
 
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState("");
@@ -211,6 +227,33 @@ export default function Profile() {
   }, [location.key]);
 
   const myId = user?.id || null;
+
+  // keep liveProfile in sync when auth context profile changes
+  useEffect(() => {
+    if (profile) setLiveProfile(profile);
+  }, [profile]);
+
+  async function fetchLiveProfile() {
+    if (!myId) return;
+    setProfileLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("id, username, display_name, handicap_index")
+        .eq("id", myId)
+        .maybeSingle();
+
+      if (!error && data) setLiveProfile(data);
+    } finally {
+      setProfileLoading(false);
+    }
+  }
+
+  // Supabase-first fetch on entry / user change
+  useEffect(() => {
+    fetchLiveProfile();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myId]);
 
   const myRounds = useMemo(() => {
     if (!myId) return [];
@@ -253,7 +296,16 @@ export default function Profile() {
     return { rounds: myRounds.length, totalPoints, birdies, eagles, hio, majors, best, lastRound };
   }, [myRounds]);
 
-  const handicap = profile?.handicap_index ?? profile?.handicap ?? null;
+  const handicap =
+    liveProfile?.handicap_index ??
+    profile?.handicap_index ??
+    profile?.handicap ??
+    null;
+
+  const handicapLabel =
+    handicap === null || handicap === undefined || handicap === ""
+      ? "—"
+      : String(handicap);
 
   async function saveProfile() {
     if (!myId) return;
@@ -271,11 +323,18 @@ export default function Profile() {
     setStatus({ type: "", message: "" });
 
     try {
-      const payload = { display_name: nextName };
-      if (nextHandicap !== null) payload.handicap_index = nextHandicap;
+      const payload = {
+        id: myId,
+        display_name: nextName,
+        handicap_index: nextHandicap,
+      };
 
-      const { error } = await supabase.from("profiles").update(payload).eq("id", myId);
+      const { error } = await supabase.from("profiles").upsert(payload, { onConflict: "id" });
       if (error) throw error;
+
+      // ✅ hard refresh both sources so UI sticks instantly
+      await fetchLiveProfile();
+      await refreshProfile(myId);
 
       setEditing(false);
       setStatus({ type: "success", message: "Profile updated ✅" });
@@ -327,8 +386,9 @@ export default function Profile() {
           <button
             type="button"
             onClick={() => {
-              setDraftName(profile?.display_name || profile?.username || "");
-              const h = profile?.handicap_index ?? profile?.handicap ?? "";
+              const p = liveProfile || profile || {};
+              setDraftName(p?.display_name || p?.username || emailPrefix(user?.email));
+              const h = p?.handicap_index ?? "";
               setDraftHandicap(h === null || h === undefined ? "" : String(h));
               setStatus({ type: "", message: "" });
               setEditing(true);
@@ -363,20 +423,30 @@ export default function Profile() {
 
           <div className="min-w-0 flex-1">
             <div className="truncate text-base font-extrabold text-slate-900">
-              {getUserNameFromProfile(profile)}
+              {displayNameFrom(liveProfile || profile, user?.email)}
             </div>
+
             <div className="mt-0.5 text-xs font-semibold text-slate-600">
               Handicap:{" "}
-              <span className="font-extrabold text-slate-900">
-                handicap === null || handicap === undefined || handicap === "" ? "—" : handicap
-              </span>
+              <span className="font-extrabold text-slate-900">{handicapLabel}</span>
             </div>
-            <div className="mt-0.5 text-[11px] font-semibold text-slate-500">{user?.email || ""}</div>
+
+            <div className="mt-0.5 text-[11px] font-semibold text-slate-500">
+              {user?.email || ""}
+              {profileLoading ? <span className="ml-2 text-slate-400">· syncing…</span> : null}
+            </div>
           </div>
 
           <div className="rounded-2xl bg-slate-50 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
             {stats.rounds} rounds
           </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <Stat label="Points" value={stats.totalPoints} />
+          <Stat label="Birdies" value={stats.birdies} />
+          <Stat label="Eagles" value={stats.eagles} />
+          <Stat label="Majors" value={stats.majors} />
         </div>
       </Card>
 
@@ -499,3 +569,6 @@ export default function Profile() {
     </div>
   );
 }
+
+
+

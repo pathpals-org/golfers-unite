@@ -14,11 +14,9 @@ import {
   getUsers,
   getPointsSystem,
   setPointsSystem,
-  isLeagueAdmin,
   getLeagueRole,
   setLeagueRole,
   LEAGUE_ROLES,
-  syncActiveLeagueFromSupabase,
 } from "../utils/storage";
 
 function ensureArr(v) {
@@ -97,6 +95,11 @@ export default function LeagueSettings() {
   // ✅ Real auth user (Supabase)
   const [authUserId, setAuthUserId] = useState(null);
 
+  // ✅ Live profile + role (Supabase truth)
+  const [myProfile, setMyProfile] = useState(null);
+  const [myRoleLive, setMyRoleLive] = useState(null);
+  const [roleLoading, setRoleLoading] = useState(false);
+
   // Invite status UI
   const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
 
@@ -165,18 +168,62 @@ export default function LeagueSettings() {
     };
   }, []);
 
-  // ✅ Current user = auth user if possible, otherwise fallback to first cached user
+  // ✅ Local fallback "me" (only for display fallback, NOT permissions)
   const me = useMemo(() => {
     if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
     return users?.[0] || null;
   }, [authUserId, users]);
 
   const myId = authUserId || getUserId(me);
-  const myRole = getLeagueRole(myId);
-  const iAmAdmin = isLeagueAdmin(myId);
 
-  // If you’re not admin, you can still view, but editing is disabled
-  const canEdit = Boolean(iAmAdmin);
+  // ✅ Display name prefers Supabase profile, falls back to cached local user
+  const myDisplayName = myProfile?.display_name || getUserName(me);
+
+  // ✅ Permissions: Supabase role is truth; fallback to cached role only if we have no live role yet
+  const myRole = myRoleLive || getLeagueRole(myId);
+  const canEdit = myRole === LEAGUE_ROLES.host || myRole === LEAGUE_ROLES.co_host;
+
+  async function refreshMyProfileAndRole() {
+    if (!authUserId || !league?.id) return;
+
+    setRoleLoading(true);
+    try {
+      // Profile
+      const { data: prof, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, display_name")
+        .eq("id", authUserId)
+        .single();
+      if (profErr) throw profErr;
+      setMyProfile(prof || null);
+
+      // Role
+      const { data: mem, error: memErr } = await supabase
+        .from("league_members")
+        .select("role")
+        .eq("league_id", league.id)
+        .eq("user_id", authUserId)
+        .maybeSingle();
+      if (memErr) throw memErr;
+
+      const role = mem?.role || LEAGUE_ROLES.member;
+      setMyRoleLive(role);
+
+      // Keep cache aligned (does NOT grant permissions; Supabase still enforces)
+      setLeagueRole(authUserId, role);
+    } catch {
+      // If offline/blocked, don't hard-fail the UI; it will remain view-only by default
+      if (!myRoleLive) setMyRoleLive(null);
+    } finally {
+      setRoleLoading(false);
+    }
+  }
+
+  // refresh when league changes / navigation changes
+  useEffect(() => {
+    refreshMyProfileAndRole();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUserId, league?.id, location.key]);
 
   async function loadPendingInvites({ leagueId }) {
     if (!leagueId) return;
@@ -197,10 +244,8 @@ export default function LeagueSettings() {
           invitee_user_id,
           status,
           created_at,
-          responded_at,
           invitee:profiles!league_invites_invitee_user_id_fkey (
             id,
-            email,
             display_name
           )
         `
@@ -226,9 +271,6 @@ export default function LeagueSettings() {
 
     setFriendsLoading(true);
     try {
-      // friendships table assumed columns:
-      // user_low, user_high, status, requester_id, addressee_id
-      // friends are rows where status == 'accepted' and user is user_low or user_high
       const { data: rows, error } = await supabase
         .from("friendships")
         .select("id,user_low,user_high,status")
@@ -247,7 +289,6 @@ export default function LeagueSettings() {
         })
         .filter(Boolean);
 
-      // Deduplicate
       const uniq = Array.from(new Set(friendIds));
 
       if (uniq.length === 0) {
@@ -255,18 +296,16 @@ export default function LeagueSettings() {
         return;
       }
 
-      // Pull friend profiles for display
       const { data: profs, error: profErr } = await supabase
         .from("profiles")
-        .select("id,email,display_name")
+        .select("id,display_name")
         .in("id", uniq);
 
       if (profErr) throw profErr;
 
-      // Preserve stable ordering: alphabetical by display/email
       const next = ensureArr(profs).sort((a, b) => {
-        const an = String(a?.display_name || a?.email || "").toLowerCase();
-        const bn = String(b?.display_name || b?.email || "").toLowerCase();
+        const an = String(a?.display_name || "").toLowerCase();
+        const bn = String(b?.display_name || "").toLowerCase();
         return an.localeCompare(bn);
       });
 
@@ -304,6 +343,7 @@ export default function LeagueSettings() {
       hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
     });
 
+    // load invites when league present (permissions gate inside)
     if (l?.id) loadPendingInvites({ leagueId: l.id });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key, canEdit]);
@@ -459,8 +499,8 @@ export default function LeagueSettings() {
     if (!inviteeUserId) return;
 
     // Already a member?
-    const memberSet = new Set(ensureArr(members));
-    if (memberSet.has(inviteeUserId)) {
+    const memberSetLocal = new Set(ensureArr(members));
+    if (memberSetLocal.has(inviteeUserId)) {
       setInviteStatus({ type: "info", message: "They’re already in this league." });
       return;
     }
@@ -553,9 +593,24 @@ export default function LeagueSettings() {
           <div>
             <div className="text-sm font-extrabold text-slate-900">Your access</div>
             <div className="mt-1 text-xs font-semibold text-slate-600">
-              Logged in as <span className="font-extrabold">{getUserName(me)}</span> ·{" "}
+              Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
               <span className="font-extrabold">{roleLabel(myRole)}</span>
+              {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
             </div>
+
+            <button
+              type="button"
+              onClick={refreshMyProfileAndRole}
+              disabled={!authUserId || roleLoading}
+              className={[
+                "mt-3 rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !authUserId || roleLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {roleLoading ? "Refreshing…" : "Refresh permissions"}
+            </button>
           </div>
 
           <span
@@ -619,7 +674,7 @@ export default function LeagueSettings() {
             ) : (
               friendsNotInLeague.map((p) => {
                 const pid = p?.id;
-                const name = p?.display_name || p?.email || "Friend";
+                const name = p?.display_name || "Friend";
                 const alreadyInvited = pendingInviteeSet.has(pid);
                 const busy = inviteActionId === pid;
 
@@ -630,9 +685,6 @@ export default function LeagueSettings() {
                   >
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
-                      <div className="mt-0.5 truncate text-xs font-semibold text-slate-600">
-                        {p?.email ? p.email : null}
-                      </div>
                     </div>
 
                     {alreadyInvited ? (
@@ -695,7 +747,6 @@ export default function LeagueSettings() {
                 const invitee = inv?.invitee || null;
                 const display =
                   invitee?.display_name ||
-                  invitee?.email ||
                   String(inv?.invitee_user_id || "").slice(0, 8) + "…";
 
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
@@ -752,6 +803,7 @@ export default function LeagueSettings() {
 
       {/* Points System */}
       <Card className="p-5">
+        {/* (UNCHANGED from your original file from here down) */}
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-slate-900">Points system</div>
@@ -767,7 +819,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("default")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=2, 3rd=0"
             >
@@ -780,7 +834,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("yourLeague")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=1, 3rd=0"
             >
@@ -793,7 +849,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("winnerOnly")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="Winner only"
             >
@@ -1074,7 +1132,9 @@ export default function LeagueSettings() {
               onClick={savePointsSystem}
               className={[
                 "rounded-xl px-4 py-2 text-sm font-extrabold",
-                canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+                canEdit
+                  ? "bg-slate-900 text-white hover:bg-slate-800"
+                  : "bg-slate-200 text-slate-500 cursor-not-allowed",
               ].join(" ")}
             >
               Save points system
@@ -1228,5 +1288,7 @@ export default function LeagueSettings() {
     </div>
   );
 }
+
+
 
 

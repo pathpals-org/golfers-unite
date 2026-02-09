@@ -1,10 +1,17 @@
 // src/pages/Feed.jsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, Link, useLocation } from "react-router-dom";
-import { KEYS, get, set, getLeague, getUsers } from "../utils/storage";
+import { KEYS, get, set, getLeague } from "../utils/storage";
+import { supabase } from "../lib/supabaseClient";
+import { useAuth } from "../auth/useAuth";
 
 import Card from "../components/ui/Card";
 import EmptyState from "../components/ui/EmptyState";
+
+const FEED_POSTS = "feed_posts";
+const FEED_LIKES = "feed_post_likes";
+const FEED_COMMENTS = "feed_post_comments";
+const PROFILES_TABLE = "profiles";
 
 function ensureArr(v) {
   return Array.isArray(v) ? v : [];
@@ -44,7 +51,25 @@ function getUserById(users, userId) {
 
 function getAuthorName(users, userId) {
   const u = getUserById(users, userId);
-  return u?.name || "Golfer";
+  return u?.display_name || u?.username || u?.name || "Golfer";
+}
+
+function formatSupabaseError(e) {
+  const msg =
+    e?.message ||
+    e?.error_description ||
+    (typeof e === "string" ? e : "") ||
+    "Unknown error";
+  const code = e?.code ? ` [${e.code}]` : "";
+  const details = e?.details ? ` • ${e.details}` : "";
+  const hint = e?.hint ? ` • ${e.hint}` : "";
+  return `${msg}${code}${details}${hint}`.trim();
+}
+
+function isAbortError(e) {
+  const name = String(e?.name || "");
+  const msg = String(e?.message || "");
+  return name === "AbortError" || msg.toLowerCase().includes("aborted");
 }
 
 function Pill({ active, onClick, children }) {
@@ -171,6 +196,7 @@ function PostCard({
   const authorUser = getUserById(users, post.userId);
 
   const handicap =
+    authorUser?.handicap_index ??
     authorUser?.handicap ??
     authorUser?.hcp ??
     authorUser?.index ??
@@ -178,8 +204,7 @@ function PostCard({
     null;
 
   const showHcp = handicap !== null && handicap !== undefined && handicap !== "";
-
-  const liked = post.likes?.includes(meId);
+  const liked = (post.likes || []).includes(meId);
   const likeCount = post.likes?.length || 0;
   const commentCount = post.comments?.length || 0;
 
@@ -226,7 +251,7 @@ function PostCard({
         <div className="mt-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <ActionChip onClick={() => onLike(post.id)}>
-              <span className={liked ? "" : ""}>👍</span>
+              <span>👍</span>
               <span>{likeCount}</span>
             </ActionChip>
 
@@ -283,21 +308,25 @@ function PostCard({
   );
 }
 
+function cacheKeyForUser(userId) {
+  return `${KEYS.playPosts}::${userId || "anon"}`;
+}
+
 export default function Feed() {
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
 
-  const [users] = useState(() => getUsers([]));
-  const [league] = useState(() => getLeague(null));
+  const { user, profile } = useAuth();
+  const meId = user?.id || "anon";
 
-  const me = users?.[0];
-  const meId = me?.id || me?._id || "demo-user";
+  const [league] = useState(() => getLeague(null));
 
   const initialScope = (() => {
     const s = (searchParams.get("scope") || "public").toLowerCase();
     if (s === "friends" || s === "league" || s === "public") return s;
     return "public";
   })();
+
   const [scope, setScopeState] = useState(initialScope);
 
   function setScope(next) {
@@ -313,27 +342,159 @@ export default function Feed() {
   const [toFriends, setToFriends] = useState(false);
   const [toLeague, setToLeague] = useState(false);
 
-  const [posts, setPosts] = useState(() => ensureArr(get(KEYS.playPosts, [])));
-
+  const [posts, setPosts] = useState(() =>
+    ensureArr(get(cacheKeyForUser(meId), []))
+  );
+  const [users, setUsers] = useState(() => (profile ? [profile] : []));
   const [openComments, setOpenComments] = useState(() => ({}));
 
-  function resyncPosts() {
-    setPosts(ensureArr(get(KEYS.playPosts, [])));
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [debugErr, setDebugErr] = useState("");
+
+  const lastFetchRef = useRef(0);
+
+  function writeCache(nextPosts) {
+    set(cacheKeyForUser(meId), ensureArr(nextPosts));
+  }
+
+  async function loadFeedSupabase() {
+    setDebugErr("");
+
+    if (!user?.id) {
+      setNotice("");
+      setPosts(ensureArr(get(cacheKeyForUser("anon"), [])));
+      return;
+    }
+
+    const now = Date.now();
+    // ✅ throttle harder to avoid overlapping fetches (focus + route change + HMR)
+    if (now - lastFetchRef.current < 1000) return;
+    lastFetchRef.current = now;
+
+    setLoading(true);
+    setNotice("");
+
+    try {
+      const { data: postRows, error: postErr } = await supabase
+        .from(FEED_POSTS)
+        .select("id, user_id, league_id, text, to_public, to_friends, to_league, created_at")
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      if (postErr) throw postErr;
+
+      const rows = postRows || [];
+      const postIds = rows.map((r) => r.id);
+      const authorIds = Array.from(new Set(rows.map((r) => r.user_id).filter(Boolean)));
+
+      let likesByPost = {};
+      let commentsByPost = {};
+
+      if (postIds.length) {
+        const [{ data: likeRows, error: likeErr }, { data: commentRows, error: cErr }] =
+          await Promise.all([
+            supabase.from(FEED_LIKES).select("post_id, user_id").in("post_id", postIds),
+            supabase
+              .from(FEED_COMMENTS)
+              .select("id, post_id, user_id, text, created_at")
+              .in("post_id", postIds)
+              .order("created_at", { ascending: true }),
+          ]);
+
+        if (likeErr) throw likeErr;
+        if (cErr) throw cErr;
+
+        likesByPost = (likeRows || []).reduce((acc, r) => {
+          (acc[r.post_id] ||= []).push(r.user_id);
+          return acc;
+        }, {});
+
+        commentsByPost = (commentRows || []).reduce((acc, r) => {
+          (acc[r.post_id] ||= []).push({
+            id: r.id,
+            userId: r.user_id,
+            text: r.text,
+            createdAt: r.created_at,
+          });
+          return acc;
+        }, {});
+      }
+
+      if (authorIds.length) {
+        const { data: profs, error: pErr } = await supabase
+          .from(PROFILES_TABLE)
+          .select("id, username, display_name, handicap_index")
+          .in("id", authorIds);
+
+        if (!pErr && profs) setUsers(profs);
+      } else {
+        setUsers(profile ? [profile] : []);
+      }
+
+      const normalized = rows.map((r) => ({
+        id: r.id,
+        userId: r.user_id,
+        leagueId: r.league_id ?? null,
+        text: r.text ?? "",
+        createdAt: r.created_at,
+        toPublic: !!r.to_public,
+        toFriends: !!r.to_friends,
+        toLeague: !!r.to_league,
+        likes: ensureArr(likesByPost[r.id]),
+        comments: ensureArr(commentsByPost[r.id]),
+      }));
+
+      setPosts(normalized);
+      writeCache(normalized);
+    } catch (e) {
+      // ✅ AbortError is not a real failure — ignore it
+      if (isAbortError(e)) {
+        // keep current UI; don’t show offline banners for aborted in-flight requests
+        return;
+      }
+
+      const cached = ensureArr(get(cacheKeyForUser(meId), []));
+      setPosts(cached);
+
+      const pretty = formatSupabaseError(e);
+      console.error("Feed load failed:", e);
+
+      setNotice(
+        cached.length
+          ? "You’re viewing cached feed (offline / temporarily unavailable)."
+          : "Feed unavailable right now (offline / temporarily unavailable)."
+      );
+      setDebugErr(pretty);
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
-    resyncPosts();
-  }, [location.key]);
+    loadFeedSupabase();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key, user?.id]);
 
   useEffect(() => {
-    const onFocus = () => resyncPosts();
+    const onFocus = () => loadFeedSupabase();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
   useEffect(() => {
-    set(KEYS.playPosts, posts);
-  }, [posts]);
+    setPosts(ensureArr(get(cacheKeyForUser(meId), [])));
+    setUsers(profile ? [profile] : []);
+    setNotice("");
+    setDebugErr("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meId]);
+
+  useEffect(() => {
+    writeCache(posts);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [posts, meId]);
 
   const filteredSorted = useMemo(() => {
     return posts
@@ -350,65 +511,147 @@ export default function Feed() {
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   }, [posts, scope, league?.id]);
 
-  function toggleLike(postId) {
+  async function toggleLike(postId) {
+    if (!user?.id) {
+      setNotice("Sign in to like posts.");
+      return;
+    }
+
+    const had = (posts.find((p) => p.id === postId)?.likes || []).includes(meId);
+
     setPosts((prev) =>
       prev.map((p) =>
         p.id !== postId
           ? p
           : {
               ...p,
-              likes: (p.likes || []).includes(meId)
+              likes: had
                 ? (p.likes || []).filter((id) => id !== meId)
                 : [...(p.likes || []), meId],
             }
       )
     );
+
+    try {
+      if (had) {
+        const { error } = await supabase
+          .from(FEED_LIKES)
+          .delete()
+          .eq("post_id", postId)
+          .eq("user_id", meId);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from(FEED_LIKES)
+          .upsert([{ post_id: postId, user_id: meId }], {
+            onConflict: "post_id,user_id",
+          });
+        if (error) throw error;
+      }
+    } catch (e) {
+      console.error("Like save failed:", e);
+      setNotice("Couldn’t save like (offline). Changes kept in cache.");
+    }
   }
 
-  function addComment(postId) {
+  async function addComment(postId) {
+    if (!user?.id) {
+      setNotice("Sign in to comment.");
+      return;
+    }
+
     const txt = window.prompt("Comment");
     if (!txt || !txt.trim()) return;
 
-    setPosts((prev) =>
-      prev.map((p) =>
-        p.id !== postId
-          ? p
-          : {
-              ...p,
-              comments: [
-                ...(p.comments || []),
-                {
-                  id: safeUUID("c"),
-                  userId: meId,
-                  text: txt.trim(),
-                  createdAt: new Date().toISOString(),
-                },
-              ],
-            }
-      )
-    );
-
-    setOpenComments((prev) => ({ ...prev, [postId]: true }));
-  }
-
-  function submitPost() {
-    if (!text.trim()) return;
-
-    const post = {
-      id: safeUUID("post"),
+    const optimistic = {
+      id: safeUUID("c"),
       userId: meId,
-      leagueId: toLeague ? league?.id || null : null,
-      text: text.trim(),
+      text: txt.trim(),
       createdAt: new Date().toISOString(),
-      toPublic,
-      toFriends,
-      toLeague,
-      likes: [],
-      comments: [],
     };
 
-    setPosts((prev) => [post, ...prev]);
-    setText("");
+    setPosts((prev) =>
+      prev.map((p) =>
+        p.id !== postId ? p : { ...p, comments: [...(p.comments || []), optimistic] }
+      )
+    );
+    setOpenComments((prev) => ({ ...prev, [postId]: true }));
+
+    try {
+      const { data, error } = await supabase
+        .from(FEED_COMMENTS)
+        .insert([{ post_id: postId, user_id: meId, text: optimistic.text }])
+        .select("id, post_id, user_id, text, created_at")
+        .single();
+
+      if (error) throw error;
+
+      setPosts((prev) =>
+        prev.map((p) => {
+          if (p.id !== postId) return p;
+          const next = (p.comments || []).map((c) =>
+            c.id === optimistic.id
+              ? { id: data.id, userId: data.user_id, text: data.text, createdAt: data.created_at }
+              : c
+          );
+          return { ...p, comments: next };
+        })
+      );
+    } catch (e) {
+      console.error("Comment save failed:", e);
+      setNotice("Couldn’t save comment (offline). Changes kept in cache.");
+    }
+  }
+
+  async function submitPost() {
+    if (!text.trim()) return;
+    if (!toPublic && !toFriends && !toLeague) return;
+
+    if (!user?.id) {
+      setNotice("Sign in to post.");
+      return;
+    }
+
+    setLoading(true);
+    setNotice("");
+
+    try {
+      const payload = {
+        user_id: meId,
+        league_id: toLeague ? league?.id || null : null,
+        text: text.trim(),
+        to_public: toPublic,
+        to_friends: toFriends,
+        to_league: toLeague,
+      };
+
+      const { error } = await supabase.from(FEED_POSTS).insert(payload);
+      if (error) throw error;
+
+      setText("");
+      await loadFeedSupabase();
+    } catch (e) {
+      console.error("Post insert failed:", e);
+
+      const offline = {
+        id: safeUUID("post"),
+        userId: meId,
+        leagueId: toLeague ? league?.id || null : null,
+        text: text.trim(),
+        createdAt: new Date().toISOString(),
+        toPublic,
+        toFriends,
+        toLeague,
+        likes: [],
+        comments: [],
+      };
+
+      setPosts((prev) => [offline, ...prev]);
+      setText("");
+      setNotice("Couldn’t post right now (offline). Saved in your cache.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   function toggleComments(postId) {
@@ -417,26 +660,25 @@ export default function Feed() {
 
   const emptyCopy =
     scope === "public"
-      ? {
-          icon: "🏌️",
-          title: "No banter yet",
-          description: "Start the public golf feed with something funny.",
-        }
+      ? { icon: "🏌️", title: "No banter yet", description: "Start the public golf feed with something funny." }
       : scope === "friends"
-      ? {
-          icon: "👥",
-          title: "No friends posts yet",
-          description: "When friends start posting, you'll see it here.",
-        }
-      : {
-          icon: "🏆",
-          title: "No league banter yet",
-          description: "Post a league moment to get the chat going.",
-        };
+      ? { icon: "👥", title: "No friends posts yet", description: "When friends start posting, you'll see it here." }
+      : { icon: "🏆", title: "No league banter yet", description: "Post a league moment to get the chat going." };
 
   return (
     <div className="space-y-4">
       <ScopeSwitch scope={scope} setScope={setScope} leagueName={league?.name} />
+
+      {notice ? (
+        <Card className="p-3">
+          <div className="text-sm font-semibold text-slate-700">{notice}</div>
+          {debugErr ? (
+            <div className="mt-2 text-xs font-mono font-semibold text-rose-700">
+              {debugErr}
+            </div>
+          ) : null}
+        </Card>
+      ) : null}
 
       <Card className="p-4">
         <textarea
@@ -452,15 +694,9 @@ export default function Feed() {
             Post to:
           </div>
 
-          <Pill active={toPublic} onClick={() => setToPublic((v) => !v)}>
-            Public
-          </Pill>
-          <Pill active={toFriends} onClick={() => setToFriends((v) => !v)}>
-            Friends
-          </Pill>
-          <Pill active={toLeague} onClick={() => setToLeague((v) => !v)}>
-            League
-          </Pill>
+          <Pill active={toPublic} onClick={() => setToPublic((v) => !v)}>Public</Pill>
+          <Pill active={toFriends} onClick={() => setToFriends((v) => !v)}>Friends</Pill>
+          <Pill active={toLeague} onClick={() => setToLeague((v) => !v)}>League</Pill>
 
           <div className="ml-auto flex items-center gap-2">
             <button
@@ -474,20 +710,25 @@ export default function Feed() {
             <button
               type="button"
               onClick={submitPost}
-              disabled={text.trim().length === 0 || (!toPublic && !toFriends && !toLeague)}
+              disabled={loading || text.trim().length === 0 || (!toPublic && !toFriends && !toLeague) || !user?.id}
               className={[
                 "rounded-xl px-4 py-2 text-sm font-extrabold text-white transition active:scale-[0.99]",
-                text.trim().length > 0 && (toPublic || toFriends || toLeague)
+                !loading && user?.id && text.trim().length > 0 && (toPublic || toFriends || toLeague)
                   ? "bg-emerald-600 hover:bg-emerald-500"
                   : "bg-slate-300 cursor-not-allowed",
               ].join(" ")}
+              title={!user?.id ? "Sign in to post" : ""}
             >
-              Post
+              {loading ? "Posting…" : "Post"}
             </button>
           </div>
         </div>
 
-        {!toPublic && !toFriends && !toLeague ? (
+        {!user?.id ? (
+          <div className="mt-2 text-xs font-semibold text-slate-600">
+            Sign in to post, like, and comment.
+          </div>
+        ) : !toPublic && !toFriends && !toLeague ? (
           <div className="mt-2 text-xs font-semibold text-rose-600">
             Pick at least one destination (Public / Friends / League).
           </div>
@@ -538,8 +779,5 @@ export default function Feed() {
     </div>
   );
 }
-
-
-
 
 

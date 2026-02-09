@@ -43,7 +43,22 @@ const safeStorage = {
   },
 };
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+// ✅ Fail loudly if env vars are missing (prevents "Failed to fetch" mystery)
+function assertEnv(name, value) {
+  if (!value || typeof value !== "string" || value.trim().length === 0) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[Supabase] Missing env var ${name}. Check your .env and restart Vite.`
+    );
+    throw new Error(`[Supabase] Missing env var ${name}`);
+  }
+  return value;
+}
+
+const url = assertEnv("VITE_SUPABASE_URL", supabaseUrl);
+const anon = assertEnv("VITE_SUPABASE_ANON_KEY", supabaseAnonKey);
+
+export const supabase = createClient(url, anon, {
   auth: {
     storage: safeStorage,
     persistSession: true,
@@ -51,4 +66,5 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     detectSessionInUrl: true,
   },
 });
+
 

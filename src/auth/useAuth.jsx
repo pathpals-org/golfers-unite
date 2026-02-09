@@ -15,14 +15,14 @@ function withTimeout(promise, ms, label = "Request") {
 async function fetchMyProfile(userId) {
   if (!userId) return null;
 
-  // ✅ Never allow profile fetch to hang forever
+  // ✅ Profile fetch can hang (network/RLS). Keep timeout.
   const { data, error } = await withTimeout(
     supabase
       .from("profiles")
       .select("id, username, display_name, avatar_url, handicap_index, created_at, updated_at")
       .eq("id", userId)
       .maybeSingle(),
-    8000,
+    15000,
     "Load profile"
   );
 
@@ -80,11 +80,6 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     mountedRef.current = true;
 
-    // ✅ Safety: never allow infinite loading
-    const watchdog = setTimeout(() => {
-      if (mountedRef.current) setLoading(false);
-    }, 4500);
-
     const safeClearSession = async (reason) => {
       try {
         console.warn("Clearing auth session:", reason);
@@ -105,12 +100,12 @@ export function AuthProvider({ children }) {
 
       try {
         /**
-         * ✅ Use getSession() first (LOCAL)
-         * This does NOT require a network request, so it won’t hang behind blockers.
+         * ✅ getSession() should be local, but can be slow on some devices/browsers.
+         * The old 3000ms timeout is too aggressive for production.
          */
         const { data, error } = await withTimeout(
           supabase.auth.getSession(),
-          3000,
+          15000,
           "Auth session"
         );
 
@@ -146,7 +141,7 @@ export function AuthProvider({ children }) {
         if (isInvalidRefreshTokenError(e)) {
           await safeClearSession("Invalid refresh token thrown during bootstrap");
         } else {
-          // If session read times out, fail open (no user), don’t hang the app
+          // If session read times out/fails, fail open (no user), don’t hang the app
           setSession(null);
           setUser(null);
           setProfile(null);
@@ -161,8 +156,7 @@ export function AuthProvider({ children }) {
     const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
       if (!mountedRef.current) return;
 
-      // ✅ Don’t keep the whole app in “loading” during events.
-      // Just update state quickly; profile fetch is still protected by timeout.
+      // ✅ Keep UI responsive; don’t lock app in loading on auth events
       setSession(newSession ?? null);
       setUser(newSession?.user ?? null);
 
@@ -190,7 +184,6 @@ export function AuthProvider({ children }) {
 
     return () => {
       mountedRef.current = false;
-      clearTimeout(watchdog);
       sub?.subscription?.unsubscribe?.();
     };
   }, []);
@@ -214,4 +207,3 @@ export function useAuth() {
   if (!ctx) throw new Error("useAuth must be used inside <AuthProvider />");
   return ctx;
 }
-
