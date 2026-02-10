@@ -43,22 +43,45 @@ const safeStorage = {
   },
 };
 
-// ✅ Fail loudly if env vars are missing (prevents "Failed to fetch" mystery)
-function assertEnv(name, value) {
-  if (!value || typeof value !== "string" || value.trim().length === 0) {
-    // eslint-disable-next-line no-console
-    console.error(
-      `[Supabase] Missing env var ${name}. Check your .env and restart Vite.`
-    );
-    throw new Error(`[Supabase] Missing env var ${name}`);
-  }
-  return value;
+// --- Helper: trim and validate env values (Netlify sometimes includes whitespace)
+function cleanEnv(v) {
+  return typeof v === "string" ? v.trim() : "";
 }
 
-const url = assertEnv("VITE_SUPABASE_URL", supabaseUrl);
-const anon = assertEnv("VITE_SUPABASE_ANON_KEY", supabaseAnonKey);
+const url = cleanEnv(supabaseUrl);
+const anon = cleanEnv(supabaseAnonKey);
 
-export const supabase = createClient(url, anon, {
+// --- Debug (safe): lets you confirm what the Netlify build actually received
+// Check on desktop Netlify console: window.__SUPABASE_ENV__
+if (typeof window !== "undefined") {
+  window.__SUPABASE_ENV__ = {
+    hasUrl: Boolean(url),
+    hasAnon: Boolean(anon),
+    urlOrigin: url ? (() => {
+      try {
+        return new URL(url).origin;
+      } catch {
+        return "INVALID_URL";
+      }
+    })() : null,
+    anonLen: anon ? anon.length : 0,
+    buildMode: import.meta.env.MODE,
+  };
+}
+
+// --- If env is missing, don't hard-crash the whole app — log loudly.
+// This prevents “everything looks like localStorage” mystery on production devices.
+if (!url || !anon) {
+  // eslint-disable-next-line no-console
+  console.error(
+    "[Supabase] Missing VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY in this build. " +
+      "On Netlify: Site configuration → Environment variables → add both, then Trigger deploy → Clear cache and deploy."
+  );
+}
+
+// Create the client even if env is missing; calls will fail with clear errors,
+// but your UI won't silently fall back to weird states.
+export const supabase = createClient(url || "http://localhost:54321", anon || "missing-anon-key", {
   auth: {
     storage: safeStorage,
     persistSession: true,
@@ -66,5 +89,6 @@ export const supabase = createClient(url, anon, {
     detectSessionInUrl: true,
   },
 });
+
 
 
