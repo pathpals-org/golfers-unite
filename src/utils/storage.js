@@ -18,7 +18,7 @@ export const KEYS = {
   seasonArchives: "seasonArchives",
   seededFlag: "__golfers_unite_seeded__",
 
-  // ✅ active league selection
+  // ✅ NEW: active league selection (so you can support multiple leagues later)
   activeLeagueId: "__golfers_unite_active_league_id__",
 };
 
@@ -67,7 +67,7 @@ export function seedIfNeeded() {
 }
 
 /* ---------------------------------------------
-   Helpers
+   App-specific helpers (so pages stay consistent)
 ---------------------------------------------- */
 
 function ensureObj(v) {
@@ -99,7 +99,7 @@ function toISODateOrNull(v) {
 }
 
 /* ---------------------------------------------
-   ✅ ACTIVE LEAGUE (Supabase-first)
+   ✅ ACTIVE LEAGUE (Supabase-first, fail-soft)
 ---------------------------------------------- */
 
 export function getActiveLeagueId() {
@@ -139,12 +139,14 @@ async function fetchMyLeagueIds() {
 
 /**
  * ✅ Supabase: fetch league row by id
- * IMPORTANT: don’t query columns that might not exist in your schema yet.
+ *
+ * IMPORTANT:
+ * Your DB does NOT have leagues.season_start (you saw that error).
+ * So we only select columns we know are safe.
  */
 async function fetchLeagueById(leagueId) {
   const { data, error } = await supabase
     .from("leagues")
-    // ✅ SAFE SELECT ONLY
     .select("id,name,host_user_id,points_system,created_at")
     .eq("id", leagueId)
     .single();
@@ -185,72 +187,81 @@ async function fetchProfilesByIds(userIds) {
 /**
  * ✅ Main sync:
  * - Loads active league + members + profiles from Supabase
- * - Normalizes into the SAME shape your UI expects
+ * - Normalizes into the SAME shape your UI already expects
  * - Caches to localStorage (KEYS.league + KEYS.users)
+ *
+ * FAIL-SOFT:
+ * - If Supabase errors (offline / RLS / transient), we DO NOT clear local cache.
+ * - We return cached league/users instead so the app stays predictable.
  */
 export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
-  // 1) Resolve active league id
-  let activeId = leagueId || getActiveLeagueId();
+  const cachedLeague = getLeagueSafe({});
+  const cachedUsers = ensureArr(getUsers([]));
 
-  if (!activeId) {
-    const myLeagueIds = await fetchMyLeagueIds();
-    activeId = myLeagueIds[0] || null;
-    if (activeId) setActiveLeagueId(activeId);
+  try {
+    // 1) Resolve active league id
+    let activeId = leagueId || getActiveLeagueId();
+
+    if (!activeId) {
+      const myLeagueIds = await fetchMyLeagueIds();
+      activeId = myLeagueIds[0] || null;
+      if (activeId) setActiveLeagueId(activeId);
+    }
+
+    // If user has no memberships, DO NOT nuke local demo cache.
+    // Just return cached values so UI can still run offline/demo.
+    if (!activeId) {
+      return { league: cachedLeague?.id ? cachedLeague : null, users: cachedUsers };
+    }
+
+    // 2) Fetch league + members + profiles
+    const leagueRow = await fetchLeagueById(activeId);
+    const members = await fetchLeagueMembers(activeId);
+
+    const memberIds = members.map((m) => m.user_id).filter(Boolean);
+    const profiles = await fetchProfilesByIds(memberIds);
+
+    // 3) Build users list in the same rough shape you use now
+    const users = profiles.map((p) => ({
+      id: p.id,
+      name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
+      email: p.email || null,
+    }));
+
+    // 4) Build league object in your existing normalized format
+    const memberRoles = {};
+    members.forEach((m) => {
+      if (!m?.user_id) return;
+      memberRoles[m.user_id] = normalizeRole(m.role);
+    });
+
+    const nextLeague = normalizeLeague({
+      id: leagueRow?.id,
+      name: leagueRow?.name || "League",
+      members: memberIds,
+      memberRoles,
+      pointsSystem: leagueRow?.points_system || null,
+
+      // Season fields are local-only unless you add real DB columns later.
+      // Keep them stable for UI.
+      seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
+      seasonEndISO: cachedLeague?.seasonEndISO || null,
+    });
+
+    // 5) Cache locally (fallback)
+    setLeagueSafe(nextLeague);
+    setUsers(users);
+
+    return { league: nextLeague, users };
+  } catch (e) {
+    // FAIL-SOFT: never destroy cache if Supabase is unhappy.
+    // Keep app stable and predictable.
+    return { league: cachedLeague?.id ? cachedLeague : null, users: cachedUsers };
   }
-
-  if (!activeId) {
-    // No memberships yet
-    setLeagueSafe({});
-    setUsers([]);
-    return { league: null, users: [] };
-  }
-
-  // 2) Fetch league + members + profiles
-  const leagueRow = await fetchLeagueById(activeId);
-  const members = await fetchLeagueMembers(activeId);
-
-  const memberIds = members.map((m) => m.user_id).filter(Boolean);
-  const profiles = await fetchProfilesByIds(memberIds);
-
-  // 3) Build users list
-  const users = profiles.map((p) => ({
-    id: p.id,
-    name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
-    email: p.email || null,
-  }));
-
-  // 4) Build league roles map
-  const memberRoles = {};
-  members.forEach((m) => {
-    if (!m?.user_id) return;
-    memberRoles[m.user_id] = normalizeRole(m.role);
-  });
-
-  // 5) Build league object (UI expects these keys)
-  // NOTE: we DO NOT rely on season_start/season_end being in Supabase.
-  // We keep using the cached local seasonStartISO/seasonEndISO defaults.
-  const cached = getLeagueSafe({});
-  const nextLeague = normalizeLeague({
-    id: leagueRow?.id,
-    name: leagueRow?.name || "League",
-    members: memberIds,
-    memberRoles,
-    pointsSystem: leagueRow?.points_system || null,
-
-    // keep what you already had locally (or default)
-    seasonStartISO: cached?.seasonStartISO || new Date().toISOString(),
-    seasonEndISO: cached?.seasonEndISO || null,
-  });
-
-  // 6) Cache locally
-  setLeagueSafe(nextLeague);
-  setUsers(users);
-
-  return { league: nextLeague, users };
 }
 
 /* ---------------------------------------------
-   USERS (cached local)
+   USERS / PLAYERS (cached local)
 ---------------------------------------------- */
 
 export function getUsers(fallback = []) {
@@ -274,7 +285,7 @@ export function setLeague(leagueObj) {
 }
 
 /* ---------------------------------------------
-   LEAGUE ROLES + SEASON HELPERS
+   LEAGUE ROLES + SEASON HELPERS (MVP-safe cache)
 ---------------------------------------------- */
 
 export const LEAGUE_ROLES = {
@@ -389,7 +400,7 @@ export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
 }
 
 /* ---------------------------------------------
-   POINTS SYSTEM (unchanged)
+   POINTS SYSTEM (cached local — unchanged)
 ---------------------------------------------- */
 
 export const DEFAULT_POINTS_SYSTEM = {
@@ -576,7 +587,7 @@ export function sortRoundsForRanking(rounds, pointsSystem = null) {
 }
 
 /* ---------------------------------------------
-   ROUNDS (local)
+   ROUNDS (still local for Option A)
 ---------------------------------------------- */
 
 export function getRounds(fallback = []) {
@@ -690,6 +701,7 @@ export function addSeasonArchive(archiveItem) {
   set(KEYS.seasonArchives, next);
   return archiveItem;
 }
+
 
 
 
