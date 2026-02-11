@@ -48,14 +48,7 @@ function getUserId(u) {
 }
 
 function getUserName(u) {
-  return (
-    u?.name ||
-    u?.fullName ||
-    u?.displayName ||
-    u?.username ||
-    u?.display_name ||
-    "Golfer"
-  );
+  return u?.name || u?.fullName || u?.displayName || u?.username || u?.display_name || "Golfer";
 }
 
 function normalizePlacement(v) {
@@ -107,10 +100,10 @@ export default function LeagueSettings() {
   const [myRoleLive, setMyRoleLive] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
-  // 🔒 Make league id stable for this page session
+  // 🔒 Freeze league id for the whole lifetime of this page instance
   const stableLeagueIdRef = useRef(null);
 
-  // Prevent stale async responses from overwriting newer role state
+  // Prevent stale async responses overwriting newer ones
   const roleReqIdRef = useRef(0);
 
   // Invite status UI
@@ -158,43 +151,90 @@ export default function LeagueSettings() {
     return users.filter((u) => setIds.has(getUserId(u)));
   }, [users, members]);
 
-  // ✅ Resolve current user from Supabase session
-  useEffect(() => {
-    let alive = true;
-
-    async function loadAuthUser() {
-      try {
-        const { data } = await supabase.auth.getUser();
-        const uid = data?.user?.id || null;
-        if (!alive) return;
-        setAuthUserId(uid);
-      } catch {
-        if (!alive) return;
-        setAuthUserId(null);
-      }
-    }
-
-    loadAuthUser();
-
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  // ✅ Local fallback "me" (only for display fallback, NOT permissions)
+  // ✅ Local fallback "me" (display only; NOT permissions)
   const me = useMemo(() => {
     if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
     return users?.[0] || null;
   }, [authUserId, users]);
 
   const myId = authUserId || getUserId(me);
-
-  // ✅ Display name prefers Supabase profile, falls back to cached local user
   const myDisplayName = myProfile?.display_name || getUserName(me);
 
-  // ✅ Permissions: Supabase truth ONLY
+  // ✅ Permissions ONLY from Supabase truth (league_members)
   const myRole = myRoleLive || LEAGUE_ROLES.member;
   const canEdit = myRoleLive === LEAGUE_ROLES.host || myRoleLive === LEAGUE_ROLES.co_host;
+
+  // ✅ Bootstrap auth in a stable way (Netlify timing safe)
+  useEffect(() => {
+    let alive = true;
+
+    async function boot() {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!alive) return;
+        setAuthUserId(data?.session?.user?.id || null);
+      } catch {
+        if (!alive) return;
+        setAuthUserId(null);
+      }
+    }
+
+    boot();
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!alive) return;
+      setAuthUserId(session?.user?.id || null);
+    });
+
+    return () => {
+      alive = false;
+      try {
+        sub?.subscription?.unsubscribe?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  // ✅ One-time page init: read cached league ONCE, freeze leagueId ONCE
+  useEffect(() => {
+    const l = getLeagueSafe({});
+    const u = ensureArr(getUsers([]));
+
+    // Freeze league id only the first time we see it.
+    // This is the key: the id cannot "jump" later due to cache resync.
+    if (!stableLeagueIdRef.current && l?.id) {
+      stableLeagueIdRef.current = l.id;
+    }
+
+    // Keep displaying whatever we have cached for UI/offline
+    setLeagueState(l);
+    setUsersState(u);
+
+    setSeasonStart(toISODateInput(l?.seasonStartISO));
+    setSeasonEnd(toISODateInput(l?.seasonEndISO));
+
+    const ps = getPointsSystem(null);
+    setPointsDraft({
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
+
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
+    });
+
+    // Clean UI state on entry
+    setInviteStatus({ type: "", message: "" });
+    setPendingInvites([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function refreshMyProfileAndRole() {
     const leagueId = stableLeagueIdRef.current;
@@ -215,7 +255,7 @@ export default function LeagueSettings() {
       if (profErr) throw profErr;
       setMyProfile(prof || null);
 
-      // Role (Supabase truth)
+      // Role (truth)
       const { data: mem, error: memErr } = await supabase
         .from("league_members")
         .select("role")
@@ -229,21 +269,29 @@ export default function LeagueSettings() {
       const role = mem?.role || LEAGUE_ROLES.member;
       setMyRoleLive(role);
 
-      // Optional: keep cache aligned for non-permission display elsewhere (NOT used for canEdit here)
+      // Optional cache alignment (NOT permission-bearing)
       try {
         setLeagueRole(authUserId, role);
       } catch {
-        // ignore cache write errors
+        // ignore
       }
     } catch {
-      // If offline/blocked, default to view-only (Apple-ready predictable)
+      // Apple-ready: do NOT overwrite a known-good role with null/member because of a transient failure
       if (reqId !== roleReqIdRef.current) return;
-      setMyRoleLive(null);
+      if (myRoleLive == null) {
+        setMyRoleLive(null); // default view-only when unknown
+      }
     } finally {
       if (reqId !== roleReqIdRef.current) return;
       setRoleLoading(false);
     }
   }
+
+  // ✅ Refresh when auth user changes (NOT when canEdit changes)
+  useEffect(() => {
+    refreshMyProfileAndRole();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUserId]);
 
   async function loadPendingInvites({ leagueId }) {
     if (!leagueId) return;
@@ -334,57 +382,14 @@ export default function LeagueSettings() {
     }
   }
 
-  // ✅ One-way: sync local cached league/users on navigation ONLY (NO canEdit dependency)
-  useEffect(() => {
-    const l = getLeagueSafe({});
-    const u = ensureArr(getUsers([]));
-
-    // Initialize / update stable league id ONLY when navigation changes
-    const nextLeagueId = l?.id || null;
-    stableLeagueIdRef.current = nextLeagueId;
-
-    setLeagueState(l);
-    setUsersState(u);
-
-    setSeasonStart(toISODateInput(l?.seasonStartISO));
-    setSeasonEnd(toISODateInput(l?.seasonEndISO));
-
-    const ps = getPointsSystem(null);
-    setPointsDraft({
-      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
-
-      participationEnabled: Boolean(ps?.participation?.enabled),
-      participationPoints: safeNum(ps?.participation?.points, 1),
-
-      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
-      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
-      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
-      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
-      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
-      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
-      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
-    });
-
-    // Clear invite UI status on navigation so it feels clean/predictable
-    setInviteStatus({ type: "", message: "" });
-    setPendingInvites([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.key]);
-
-  // ✅ Refresh role whenever auth user OR stable league id changes
-  useEffect(() => {
-    refreshMyProfileAndRole();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUserId, location.key]);
-
-  // load friends when we have auth user
+  // load friends when we have a user id (auth preferred)
   useEffect(() => {
     if (!myId) return;
     loadFriendsForInvites({ userId: myId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myId]);
 
-  // ✅ Load pending invites only after permissions are confirmed (no league re-sync)
+  // ✅ Load pending invites ONLY when edit is enabled (and stable leagueId is frozen)
   useEffect(() => {
     const leagueId = stableLeagueIdRef.current;
     if (!leagueId) return;
@@ -393,10 +398,9 @@ export default function LeagueSettings() {
       setPendingInvites([]);
       return;
     }
-
     loadPendingInvites({ leagueId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canEdit, location.key]);
+  }, [canEdit]);
 
   if (!league?.id) {
     return (
@@ -541,7 +545,7 @@ export default function LeagueSettings() {
     const inviteeUserId = friendProfile?.id || null;
     if (!inviteeUserId) return;
 
-    // Already a member? (local list; Supabase will enforce anyway)
+    // Already a member? (local hint; Supabase enforces truth)
     const memberSetLocal = new Set(ensureArr(members));
     if (memberSetLocal.has(inviteeUserId)) {
       setInviteStatus({ type: "info", message: "They’re already in this league." });
@@ -567,7 +571,7 @@ export default function LeagueSettings() {
         throw invErr;
       }
 
-      await loadPendingInvites({ leagueId: league.id });
+      await loadPendingInvites({ leagueId: stableLeagueIdRef.current || league.id });
 
       setInviteStatus({
         type: "success",
@@ -588,7 +592,7 @@ export default function LeagueSettings() {
       const { error } = await supabase.from("league_invites").delete().eq("id", inviteId);
       if (error) throw error;
 
-      await loadPendingInvites({ leagueId: league.id });
+      await loadPendingInvites({ leagueId: stableLeagueIdRef.current || league.id });
       setInviteStatus({ type: "info", message: "Invite cancelled." });
     } catch (e) {
       setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
@@ -639,7 +643,6 @@ export default function LeagueSettings() {
               Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
               <span className="font-extrabold">{roleLabel(myRole)}</span>
               {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
-              {!authUserId ? <span className="ml-2 text-slate-400">(not signed in)</span> : null}
             </div>
 
             <button
@@ -668,7 +671,7 @@ export default function LeagueSettings() {
         </div>
       </Card>
 
-      {/* ✅ Invite to league (locked flow: from Friends list) */}
+      {/* ✅ Invite to league */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -765,7 +768,7 @@ export default function LeagueSettings() {
             <button
               type="button"
               disabled={!canEdit || invitesLoading}
-              onClick={() => loadPendingInvites({ leagueId: league.id })}
+              onClick={() => loadPendingInvites({ leagueId: stableLeagueIdRef.current || league.id })}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
                 !canEdit || invitesLoading
@@ -790,7 +793,8 @@ export default function LeagueSettings() {
               pendingInvites.map((inv) => {
                 const invitee = inv?.invitee || null;
                 const display =
-                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                  invitee?.display_name ||
+                  String(inv?.invitee_user_id || "").slice(0, 8) + "…";
 
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
@@ -846,7 +850,6 @@ export default function LeagueSettings() {
 
       {/* Points System */}
       <Card className="p-5">
-        {/* (UNCHANGED from your original file from here down) */}
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-slate-900">Points system</div>
@@ -1250,9 +1253,7 @@ export default function LeagueSettings() {
             onClick={saveSeasonDates}
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
-              canEdit
-                ? "bg-slate-900 text-white hover:bg-slate-800"
-                : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
             ].join(" ")}
           >
             Save season dates
@@ -1327,7 +1328,7 @@ export default function LeagueSettings() {
         </div>
 
         <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          Permissions on this page are derived from Supabase <span className="font-mono">league_members</span> for your signed-in account.
+          Permissions on this page are Supabase truth (league_members). Cached roles here are display-only.
         </div>
       </Card>
     </div>
