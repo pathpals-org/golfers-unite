@@ -1,8 +1,17 @@
 // src/utils/storage.js
 import { seedData } from "../data/seed";
-
-// ✅ Supabase client
 import { supabase } from "../lib/supabaseClient";
+
+/**
+ * ✅ IMPORTANT MIGRATION NOTE
+ * Supabase is the source of truth.
+ * localStorage is ONLY a demo/offline cache layer while you migrate.
+ * This file keeps the cache safe + scoped per signed-in user to prevent cross-account bleed.
+ */
+
+/* ---------------------------------------------
+   KEYS (base keys before scoping)
+---------------------------------------------- */
 
 export const KEYS = {
   users: "users",
@@ -18,11 +27,11 @@ export const KEYS = {
   seasonArchives: "seasonArchives",
   seededFlag: "__golfers_unite_seeded__",
 
-  // ✅ NEW: active league selection (so you can support multiple leagues later)
+  // active league selection (support multiple leagues later)
   activeLeagueId: "__golfers_unite_active_league_id__",
 };
 
-// ✅ NEW: identifies which signed-in user the offline/local cache belongs to
+// identifies which signed-in user the offline/local cache belongs to
 export const STORAGE_USER_KEY = "__golfers_unite_storage_user_id__";
 
 export function getStorageUserId() {
@@ -33,6 +42,11 @@ export function getStorageUserId() {
   }
 }
 
+/**
+ * ✅ Call this from Auth on login/logout to scope local cache.
+ * - When user logs in: setStorageUserId(user.id)
+ * - When user logs out: setStorageUserId(null)
+ */
 export function setStorageUserId(userId) {
   try {
     if (!userId) localStorage.removeItem(STORAGE_USER_KEY);
@@ -41,6 +55,47 @@ export function setStorageUserId(userId) {
     // ignore
   }
 }
+
+/* ---------------------------------------------
+   KEY SCOPING (prevents cross-account bleed)
+---------------------------------------------- */
+
+function scopedKey(baseKey) {
+  // Keep Supabase auth tokens untouched (sb-...-auth-token)
+  // Only scope OUR app keys.
+  const uid = getStorageUserId();
+  if (!uid) return baseKey;
+  return `${uid}::${baseKey}`;
+}
+
+/* ---------------------------------------------
+   Generic localStorage helpers (scoped)
+---------------------------------------------- */
+
+export function get(key, fallback = null) {
+  try {
+    const raw = localStorage.getItem(scopedKey(key));
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function set(key, value) {
+  localStorage.setItem(scopedKey(key), JSON.stringify(value));
+}
+
+export function remove(key) {
+  try {
+    localStorage.removeItem(scopedKey(key));
+  } catch {
+    // ignore
+  }
+}
+
+/* ---------------------------------------------
+   Seed (scoped demo/offline cache)
+---------------------------------------------- */
 
 const STORAGE_KEYS = [
   KEYS.users,
@@ -56,38 +111,22 @@ const STORAGE_KEYS = [
   KEYS.seasonArchives,
 ];
 
-export function get(key, fallback = null) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-export function set(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
-}
-
-/**
- * Seed the app once (front-end only).
- */
 export function seedIfNeeded() {
-  const hasSeed = localStorage.getItem(KEYS.seededFlag);
+  // Seed is per-user (scoped). If no user id is set, it seeds the unscoped demo cache.
+  const hasSeed = localStorage.getItem(scopedKey(KEYS.seededFlag));
   if (hasSeed) return;
 
   const data = seedData();
-  STORAGE_KEYS.forEach((key) => {
-    if (data[key] !== undefined) {
-      set(key, data[key]);
-    }
+
+  STORAGE_KEYS.forEach((k) => {
+    if (data[k] !== undefined) set(k, data[k]);
   });
 
-  localStorage.setItem(KEYS.seededFlag, "true");
+  localStorage.setItem(scopedKey(KEYS.seededFlag), "true");
 }
 
 /* ---------------------------------------------
-   App-specific helpers (so pages stay consistent)
+   App-specific helpers (safe normalizers)
 ---------------------------------------------- */
 
 function ensureObj(v) {
@@ -119,12 +158,13 @@ function toISODateOrNull(v) {
 }
 
 /* ---------------------------------------------
-   ✅ ACTIVE LEAGUE (Supabase-first, fail-soft)
+   ACTIVE LEAGUE (cache helper)
 ---------------------------------------------- */
 
 export function getActiveLeagueId() {
   try {
-    return localStorage.getItem(KEYS.activeLeagueId) || null;
+    // Active league is also scoped (per user)
+    return localStorage.getItem(scopedKey(KEYS.activeLeagueId)) || null;
   } catch {
     return null;
   }
@@ -132,17 +172,17 @@ export function getActiveLeagueId() {
 
 export function setActiveLeagueId(leagueId) {
   try {
-    if (!leagueId) localStorage.removeItem(KEYS.activeLeagueId);
-    else localStorage.setItem(KEYS.activeLeagueId, String(leagueId));
+    if (!leagueId) localStorage.removeItem(scopedKey(KEYS.activeLeagueId));
+    else localStorage.setItem(scopedKey(KEYS.activeLeagueId), String(leagueId));
   } catch {
     // ignore
   }
 }
 
-/**
- * ✅ Supabase: fetch memberships for the current authed user.
- * Returns array of league_id strings.
- */
+/* ---------------------------------------------
+   Supabase helpers (source of truth reads)
+---------------------------------------------- */
+
 async function fetchMyLeagueIds() {
   const { data: auth } = await supabase.auth.getUser();
   const uid = auth?.user?.id;
@@ -158,11 +198,9 @@ async function fetchMyLeagueIds() {
 }
 
 /**
- * ✅ Supabase: fetch league row by id
- *
  * IMPORTANT:
  * Your DB does NOT have leagues.season_start (you saw that error).
- * So we only select columns we know are safe.
+ * So we only select columns we know exist.
  */
 async function fetchLeagueById(leagueId) {
   const { data, error } = await supabase
@@ -175,9 +213,6 @@ async function fetchLeagueById(leagueId) {
   return data || null;
 }
 
-/**
- * ✅ Supabase: fetch members for a league (user_id + role)
- */
 async function fetchLeagueMembers(leagueId) {
   const { data, error } = await supabase
     .from("league_members")
@@ -188,9 +223,6 @@ async function fetchLeagueMembers(leagueId) {
   return ensureArr(data);
 }
 
-/**
- * ✅ Supabase: fetch profiles for a list of user ids
- */
 async function fetchProfilesByIds(userIds) {
   const ids = ensureArr(userIds).filter(Boolean);
   if (!ids.length) return [];
@@ -205,14 +237,13 @@ async function fetchProfilesByIds(userIds) {
 }
 
 /**
- * ✅ Main sync:
- * - Loads active league + members + profiles from Supabase
- * - Normalizes into the SAME shape your UI already expects
- * - Caches to localStorage (KEYS.league + KEYS.users)
+ * ✅ Main sync (Supabase -> cache):
+ * - Supabase is truth
+ * - localStorage is just a cache (scoped)
  *
  * FAIL-SOFT:
- * - If Supabase errors (offline / RLS / transient), we DO NOT clear local cache.
- * - We return cached league/users instead so the app stays predictable.
+ * - If Supabase fails (offline/RLS/transient), DO NOT wipe cache.
+ * - Return cached values so app stays usable.
  */
 export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
   const cachedLeague = getLeagueSafe({});
@@ -228,8 +259,7 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
       if (activeId) setActiveLeagueId(activeId);
     }
 
-    // If user has no memberships, DO NOT nuke local demo cache.
-    // Just return cached values so UI can still run offline/demo.
+    // No memberships: return cache (demo/offline)
     if (!activeId) {
       return { league: cachedLeague?.id ? cachedLeague : null, users: cachedUsers };
     }
@@ -241,14 +271,14 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
     const memberIds = members.map((m) => m.user_id).filter(Boolean);
     const profiles = await fetchProfilesByIds(memberIds);
 
-    // 3) Build users list in the same rough shape you use now
+    // 3) Build users list for UI
     const users = profiles.map((p) => ({
       id: p.id,
       name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
       email: p.email || null,
     }));
 
-    // 4) Build league object in your existing normalized format
+    // 4) Build league object in normalized format
     const memberRoles = {};
     members.forEach((m) => {
       if (!m?.user_id) return;
@@ -262,20 +292,19 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
       memberRoles,
       pointsSystem: leagueRow?.points_system || null,
 
-      // Season fields are local-only unless you add real DB columns later.
-      // Keep them stable for UI.
+      // Season fields are local-only unless you add DB columns later.
+      // Keep stable for UI.
       seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
       seasonEndISO: cachedLeague?.seasonEndISO || null,
     });
 
-    // 5) Cache locally (fallback)
+    // 5) Cache (scoped)
     setLeagueSafe(nextLeague);
     setUsers(users);
 
     return { league: nextLeague, users };
-  } catch (e) {
-    // FAIL-SOFT: never destroy cache if Supabase is unhappy.
-    // Keep app stable and predictable.
+  } catch {
+    // FAIL-SOFT: keep cached fallback
     return { league: cachedLeague?.id ? cachedLeague : null, users: cachedUsers };
   }
 }
@@ -305,7 +334,7 @@ export function setLeague(leagueObj) {
 }
 
 /* ---------------------------------------------
-   LEAGUE ROLES + SEASON HELPERS (MVP-safe cache)
+   LEAGUE ROLES + SEASON HELPERS (cache only)
 ---------------------------------------------- */
 
 export const LEAGUE_ROLES = {
@@ -334,7 +363,7 @@ function normalizeMemberRoles(league) {
     next[id] = normalizeRole(existing[id] || LEAGUE_ROLES.member);
   });
 
-  // Ensure a host exists (cache-safety)
+  // cache-safety: ensure a host exists
   const hasHost = Object.values(next).some((r) => r === LEAGUE_ROLES.host);
   if (!hasHost && members.length) {
     next[members[0]] = LEAGUE_ROLES.host;
@@ -420,7 +449,7 @@ export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
 }
 
 /* ---------------------------------------------
-   POINTS SYSTEM (cached local — unchanged)
+   POINTS SYSTEM (cached local)
 ---------------------------------------------- */
 
 export const DEFAULT_POINTS_SYSTEM = {
@@ -447,7 +476,6 @@ function normalizePlacementPoints(v) {
 
   const keys = Object.keys(next);
   if (!keys.length) return { ...DEFAULT_POINTS_SYSTEM.placementPoints };
-
   return next;
 }
 
@@ -465,7 +493,9 @@ function normalizePointsSystem(ps) {
 
   const participationRaw = ensureObj(raw.participation);
   const participation = {
-    enabled: Boolean(participationRaw.enabled ?? DEFAULT_POINTS_SYSTEM.participation.enabled),
+    enabled: Boolean(
+      participationRaw.enabled ?? DEFAULT_POINTS_SYSTEM.participation.enabled
+    ),
     points: toInt(
       participationRaw.points ?? DEFAULT_POINTS_SYSTEM.participation.points,
       DEFAULT_POINTS_SYSTEM.participation.points
@@ -524,7 +554,6 @@ export function getPointsSystem(fallback = null) {
 
   if (!stored && fallback) return normalizePointsSystem(fallback);
   if (!stored) return normalizePointsSystem(DEFAULT_POINTS_SYSTEM);
-
   return normalizePointsSystem(stored);
 }
 
@@ -571,12 +600,7 @@ export function calculateLeaguePoints({
 
   const totalPoints = placementPoints + participationPoints + bonusPoints;
 
-  return {
-    placementPoints,
-    participationPoints,
-    bonusPoints,
-    totalPoints,
-  };
+  return { placementPoints, participationPoints, bonusPoints, totalPoints };
 }
 
 export function sortRoundsForRanking(rounds, pointsSystem = null) {
@@ -607,7 +631,7 @@ export function sortRoundsForRanking(rounds, pointsSystem = null) {
 }
 
 /* ---------------------------------------------
-   ROUNDS (still local for Option A)
+   ROUNDS (still local for now)
 ---------------------------------------------- */
 
 export function getRounds(fallback = []) {
@@ -721,6 +745,7 @@ export function addSeasonArchive(archiveItem) {
   set(KEYS.seasonArchives, next);
   return archiveItem;
 }
+
 
 
 

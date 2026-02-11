@@ -1,129 +1,65 @@
-// src/pages/League.jsx
-import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
-import EmptyState from "../components/ui/EmptyState";
+// src/pages/LeagueSettings.jsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import Card from "../components/ui/Card";
+import EmptyState from "../components/ui/EmptyState";
+import PageHeader from "../components/ui/PageHeader";
+
 import { supabase } from "../lib/supabaseClient";
-import { useAuth } from "../auth/useAuth";
 
 import {
-  getLeague,
-  setLeague,
+  getLeagueSafe,
+  setLeagueSafe,
+  setLeagueSeasonDates,
   getUsers,
-  getRounds,
-  setRounds,
-  getTrophies,
-  setTrophies,
-  addSeasonArchive,
   getPointsSystem,
   setPointsSystem,
-  syncActiveLeagueFromSupabase,
-  setActiveLeagueId,
+  getLeagueRole,
+  setLeagueRole,
+  LEAGUE_ROLES,
 } from "../utils/storage";
-import { buildStandings } from "../utils/stats";
 
-const DEFAULT_POINTS_SYSTEM = {
-  placementPoints: { 1: 3, 2: 2, 3: 0 },
-  participation: { enabled: false, points: 1 },
-  bonuses: {
-    enabled: false,
-    birdie: { enabled: false, points: 1 },
-    eagle: { enabled: false, points: 2 },
-    hio: { enabled: false, points: 5 },
-  },
-};
-
-function formatSeasonRange(startISO) {
-  if (!startISO) return "";
-  const start = new Date(startISO);
-  const end = new Date(startISO);
-  end.setFullYear(end.getFullYear() + 1);
-  end.setDate(end.getDate() - 1);
-
-  const fmt = (d) => d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
-  return `${fmt(start)} – ${fmt(end)}`;
+function ensureArr(v) {
+  return Array.isArray(v) ? v : [];
 }
 
-function getWeekNumber(seasonStartISO) {
-  if (!seasonStartISO) return 1;
-  const start = new Date(seasonStartISO);
-  const now = new Date();
-  const diff = Math.max(0, now.getTime() - start.getTime());
-  const days = diff / (1000 * 60 * 60 * 24);
-  return Math.max(1, Math.floor(days / 7) + 1);
-}
-
-function Modal({ open, title, children, onClose }) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-[60]">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden="true" />
-      <div className="absolute left-1/2 top-1/2 w-[92vw] max-w-lg -translate-x-1/2 -translate-y-1/2">
-        <div className="rounded-2xl bg-white p-5 shadow-xl ring-1 ring-slate-200">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="truncate text-base font-extrabold text-slate-900">{title}</div>
-              <div className="mt-1 text-xs font-semibold text-slate-500">Supabase-backed.</div>
-            </div>
-            <button
-              onClick={onClose}
-              className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-            >
-              Close
-            </button>
-          </div>
-          <div className="mt-4">{children}</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Toast({ message, onClose }) {
-  if (!message) return null;
-  return (
-    <div className="fixed bottom-24 left-1/2 z-[70] w-[92vw] max-w-md -translate-x-1/2">
-      <div className="rounded-2xl bg-slate-900 p-4 text-sm shadow-lg">
-        <div className="flex items-start justify-between gap-4">
-          <div className="text-white">{message}</div>
-          <button
-            onClick={onClose}
-            className="rounded-lg bg-white/10 px-2 py-1 text-xs font-extrabold text-white hover:bg-white/15"
-          >
-            OK
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Crest() {
-  return (
-    <div className="grid h-10 w-10 place-items-center rounded-2xl bg-slate-900 text-lg text-white shadow-sm">
-      🏆
-    </div>
-  );
-}
-
-function PosPill({ pos }) {
-  const isLeader = pos === 1;
-  return (
-    <div
-      className={[
-        "inline-flex h-7 w-9 items-center justify-center rounded-lg text-xs font-extrabold text-white",
-        isLeader ? "bg-amber-500" : "bg-slate-700",
-      ].join(" ")}
-      title={isLeader ? "Leader" : `Position ${pos}`}
-    >
-      {pos}
-    </div>
-  );
+function ensureObj(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
 
 function safeNum(n, fallback = 0) {
   const x = typeof n === "string" ? Number(n) : n;
   return Number.isFinite(x) ? x : fallback;
+}
+
+function toISODateInput(iso) {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toISOString().slice(0, 10);
+  } catch {
+    return "";
+  }
+}
+
+function fromISODateInput(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toISOString();
+}
+
+function getUserId(u) {
+  return u?.id || u?._id || null;
+}
+
+function getUserName(u) {
+  return (
+    u?.name ||
+    u?.fullName ||
+    u?.displayName ||
+    u?.username ||
+    u?.display_name ||
+    "Golfer"
+  );
 }
 
 function normalizePlacement(v) {
@@ -137,55 +73,17 @@ function normalizePlacement(v) {
   return next;
 }
 
-function placementToLabel(map) {
-  const m = normalizePlacement(map);
-  const places = Object.keys(m)
+function placementRowsFromMap(map) {
+  return Object.keys(normalizePlacement(map))
     .map((k) => Number(k))
     .filter((n) => Number.isFinite(n))
     .sort((a, b) => a - b);
-
-  if (!places.length) return "Not set";
-
-  return places
-    .map((p) => `${p}${p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}=${m[p]}`)
-    .join(", ");
 }
 
-function mergePointsSystem(raw) {
-  const base = DEFAULT_POINTS_SYSTEM;
-  const ps = raw && typeof raw === "object" ? raw : {};
-
-  const placementPoints = normalizePlacement(ps.placementPoints || base.placementPoints);
-
-  const participation = ps.participation && typeof ps.participation === "object" ? ps.participation : {};
-  const bonuses = ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
-
-  const birdie = bonuses.birdie && typeof bonuses.birdie === "object" ? bonuses.birdie : {};
-  const eagle = bonuses.eagle && typeof bonuses.eagle === "object" ? bonuses.eagle : {};
-  const hio = bonuses.hio && typeof bonuses.hio === "object" ? bonuses.hio : {};
-
-  return {
-    placementPoints: Object.keys(placementPoints).length ? placementPoints : base.placementPoints,
-    participation: {
-      enabled: Boolean(participation.enabled ?? base.participation.enabled),
-      points: Math.trunc(safeNum(participation.points, base.participation.points)),
-    },
-    bonuses: {
-      enabled: Boolean(bonuses.enabled ?? base.bonuses.enabled),
-      birdie: {
-        enabled: Boolean(birdie.enabled ?? base.bonuses.birdie.enabled),
-        points: Math.trunc(safeNum(birdie.points, base.bonuses.birdie.points)),
-      },
-      eagle: {
-        enabled: Boolean(eagle.enabled ?? base.bonuses.eagle.enabled),
-        points: Math.trunc(safeNum(eagle.points, base.bonuses.eagle.points)),
-      },
-      hio: {
-        enabled: Boolean(hio.enabled ?? base.bonuses.hio.enabled),
-        points: Math.trunc(safeNum(hio.points, base.bonuses.hio.points)),
-      },
-    },
-  };
+function roleLabel(role) {
+  if (role === LEAGUE_ROLES.host) return "Host";
+  if (role === LEAGUE_ROLES.co_host) return "Co-host";
+  return "Member";
 }
 
 function humanizeSupabaseError(err) {
@@ -194,519 +92,1228 @@ function humanizeSupabaseError(err) {
   return msg;
 }
 
-async function insertLeagueRobust({ name, userId }) {
-  // Try a few payload shapes so we don’t hard-depend on one schema.
-  const attempts = [
-    // common schema: host_user_id
-    { name, host_user_id: userId },
-    // minimal
-    { name },
-  ];
-
-  let lastErr = null;
-
-  for (const payload of attempts) {
-    // eslint-disable-next-line no-await-in-loop
-    const res = await supabase.from("leagues").insert(payload).select("*").single();
-    if (!res.error && res.data) return res.data;
-    lastErr = res.error;
-    const msg = String(res.error?.message || "").toLowerCase();
-
-    // If the failure is “column does not exist”, try next payload
-    if (msg.includes("column") && msg.includes("does not exist")) continue;
-
-    // If it’s “null value violates not-null constraint”, try next payload (maybe needs host_user_id)
-    if (msg.includes("null value") && msg.includes("violates")) continue;
-
-    // Otherwise stop early
-    break;
-  }
-
-  throw lastErr || new Error("Failed to create league.");
+function isUniqueViolation(err) {
+  return String(err?.code || "") === "23505";
 }
 
-export default function League() {
+function getLeagueIdFromLocation(location) {
+  // Priority: navigation state, then query string
+  const stateId = location?.state?.leagueId || location?.state?.id || null;
+  if (stateId) return stateId;
+
+  try {
+    const sp = new URLSearchParams(location?.search || "");
+    const q = sp.get("leagueId") || sp.get("league_id");
+    if (q) return q;
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+export default function LeagueSettings() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user, loading: authLoading } = useAuth();
 
-  const [league, setLeagueState] = useState(() => getLeague(null));
-  const [users, setUsersState] = useState(() => getUsers([]));
-  const [rounds, setRoundsState] = useState(() => getRounds([]));
+  const [league, setLeagueState] = useState(() => getLeagueSafe({}));
+  const [users, setUsersState] = useState(() => ensureArr(getUsers([])));
 
-  const [toast, setToast] = useState("");
-  const [showEndSeason, setShowEndSeason] = useState(false);
+  // Supabase auth user
+  const [authUserId, setAuthUserId] = useState(null);
 
-  const [leagueLoading, setLeagueLoading] = useState(false);
-  const [leagueSyncError, setLeagueSyncError] = useState("");
+  // Supabase profile + role (preferred truth)
+  const [myProfile, setMyProfile] = useState(null);
+  const [myRoleLive, setMyRoleLive] = useState(null);
+  const [roleLoading, setRoleLoading] = useState(false);
 
-  // Create League modal
-  const [showCreate, setShowCreate] = useState(false);
-  const [createName, setCreateName] = useState("");
-  const [createBusy, setCreateBusy] = useState(false);
-  const [createErr, setCreateErr] = useState("");
+  // Stable league context for this page
+  const stableLeagueIdRef = useRef(null);
+  const initDoneRef = useRef(false);
 
-  const pointsSystem = useMemo(() => {
-    return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
-  }, [league?.pointsSystem]);
+  // Prevent stale async responses overwriting
+  const roleReqIdRef = useRef(0);
+  const leagueReqIdRef = useRef(0);
 
-  // ✅ Hydrate from Supabase on entry (or navigation)
+  // Invite status UI
+  const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
+
+  // Friends for invite list (Supabase source)
+  const [friends, setFriends] = useState([]);
+  const [friendsLoading, setFriendsLoading] = useState(false);
+
+  // Pending invites UI
+  const [pendingInvites, setPendingInvites] = useState([]);
+  const [invitesLoading, setInvitesLoading] = useState(false);
+  const [inviteActionId, setInviteActionId] = useState(null);
+
+  // points system
+  useMemo(() => getPointsSystem(null), [league?.pointsSystem]); // keep behavior
+
+  // points draft
+  const [pointsDraft, setPointsDraft] = useState(() => {
+    const ps = getPointsSystem(null);
+    return {
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
+
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
+    };
+  });
+
+  // season dates draft
+  const [seasonStart, setSeasonStart] = useState(() => toISODateInput(league?.seasonStartISO));
+  const [seasonEnd, setSeasonEnd] = useState(() => toISODateInput(league?.seasonEndISO));
+
+  const members = useMemo(() => ensureArr(league?.members), [league?.members]);
+
+  const memberUsers = useMemo(() => {
+    const setIds = new Set(members);
+    return users.filter((u) => setIds.has(getUserId(u)));
+  }, [users, members]);
+
+  // display fallback "me"
+  const me = useMemo(() => {
+    if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
+    return users?.[0] || null;
+  }, [authUserId, users]);
+
+  const myId = authUserId || getUserId(me);
+  const myDisplayName = myProfile?.display_name || getUserName(me);
+
+  /**
+   * ✅ Permission logic (fix):
+   * Prefer Supabase league_members role (myRoleLive),
+   * but FALL BACK to:
+   * - leagues.host_user_id === authUserId
+   * - cached league.memberRoles[authUserId] (populated by syncActiveLeagueFromSupabase)
+   */
+  const cachedRole = useMemo(() => {
+    if (!authUserId) return null;
+    const roles = ensureObj(league?.memberRoles);
+    return roles[authUserId] || null;
+  }, [league?.memberRoles, authUserId]);
+
+  const isHostByLeagueRow = Boolean(authUserId && league?.host_user_id && league.host_user_id === authUserId);
+
+  const effectiveRole =
+    myRoleLive ||
+    (isHostByLeagueRow ? LEAGUE_ROLES.host : null) ||
+    cachedRole ||
+    LEAGUE_ROLES.member;
+
+  const canEdit =
+    effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.co_host;
+
+  // Auth bootstrap (Netlify-safe)
   useEffect(() => {
     let alive = true;
 
-    async function syncLeague() {
-      if (authLoading) return; // wait for auth
-      setLeagueLoading(true);
-      setLeagueSyncError("");
-
+    async function boot() {
       try {
-        await syncActiveLeagueFromSupabase();
-      } catch (e) {
-        const msg = String(e?.message || "");
-        if (alive && msg) setLeagueSyncError(msg);
-      } finally {
+        const { data } = await supabase.auth.getSession();
         if (!alive) return;
-        setLeagueState(getLeague(null));
-        setUsersState(getUsers([]));
-        setRoundsState(getRounds([]));
-        setLeagueLoading(false);
+        setAuthUserId(data?.session?.user?.id || null);
+      } catch {
+        if (!alive) return;
+        setAuthUserId(null);
       }
     }
 
-    syncLeague();
+    boot();
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!alive) return;
+      setAuthUserId(session?.user?.id || null);
+    });
 
     return () => {
       alive = false;
+      try {
+        sub?.subscription?.unsubscribe?.();
+      } catch {
+        // ignore
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.pathname, authLoading, user?.id]);
+  }, []);
 
-  // Ensure league has a pointsSystem once we have a league (safe default)
+  /**
+   * ✅ Freeze leagueId ASAP from navigation state/query (so refresh/back doesn’t break).
+   * This runs whenever location changes and sets stableLeagueIdRef if not already set.
+   */
   useEffect(() => {
-    if (!league) return;
-    if (!league?.pointsSystem) {
-      const merged = mergePointsSystem(DEFAULT_POINTS_SYSTEM);
-      setPointsSystem(merged);
+    const navLeagueId = getLeagueIdFromLocation(location);
+    if (navLeagueId) stableLeagueIdRef.current = navLeagueId;
+  }, [location]);
 
-      const nextLeague = { ...league, pointsSystem: merged };
-      setLeague(nextLeague);
-      setLeagueState(nextLeague);
-    }
+  // One-time init: cache UI state
+  useEffect(() => {
+    if (initDoneRef.current) return;
+    initDoneRef.current = true;
+
+    const cachedLeague = getLeagueSafe({});
+    const cachedUsers = ensureArr(getUsers([]));
+
+    const navLeagueId = getLeagueIdFromLocation(location);
+    const cachedLeagueId = cachedLeague?.id || null;
+
+    stableLeagueIdRef.current = navLeagueId || cachedLeagueId || null;
+
+    setLeagueState(cachedLeague);
+    setUsersState(cachedUsers);
+
+    setSeasonStart(toISODateInput(cachedLeague?.seasonStartISO));
+    setSeasonEnd(toISODateInput(cachedLeague?.seasonEndISO));
+
+    const ps = getPointsSystem(null);
+    setPointsDraft({
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
+
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
+    });
+
+    setInviteStatus({ type: "", message: "" });
+    setPendingInvites([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [league?.id]);
+  }, []);
 
-  const leagueRounds = useMemo(() => {
-    if (!league?.id) return [];
-    return rounds.filter((r) => !r?.leagueId || r?.leagueId === league.id);
-  }, [league?.id, rounds]);
+  async function refreshLeagueFromSupabase(leagueId) {
+    if (!leagueId) return;
 
-  const standings = useMemo(() => {
-    if (!league) return [];
-    const members = Array.isArray(league?.members) ? league.members : [];
-    const memberUsers = users.filter((u) => members.includes(u.id || u._id));
-    return buildStandings(memberUsers, leagueRounds, pointsSystem);
-  }, [league, users, leagueRounds, pointsSystem]);
-
-  async function handleCreateLeague() {
-    if (!user?.id) {
-      setCreateErr("You must be signed in to create a league.");
-      return;
-    }
-
-    const name = String(createName || "").trim();
-    if (name.length < 2) {
-      setCreateErr("League name must be at least 2 characters.");
-      return;
-    }
-
-    setCreateBusy(true);
-    setCreateErr("");
+    const reqId = ++leagueReqIdRef.current;
 
     try {
-      // 1) Create league
-      const leagueRow = await insertLeagueRobust({ name, userId: user.id });
+      const { data, error } = await supabase
+        .from("leagues")
+        .select("*")
+        .eq("id", leagueId)
+        .single();
 
-      const leagueId = leagueRow?.id;
-      if (!leagueId) throw new Error("League created but id missing.");
+      if (reqId !== leagueReqIdRef.current) return;
+      if (error) throw error;
 
-      // 2) Create membership as host
-      const { error: memErr } = await supabase.from("league_members").insert({
-        league_id: leagueId,
-        user_id: user.id,
-        role: "host",
-      });
-      if (memErr) throw memErr;
+      const merged = { ...getLeagueSafe({}), ...data };
+      setLeagueSafe(merged);
+      setLeagueState(merged);
 
-      // 3) Pin active league + sync cache
-      setActiveLeagueId(leagueId);
-      await syncActiveLeagueFromSupabase({ leagueId });
-
-      // 4) Refresh UI from cache
-      setLeagueState(getLeague(null));
-      setUsersState(getUsers([]));
-      setRoundsState(getRounds([]));
-
-      setShowCreate(false);
-      setCreateName("");
-      setToast("League created ✅ You’re Host.");
-    } catch (e) {
-      setCreateErr(humanizeSupabaseError(e));
-    } finally {
-      setCreateBusy(false);
+      if (data?.season_start || data?.seasonStartISO) {
+        const iso = data?.seasonStartISO || data?.season_start;
+        setSeasonStart(toISODateInput(iso));
+      }
+      if (data?.season_end || data?.seasonEndISO) {
+        const iso = data?.seasonEndISO || data?.season_end;
+        setSeasonEnd(toISODateInput(iso));
+      }
+    } catch {
+      // keep cached league for UI
     }
   }
 
-  // ✅ No league yet (production flow)
-  if (!league) {
+  async function ensureStableLeagueIdIsValid() {
+    if (!authUserId) return;
+
+    const current = stableLeagueIdRef.current;
+
+    if (current) {
+      try {
+        const { data, error } = await supabase
+          .from("league_members")
+          .select("league_id, role")
+          .eq("league_id", current)
+          .eq("user_id", authUserId)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (data?.league_id) return;
+      } catch {
+        // attempt recovery
+      }
+    }
+
+    try {
+      const { data: rows, error } = await supabase
+        .from("league_members")
+        .select("league_id, role, created_at")
+        .eq("user_id", authUserId)
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      const list = ensureArr(rows);
+      if (list.length === 0) return;
+
+      const hostish = list.find(
+        (r) => r?.role === LEAGUE_ROLES.host || r?.role === LEAGUE_ROLES.co_host
+      );
+      const pick = hostish?.league_id || list[0]?.league_id || null;
+      if (!pick) return;
+
+      stableLeagueIdRef.current = pick;
+      await refreshLeagueFromSupabase(pick);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function refreshMyProfileAndRole() {
+    const leagueId = stableLeagueIdRef.current;
+    if (!authUserId || !leagueId) return;
+
+    const reqId = ++roleReqIdRef.current;
+    setRoleLoading(true);
+
+    try {
+      // Profile (nice-to-have)
+      const { data: prof, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, display_name")
+        .eq("id", authUserId)
+        .single();
+
+      if (reqId !== roleReqIdRef.current) return;
+      if (!profErr) setMyProfile(prof || null);
+
+      // Role (truth)
+      const { data: mem, error: memErr } = await supabase
+        .from("league_members")
+        .select("role")
+        .eq("league_id", leagueId)
+        .eq("user_id", authUserId)
+        .maybeSingle();
+
+      if (reqId !== roleReqIdRef.current) return;
+      if (memErr) throw memErr;
+
+      const role = mem?.role || LEAGUE_ROLES.member;
+      setMyRoleLive(role);
+
+      // optional cache alignment (for other screens)
+      try {
+        setLeagueRole(authUserId, role);
+      } catch {
+        // ignore
+      }
+    } catch {
+      // keep whatever role we had; fallbacks will still allow host edits
+      if (reqId !== roleReqIdRef.current) return;
+      if (myRoleLive == null) setMyRoleLive(null);
+    } finally {
+      if (reqId !== roleReqIdRef.current) return;
+      setRoleLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!authUserId) {
+      setMyRoleLive(null);
+      setMyProfile(null);
+      return;
+    }
+
+    (async () => {
+      await ensureStableLeagueIdIsValid();
+
+      const leagueId = stableLeagueIdRef.current;
+      if (leagueId) await refreshLeagueFromSupabase(leagueId);
+
+      await refreshMyProfileAndRole();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUserId]);
+
+  async function loadPendingInvites({ leagueId }) {
+    if (!leagueId) return;
+
+    setInvitesLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("league_invites")
+        .select(
+          `
+          id,
+          league_id,
+          inviter_user_id,
+          invitee_user_id,
+          status,
+          created_at,
+          invitee:profiles!league_invites_invitee_user_id_fkey (
+            id,
+            display_name
+          )
+        `
+        )
+        .eq("league_id", leagueId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setPendingInvites(ensureArr(data));
+    } catch {
+      setPendingInvites([]);
+    } finally {
+      setInvitesLoading(false);
+    }
+  }
+
+  async function loadFriendsForInvites({ userId }) {
+    if (!userId) {
+      setFriends([]);
+      return;
+    }
+
+    setFriendsLoading(true);
+    try {
+      const { data: rows, error } = await supabase
+        .from("friendships")
+        .select("id,user_low,user_high,status")
+        .eq("status", "accepted")
+        .or(`user_low.eq.${userId},user_high.eq.${userId}`);
+
+      if (error) throw error;
+
+      const rels = ensureArr(rows);
+      const friendIds = rels
+        .map((r) => {
+          const low = r?.user_low || null;
+          const high = r?.user_high || null;
+          if (!low || !high) return null;
+          return low === userId ? high : low;
+        })
+        .filter(Boolean);
+
+      const uniq = Array.from(new Set(friendIds));
+
+      if (uniq.length === 0) {
+        setFriends([]);
+        return;
+      }
+
+      const { data: profs, error: profErr } = await supabase
+        .from("profiles")
+        .select("id,display_name")
+        .in("id", uniq);
+
+      if (profErr) throw profErr;
+
+      const next = ensureArr(profs).sort((a, b) => {
+        const an = String(a?.display_name || "").toLowerCase();
+        const bn = String(b?.display_name || "").toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      setFriends(next);
+    } catch (e) {
+      setFriends([]);
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setFriendsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!myId) return;
+    loadFriendsForInvites({ userId: myId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myId]);
+
+  useEffect(() => {
+    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    if (!leagueId) return;
+
+    if (!canEdit) {
+      setPendingInvites([]);
+      return;
+    }
+
+    loadPendingInvites({ leagueId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit]);
+
+  const stableLeagueId = stableLeagueIdRef.current || league?.id || null;
+
+  if (!stableLeagueId) {
     return (
-      <div className="pt-2 space-y-3">
+      <div className="pt-2">
         <EmptyState
-          icon="🏌️"
-          title={leagueLoading ? "Loading your league…" : "No league yet"}
-          description={
-            leagueLoading
-              ? "Checking your league membership…"
-              : "Create a league (or accept an invite) to unlock standings and settings."
-          }
+          icon="⚙️"
+          title="No league selected"
+          description="Open League Settings from a specific league."
           actions={
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={() => navigate("/friends")}
-                className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-              >
-                Find golfers
-              </button>
-
-              <button
-                onClick={() => navigate("/profile")}
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
-              >
-                Go to Profile
-              </button>
-
-              <button
-                onClick={() => setShowCreate(true)}
-                disabled={!user?.id || leagueLoading}
-                className={[
-                  "rounded-xl px-4 py-2 text-sm font-extrabold",
-                  !user?.id || leagueLoading
-                    ? "bg-slate-200 text-slate-500 cursor-not-allowed"
-                    : "bg-emerald-600 text-white hover:bg-emerald-500",
-                ].join(" ")}
-              >
-                + Create League
-              </button>
-            </div>
+            <button
+              onClick={() => navigate("/leagues")}
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
+            >
+              Back to Leagues
+            </button>
           }
         />
-
-        {leagueSyncError ? (
-          <div className="rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
-            {leagueSyncError}
-          </div>
-        ) : null}
-
-        <Modal open={showCreate} title="Create a league" onClose={() => setShowCreate(false)}>
-          <div className="space-y-3">
-            <div className="text-sm font-semibold text-slate-700">
-              You’ll become <span className="font-extrabold">Host</span> automatically.
-            </div>
-
-            <div>
-              <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-                League name
-              </div>
-              <input
-                value={createName}
-                onChange={(e) => setCreateName(e.target.value)}
-                placeholder="e.g. Sunday Society"
-                className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-extrabold text-slate-900 outline-none ring-emerald-200 focus:ring-4"
-              />
-            </div>
-
-            {createErr ? (
-              <div className="rounded-2xl bg-rose-50 p-3 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
-                {createErr}
-              </div>
-            ) : null}
-
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={handleCreateLeague}
-                disabled={createBusy}
-                className={[
-                  "rounded-xl px-4 py-2 text-sm font-extrabold",
-                  createBusy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-slate-900 text-white hover:bg-slate-800",
-                ].join(" ")}
-              >
-                {createBusy ? "Creating…" : "Create league"}
-              </button>
-
-              <button
-                onClick={() => setShowCreate(false)}
-                className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </Modal>
       </div>
     );
   }
 
-  function goToPlayer(userId) {
-    navigate(`/profile?userId=${encodeURIComponent(userId)}`);
+  function setPreset(preset) {
+    if (!canEdit) return;
+
+    if (preset === "default") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3, 2: 2, 3: 0 }),
+      }));
+      return;
+    }
+    if (preset === "yourLeague") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3, 2: 1, 3: 0 }),
+      }));
+      return;
+    }
+    if (preset === "winnerOnly") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3 }),
+      }));
+      return;
+    }
   }
 
-  function endSeasonConfirm() {
-    const trophies = getTrophies([]);
-
-    const champion = standings[0];
-    const mostBirdies = standings.slice().sort((a, b) => b.birdies - a.birdies)[0];
-    const mostEagles = standings.slice().sort((a, b) => b.eagles - a.eagles)[0];
-    const mostMajors = standings.slice().sort((a, b) => b.majors - a.majors)[0];
-
-    const endedAtISO = new Date().toISOString();
-    const seasonLabel = formatSeasonRange(league.seasonStartISO);
-
-    const awards = [
-      champion
-        ? {
-            type: "LEAGUE_CHAMPION",
-            title: "League Champion 🏆",
-            userId: champion.userId,
-            meta: { seasonLabel, points: champion.points },
-          }
-        : null,
-      mostBirdies
-        ? {
-            type: "MOST_BIRDIES",
-            title: "Most Birdies 🐦",
-            userId: mostBirdies.userId,
-            meta: { seasonLabel, birdies: mostBirdies.birdies },
-          }
-        : null,
-      mostEagles
-        ? {
-            type: "MOST_EAGLES",
-            title: "Most Eagles 🦅",
-            userId: mostEagles.userId,
-            meta: { seasonLabel, eagles: mostEagles.eagles },
-          }
-        : null,
-      mostMajors
-        ? {
-            type: "MAJOR_HOUND",
-            title: "Major Hound ⭐",
-            userId: mostMajors.userId,
-            meta: { seasonLabel, majors: mostMajors.majors },
-          }
-        : null,
-    ].filter(Boolean);
-
-    const newTrophies = awards.map((a) => ({
-      id: crypto.randomUUID(),
-      userId: a.userId,
-      type: a.type,
-      title: a.title,
-      dateISO: endedAtISO,
-      leagueId: league.id,
-      meta: a.meta,
+  function updatePlacement(place, value) {
+    if (!canEdit) return;
+    const p = Math.trunc(safeNum(place, NaN));
+    if (!Number.isFinite(p) || p <= 0) return;
+    const v = Math.trunc(safeNum(value, 0));
+    setPointsDraft((d) => ({
+      ...d,
+      placementPoints: { ...(d.placementPoints || {}), [p]: v },
     }));
-
-    addSeasonArchive({
-      id: crypto.randomUUID(),
-      leagueId: league.id,
-      seasonLabel,
-      endedAtISO,
-      standingsSnapshot: standings,
-      awardsSnapshot: newTrophies,
-    });
-
-    setTrophies([...(newTrophies || []), ...(trophies || [])]);
-
-    const nextLeague = { ...league, seasonStartISO: endedAtISO };
-    setLeague(nextLeague);
-    setLeagueState(nextLeague);
-
-    const remaining = rounds.filter((r) => r?.leagueId && r?.leagueId !== league.id);
-    setRounds(remaining);
-    setRoundsState(remaining);
-
-    setShowEndSeason(false);
-    setToast("Season ended — trophies awarded + standings archived 🏆");
   }
 
-  const seasonRange = formatSeasonRange(league.seasonStartISO);
-  const week = getWeekNumber(league.seasonStartISO);
-  const placementSummary = placementToLabel(pointsSystem?.placementPoints);
+  function removePlacement(place) {
+    if (!canEdit) return;
+    const p = Math.trunc(safeNum(place, NaN));
+    if (!Number.isFinite(p) || p <= 0) return;
+    setPointsDraft((d) => {
+      const next = { ...(d.placementPoints || {}) };
+      delete next[p];
+      return { ...d, placementPoints: next };
+    });
+  }
+
+  function addPlacementRow() {
+    if (!canEdit) return;
+    setPointsDraft((d) => {
+      const cur = normalizePlacement(d.placementPoints);
+      const existingPlaces = Object.keys(cur).map((k) => Number(k));
+      const nextPlace = existingPlaces.length ? Math.max(...existingPlaces) + 1 : 4;
+      return { ...d, placementPoints: { ...cur, [nextPlace]: 0 } };
+    });
+  }
+
+  function savePointsSystem() {
+    if (!canEdit) return;
+
+    const placementPoints = normalizePlacement(pointsDraft.placementPoints);
+    const safePlacement =
+      Object.keys(placementPoints).length > 0 ? placementPoints : { 1: 3, 2: 2, 3: 0 };
+
+    const merged = {
+      placementPoints: safePlacement,
+      participation: {
+        enabled: Boolean(pointsDraft.participationEnabled),
+        points: Math.trunc(safeNum(pointsDraft.participationPoints, 1)),
+      },
+      bonuses: {
+        enabled: Boolean(pointsDraft.bonusesEnabled),
+        birdie: {
+          enabled: Boolean(pointsDraft.birdieEnabled),
+          points: Math.trunc(safeNum(pointsDraft.birdiePoints, 1)),
+        },
+        eagle: {
+          enabled: Boolean(pointsDraft.eagleEnabled),
+          points: Math.trunc(safeNum(pointsDraft.eaglePoints, 2)),
+        },
+        hio: {
+          enabled: Boolean(pointsDraft.hioEnabled),
+          points: Math.trunc(safeNum(pointsDraft.hioPoints, 5)),
+        },
+      },
+    };
+
+    const next = setPointsSystem(merged);
+    const nextLeague = { ...getLeagueSafe({}), pointsSystem: next };
+    setLeagueSafe(nextLeague);
+    setLeagueState(nextLeague);
+  }
+
+  function saveSeasonDates() {
+    if (!canEdit) return;
+
+    const startISO = fromISODateInput(seasonStart) || league?.seasonStartISO;
+    const endISO = seasonEnd ? fromISODateInput(seasonEnd) : null;
+
+    const next = setLeagueSeasonDates({ startISO, endISO });
+    setLeagueState(next);
+  }
+
+  function toggleCoHost(userId, makeCoHost) {
+    if (!canEdit) return;
+    if (!userId) return;
+
+    setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
+    setLeagueState(getLeagueSafe({}));
+  }
+
+  async function sendInviteToFriend(friendProfile) {
+    if (!canEdit) return;
+
+    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    if (!leagueId) return;
+
+    if (!myId) {
+      setInviteStatus({ type: "error", message: "You must be signed in to invite." });
+      return;
+    }
+
+    const inviteeUserId = friendProfile?.id || null;
+    if (!inviteeUserId) return;
+
+    const memberSetLocal = new Set(ensureArr(members));
+    if (memberSetLocal.has(inviteeUserId)) {
+      setInviteStatus({ type: "info", message: "They’re already in this league." });
+      return;
+    }
+
+    setInviteActionId(inviteeUserId);
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      const { error: invErr } = await supabase.from("league_invites").insert({
+        league_id: leagueId,
+        inviter_user_id: myId,
+        invitee_user_id: inviteeUserId,
+        status: "pending",
+      });
+
+      if (invErr) {
+        if (isUniqueViolation(invErr)) {
+          setInviteStatus({ type: "info", message: "Invite already pending for that golfer." });
+          return;
+        }
+        throw invErr;
+      }
+
+      await loadPendingInvites({ leagueId });
+
+      setInviteStatus({
+        type: "success",
+        message: "Invite sent ✅ They’ll see it in their invites and can accept to join.",
+      });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setInviteActionId(null);
+    }
+  }
+
+  async function cancelInvite(inviteId) {
+    if (!canEdit) return;
+    if (!inviteId) return;
+
+    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    if (!leagueId) return;
+
+    try {
+      const { error } = await supabase.from("league_invites").delete().eq("id", inviteId);
+      if (error) throw error;
+
+      await loadPendingInvites({ leagueId });
+      setInviteStatus({ type: "info", message: "Invite cancelled." });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
+  }
+
+  const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
+
+  const memberSet = useMemo(() => new Set(ensureArr(members)), [members]);
+  const pendingInviteeSet = useMemo(
+    () => new Set(ensureArr(pendingInvites).map((x) => x?.invitee_user_id).filter(Boolean)),
+    [pendingInvites]
+  );
+
+  const friendsNotInLeague = useMemo(() => {
+    return ensureArr(friends).filter((p) => {
+      const id = p?.id;
+      if (!id) return false;
+      if (memberSet.has(id)) return false;
+      return true;
+    });
+  }, [friends, memberSet]);
 
   return (
-    <div className="space-y-4">
-      <Card>
-        <div className="flex items-center gap-3">
-          <Crest />
-          <div className="min-w-0">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">League</div>
-            <div className="truncate text-xl font-extrabold text-slate-900">{league.name}</div>
-            <div className="mt-1 text-sm font-semibold text-slate-600">{seasonRange}</div>
-
-            <div className="mt-2 text-xs font-semibold text-slate-500">
-              Points: <span className="font-extrabold text-slate-700">{placementSummary}</span>
-              {pointsSystem?.participation?.enabled ? (
-                <span className="ml-2 rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-extrabold text-slate-700 ring-1 ring-slate-200">
-                  +{pointsSystem.participation.points} play
-                </span>
-              ) : null}
-              {pointsSystem?.bonuses?.enabled ? (
-                <span className="ml-2 rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-extrabold text-slate-700 ring-1 ring-slate-200">
-                  Bonuses on
-                </span>
-              ) : null}
-            </div>
-
-            <div className="mt-1 text-[11px] font-semibold text-slate-500">
-              League admins can edit points in <span className="font-extrabold text-slate-700">League Settings</span>.
-            </div>
-
-            {leagueLoading ? (
-              <div className="mt-2 text-[11px] font-semibold text-slate-400">Syncing league…</div>
-            ) : null}
-          </div>
-
-          <div className="ml-auto text-right">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Week</div>
-            <div className="text-2xl font-extrabold text-emerald-700">{String(week).padStart(2, "0")}</div>
-          </div>
-        </div>
-
-        <div className="mt-4 flex flex-wrap items-center gap-2">
+    <div className="space-y-6">
+      <PageHeader
+        title="League Settings"
+        subtitle={
+          canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."
+        }
+        right={
           <button
-            onClick={() => navigate("/post")}
+            type="button"
+            onClick={() => navigate("/league")}
             className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
           >
-            + Submit Round
+            Back
           </button>
+        }
+      />
 
-          <button
-            onClick={() => {
-              setActiveLeagueId(league?.id);
-              navigate("/?scope=league");
-            }}
-            className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-            title="Opens the feed filtered to League banter"
-          >
-            League Banter →
-          </button>
+      {/* Admin status */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Your access</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
+              <span className="font-extrabold">{roleLabel(effectiveRole)}</span>
+              {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
+            </div>
 
-          <button
-            onClick={() => {
-              setActiveLeagueId(league?.id);
-              navigate("/league-settings", { state: { leagueId: league.id } });
-            }}
-            className="ml-auto rounded-xl bg-white px-4 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
+            <button
+              type="button"
+              onClick={refreshMyProfileAndRole}
+              disabled={!authUserId || roleLoading}
+              className={[
+                "mt-3 rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !authUserId || roleLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {roleLoading ? "Refreshing…" : "Refresh permissions"}
+            </button>
+          </div>
+
+          <span
+            className={[
+              "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
+              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
+            ].join(" ")}
           >
-            League Settings
-          </button>
+            {canEdit ? "Editing enabled" : "View only"}
+          </span>
         </div>
+
+        {myRoleLive == null ? (
+          <div className="mt-3 text-[11px] font-semibold text-slate-500">
+            If role lookup is slow/blocked, we fall back to cached host/co-host so you can keep working.
+          </div>
+        ) : null}
       </Card>
 
-      <div className="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
-        <div className="border-b border-slate-200 bg-slate-50 px-4 py-2">
-          <div className="grid grid-cols-[56px_1fr_44px_44px_44px_44px_70px] items-center gap-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
-            <div>Pos</div>
-            <div>Player</div>
-            <div className="text-center">R</div>
-            <div className="text-center">B</div>
-            <div className="text-center">E</div>
-            <div className="text-center">H</div>
-            <div className="text-right">Pts</div>
+      {/* Invite friends */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Invite friends</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Host/co-host can invite accepted friends. They join only after they accept.
+            </div>
           </div>
+
+          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+            League ID: <span className="font-mono">{String(stableLeagueId).slice(0, 8)}…</span>
+          </span>
         </div>
 
-        {standings.length === 0 ? (
-          <div className="p-4">
-            <EmptyState icon="📋" title="No rounds yet" description="Submit the first round to populate the league table." />
-          </div>
-        ) : (
-          <div className="divide-y divide-slate-200">
-            {standings.map((row, idx) => {
-              const pos = idx + 1;
-              return (
-                <button
-                  key={row.userId}
-                  onClick={() => goToPlayer(row.userId)}
-                  className="w-full px-4 py-3 text-left transition hover:bg-emerald-50 active:scale-[0.999]"
-                  title="Tap to view profile"
-                >
-                  <div className="grid grid-cols-[56px_1fr_44px_44px_44px_44px_70px] items-center gap-2">
-                    <div className="flex items-center">
-                      <PosPill pos={pos} />
-                    </div>
+        <div className="mt-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Friends not in this league
+            </div>
 
+            <button
+              type="button"
+              disabled={!canEdit || friendsLoading}
+              onClick={() => loadFriendsForInvites({ userId: myId })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || friendsLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {friendsLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can invite friends to the league.
+              </div>
+            ) : friendsLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading friends…</div>
+            ) : friendsNotInLeague.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">
+                No inviteable friends found (either none accepted yet, or they’re already in the league).
+              </div>
+            ) : (
+              friendsNotInLeague.map((p) => {
+                const pid = p?.id;
+                const name = p?.display_name || "Friend";
+                const alreadyInvited = pendingInviteeSet.has(pid);
+                const busy = inviteActionId === pid;
+
+                return (
+                  <div
+                    key={pid}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
                     <div className="min-w-0">
-                      <div className="truncate text-sm font-extrabold text-slate-900">{row.name}</div>
-                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">⭐ {row.majors} majors</div>
+                      <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
                     </div>
 
-                    <div className="text-center text-sm font-extrabold text-slate-900">{row.rounds}</div>
-                    <div className="text-center text-sm font-extrabold text-slate-900">{row.birdies}</div>
-                    <div className="text-center text-sm font-extrabold text-slate-900">{row.eagles}</div>
-                    <div className="text-center text-sm font-extrabold text-slate-900">{row.hio}</div>
-
-                    <div className="text-right">
-                      <div className="text-base font-extrabold text-slate-900">{row.points}</div>
-                      <div className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500">pts</div>
-                    </div>
+                    {alreadyInvited ? (
+                      <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+                        Invited
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => sendInviteToFriend(p)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold",
+                          busy
+                            ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                            : "bg-slate-900 text-white hover:bg-slate-800",
+                        ].join(" ")}
+                      >
+                        {busy ? "Inviting…" : "Invite"}
+                      </button>
+                    )}
                   </div>
-                </button>
-              );
-            })}
+                );
+              })
+            )}
           </div>
-        )}
-
-        <div className="flex items-center justify-between gap-2 border-t border-slate-200 bg-white px-4 py-3">
-          <div className="text-xs font-semibold text-slate-600">{leagueRounds.length} rounds played</div>
-          <button
-            onClick={() => setShowEndSeason(true)}
-            className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-extrabold text-white hover:bg-rose-500"
-          >
-            End Season
-          </button>
         </div>
-      </div>
 
-      <Modal open={showEndSeason} title="End season?" onClose={() => setShowEndSeason(false)}>
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-            <div className="font-extrabold text-slate-900">What happens:</div>
-            <ul className="mt-2 list-disc space-y-1 pl-5 font-semibold">
-              <li>League Champion trophy awarded to #1 in points.</li>
-              <li>Season awards: Most Birdies / Most Eagles / Major Hound.</li>
-              <li>Standings snapshot archived to seasonArchives.</li>
-              <li>Rounds cleared for a fresh season start (demo flow).</li>
-            </ul>
+        {/* Pending invites */}
+        <div className="mt-6">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Pending invites
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || invitesLoading}
+              onClick={() => loadPendingInvites({ leagueId: stableLeagueId })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || invitesLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {invitesLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can view and manage league invites.
+              </div>
+            ) : invitesLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
+            ) : pendingInvites.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">No pending invites.</div>
+            ) : (
+              pendingInvites.map((inv) => {
+                const invitee = inv?.invitee || null;
+                const display =
+                  invitee?.display_name ||
+                  String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+
+                const created = inv?.created_at ? new Date(inv.created_at) : null;
+
+                return (
+                  <div
+                    key={inv.id}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
+                      <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                        Status: <span className="font-extrabold">Pending</span>
+                        {created ? (
+                          <>
+                            {" "}
+                            · Sent {created.toLocaleDateString()}{" "}
+                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => cancelInvite(inv.id)}
+                      className="rounded-xl bg-rose-600 px-3 py-2 text-xs font-extrabold text-white hover:bg-rose-500"
+                      title="Cancel invite"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {inviteStatus?.message ? (
+          <div
+            className={[
+              "mt-4 rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+              inviteStatus.type === "success"
+                ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
+                : inviteStatus.type === "info"
+                ? "bg-slate-50 text-slate-800 ring-slate-200"
+                : "bg-rose-50 text-rose-900 ring-rose-200",
+            ].join(" ")}
+          >
+            {inviteStatus.message}
+          </div>
+        ) : null}
+      </Card>
+
+      {/* Points System */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Points system</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Configure how points are awarded in this league.
+            </div>
           </div>
 
           <div className="flex flex-wrap gap-2">
             <button
-              onClick={endSeasonConfirm}
-              className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-extrabold text-white hover:bg-rose-500"
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("default")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="1st=3, 2nd=2, 3rd=0"
             >
-              Confirm End Season
+              Default (3/2/0)
             </button>
+
             <button
-              onClick={() => setShowEndSeason(false)}
-              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("yourLeague")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="1st=3, 2nd=1, 3rd=0"
             >
-              Cancel
+              Your League (3/1/0)
+            </button>
+
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("winnerOnly")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="Winner only"
+            >
+              Winner only
             </button>
           </div>
         </div>
-      </Modal>
 
-      <Toast message={toast} onClose={() => setToast("")} />
+        <div className="mt-5 space-y-4">
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Placement points
+            </div>
+
+            <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
+              <div className="grid grid-cols-[70px_1fr_54px] items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
+                <div>Place</div>
+                <div>Points</div>
+                <div className="text-right">Del</div>
+              </div>
+
+              <div className="divide-y divide-slate-200 bg-white">
+                {placementRows.length === 0 ? (
+                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">
+                    No placement rules set yet.
+                  </div>
+                ) : (
+                  placementRows.map((p) => (
+                    <div
+                      key={p}
+                      className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2"
+                    >
+                      <div className="text-sm font-extrabold text-slate-900">
+                        {p}
+                        {p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}
+                      </div>
+
+                      <input
+                        value={String(pointsDraft.placementPoints?.[p] ?? 0)}
+                        onChange={(e) => updatePlacement(p, e.target.value)}
+                        inputMode="numeric"
+                        disabled={!canEdit}
+                        className={[
+                          "w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                          canEdit
+                            ? "border-slate-200 bg-white text-slate-900"
+                            : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                        ].join(" ")}
+                        aria-label={`Points for place ${p}`}
+                      />
+
+                      <div className="text-right">
+                        <button
+                          type="button"
+                          disabled={!canEdit}
+                          onClick={() => removePlacement(p)}
+                          className={[
+                            "rounded-xl px-3 py-2 text-xs font-extrabold",
+                            canEdit
+                              ? "bg-rose-600 text-white hover:bg-rose-500"
+                              : "bg-slate-100 text-slate-400 cursor-not-allowed",
+                          ].join(" ")}
+                          title="Remove this place"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="border-t border-slate-200 bg-white px-4 py-3">
+                <button
+                  type="button"
+                  disabled={!canEdit}
+                  onClick={addPlacementRow}
+                  className={[
+                    "rounded-xl px-4 py-2 text-xs font-extrabold",
+                    canEdit
+                      ? "bg-slate-100 text-slate-900 hover:bg-slate-200"
+                      : "bg-slate-50 text-slate-400 cursor-not-allowed",
+                  ].join(" ")}
+                >
+                  + Add place
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-2 text-xs font-semibold text-slate-500">
+              Anyone outside these places gets <span className="font-extrabold">0</span> points.
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={savePointsSystem}
+              className={[
+                "rounded-xl px-4 py-2 text-sm font-extrabold",
+                canEdit
+                  ? "bg-slate-900 text-white hover:bg-slate-800"
+                  : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              ].join(" ")}
+            >
+              Save points system
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigate("/league")}
+              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </Card>
+
+      {/* Season dates */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Season dates</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Used for standings, trophies, and archiving. Example: April → April.
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Season start
+            </div>
+            <input
+              type="date"
+              value={seasonStart}
+              onChange={(e) => setSeasonStart(e.target.value)}
+              disabled={!canEdit}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                canEdit
+                  ? "border-slate-200 bg-white text-slate-900"
+                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+              ].join(" ")}
+            />
+          </div>
+
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Season end (optional)
+            </div>
+            <input
+              type="date"
+              value={seasonEnd}
+              onChange={(e) => setSeasonEnd(e.target.value)}
+              disabled={!canEdit}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                canEdit
+                  ? "border-slate-200 bg-white text-slate-900"
+                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+              ].join(" ")}
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={!canEdit}
+            onClick={saveSeasonDates}
+            className={[
+              "rounded-xl px-4 py-2 text-sm font-extrabold",
+              canEdit
+                ? "bg-slate-900 text-white hover:bg-slate-800"
+                : "bg-slate-200 text-slate-500 cursor-not-allowed",
+            ].join(" ")}
+          >
+            Save season dates
+          </button>
+        </div>
+      </Card>
+
+      {/* Admins */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Admins</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Host and co-hosts can manage points and league settings.
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          {memberUsers.length === 0 ? (
+            <div className="text-sm font-semibold text-slate-600">No members found.</div>
+          ) : (
+            memberUsers.map((u) => {
+              const uid = getUserId(u);
+              const role = getLeagueRole(uid);
+              const isHost = role === LEAGUE_ROLES.host;
+              const isCoHost = role === LEAGUE_ROLES.co_host;
+
+              return (
+                <div
+                  key={uid}
+                  className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-extrabold text-slate-900">
+                      {getUserName(u)}
+                    </div>
+                    <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                      {roleLabel(role)}
+                      {uid === myId ? " · You" : ""}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {isHost ? (
+                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">
+                        Host
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!canEdit}
+                        onClick={() => toggleCoHost(uid, !isCoHost)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                          !canEdit
+                            ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                            : isCoHost
+                            ? "bg-emerald-600 text-white ring-emerald-600 hover:bg-emerald-500"
+                            : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+                        ].join(" ")}
+                        title={isCoHost ? "Remove co-host" : "Make co-host"}
+                      >
+                        {isCoHost ? "Co-host ✓" : "Make co-host"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div className="mt-3 text-[11px] font-semibold text-slate-500">
+          Permissions prefer Supabase <span className="font-mono">league_members</span>, with safe fallbacks to keep Host access working during migration.
+        </div>
+      </Card>
     </div>
   );
 }
+
