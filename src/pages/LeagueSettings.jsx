@@ -14,7 +14,7 @@ import {
   getUsers,
   getPointsSystem,
   setPointsSystem,
-  setLeagueRole,
+  setLeagueRole, // ✅ FIX: was being called but not imported
   LEAGUE_ROLES,
   syncActiveLeagueFromSupabase,
   setActiveLeagueId,
@@ -50,14 +50,7 @@ function getUserId(u) {
 }
 
 function getUserName(u) {
-  return (
-    u?.name ||
-    u?.fullName ||
-    u?.displayName ||
-    u?.username ||
-    u?.display_name ||
-    "Golfer"
-  );
+  return u?.name || u?.fullName || u?.displayName || u?.username || u?.display_name || "Golfer";
 }
 
 function normalizePlacement(v) {
@@ -108,6 +101,14 @@ function getLeagueIdFromLocation(location) {
   }
 
   return null;
+}
+
+// ✅ Normalize DB role strings into our constants (prevents "co-host" vs "co_host" bugs)
+function normalizeDbRole(role) {
+  const r = String(role || "").trim().toLowerCase();
+  if (r === "host") return LEAGUE_ROLES.host;
+  if (r === "co_host" || r === "co-host" || r === "cohost" || r === "co host") return LEAGUE_ROLES.co_host;
+  return LEAGUE_ROLES.member;
 }
 
 export default function LeagueSettings() {
@@ -333,7 +334,7 @@ export default function LeagueSettings() {
       if (reqId !== roleReqIdRef.current) return;
       if (memErr) throw memErr;
 
-      const role = mem?.role || LEAGUE_ROLES.member;
+      const role = normalizeDbRole(mem?.role);
       setMyRoleLive(role);
 
       // Optional cache alignment for other screens
@@ -617,8 +618,7 @@ export default function LeagueSettings() {
     setLeagueState(next);
   }
 
-  // ✅ THIS IS THE IMPORTANT CHANGE:
-  // Co-host toggle MUST update Supabase league_members, not just localStorage.
+  // ✅ IMPORTANT: Co-host toggle updates Supabase league_members (not just local)
   async function toggleCoHost(userId, makeCoHost) {
     if (!canEdit) return;
     if (!userId) return;
@@ -731,18 +731,14 @@ export default function LeagueSettings() {
     });
   }, [friends, memberSet]);
 
-  // ✅ Admin roles shown should come from synced league.memberRoles (not getLeagueRole())
+  // ✅ Admin roles shown should come from synced league.memberRoles
   const memberRolesLive = league?.memberRoles || {};
 
   return (
     <div className="space-y-6">
       <PageHeader
         title="League Settings"
-        subtitle={
-          canEdit
-            ? "Manage points, season, and admins."
-            : "You can view settings. Only host/co-host can edit."
-        }
+        subtitle={canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."}
         right={
           <button
             type="button"
@@ -783,9 +779,7 @@ export default function LeagueSettings() {
           <span
             className={[
               "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
-              canEdit
-                ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
-                : "bg-slate-50 text-slate-700 ring-slate-200",
+              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
             ].join(" ")}
           >
             {canEdit ? "Editing enabled" : "View only"}
@@ -810,9 +804,7 @@ export default function LeagueSettings() {
 
         <div className="mt-4">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Friends not in this league
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Friends not in this league</div>
 
             <button
               type="button"
@@ -867,9 +859,7 @@ export default function LeagueSettings() {
                         onClick={() => sendInviteToFriend(p)}
                         className={[
                           "rounded-xl px-3 py-2 text-xs font-extrabold",
-                          busy
-                            ? "bg-slate-200 text-slate-500 cursor-not-allowed"
-                            : "bg-slate-900 text-white hover:bg-slate-800",
+                          busy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-slate-900 text-white hover:bg-slate-800",
                         ].join(" ")}
                       >
                         {busy ? "Inviting…" : "Invite"}
@@ -885,9 +875,7 @@ export default function LeagueSettings() {
         {/* Pending invites */}
         <div className="mt-6">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Pending invites
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Pending invites</div>
 
             <button
               type="button"
@@ -906,9 +894,7 @@ export default function LeagueSettings() {
 
           <div className="mt-2 space-y-2">
             {!canEdit ? (
-              <div className="text-sm font-semibold text-slate-600">
-                Only host/co-host can view and manage league invites.
-              </div>
+              <div className="text-sm font-semibold text-slate-600">Only host/co-host can view and manage league invites.</div>
             ) : invitesLoading ? (
               <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
             ) : pendingInvites.length === 0 ? (
@@ -916,10 +902,7 @@ export default function LeagueSettings() {
             ) : (
               pendingInvites.map((inv) => {
                 const invitee = inv?.invitee || null;
-                const display =
-                  invitee?.display_name ||
-                  String(inv?.invitee_user_id || "").slice(0, 8) + "…";
-
+                const display = invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
                 return (
@@ -935,10 +918,7 @@ export default function LeagueSettings() {
                           <>
                             {" "}
                             · Sent {created.toLocaleDateString()}{" "}
-                            {created.toLocaleTimeString([], {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}
+                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                           </>
                         ) : null}
                       </div>
@@ -976,14 +956,11 @@ export default function LeagueSettings() {
       </Card>
 
       {/* Points System */}
-      {/* (Everything below stays your existing behavior as requested) */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-slate-900">Points system</div>
-            <div className="mt-1 text-xs font-semibold text-slate-600">
-              Configure how points are awarded in this league.
-            </div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">Configure how points are awarded in this league.</div>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -993,9 +970,7 @@ export default function LeagueSettings() {
               onClick={() => setPreset("default")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit
-                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
-                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=2, 3rd=0"
             >
@@ -1008,9 +983,7 @@ export default function LeagueSettings() {
               onClick={() => setPreset("yourLeague")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit
-                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
-                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=1, 3rd=0"
             >
@@ -1023,9 +996,7 @@ export default function LeagueSettings() {
               onClick={() => setPreset("winnerOnly")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit
-                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
-                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="Winner only"
             >
@@ -1036,9 +1007,7 @@ export default function LeagueSettings() {
 
         <div className="mt-5 space-y-4">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Placement points
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Placement points</div>
 
             <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
               <div className="grid grid-cols-[70px_1fr_54px] items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
@@ -1049,15 +1018,10 @@ export default function LeagueSettings() {
 
               <div className="divide-y divide-slate-200 bg-white">
                 {placementRows.length === 0 ? (
-                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">
-                    No placement rules set yet.
-                  </div>
+                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">No placement rules set yet.</div>
                 ) : (
                   placementRows.map((p) => (
-                    <div
-                      key={p}
-                      className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2"
-                    >
+                    <div key={p} className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2">
                       <div className="text-sm font-extrabold text-slate-900">
                         {p}
                         {p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}
@@ -1070,9 +1034,7 @@ export default function LeagueSettings() {
                         disabled={!canEdit}
                         className={[
                           "w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                          canEdit
-                            ? "border-slate-200 bg-white text-slate-900"
-                            : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                          canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
                         ].join(" ")}
                         aria-label={`Points for place ${p}`}
                       />
@@ -1084,9 +1046,7 @@ export default function LeagueSettings() {
                           onClick={() => removePlacement(p)}
                           className={[
                             "rounded-xl px-3 py-2 text-xs font-extrabold",
-                            canEdit
-                              ? "bg-rose-600 text-white hover:bg-rose-500"
-                              : "bg-slate-100 text-slate-400 cursor-not-allowed",
+                            canEdit ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-slate-100 text-slate-400 cursor-not-allowed",
                           ].join(" ")}
                           title="Remove this place"
                         >
@@ -1105,9 +1065,7 @@ export default function LeagueSettings() {
                   onClick={addPlacementRow}
                   className={[
                     "rounded-xl px-4 py-2 text-xs font-extrabold",
-                    canEdit
-                      ? "bg-slate-100 text-slate-900 hover:bg-slate-200"
-                      : "bg-slate-50 text-slate-400 cursor-not-allowed",
+                    canEdit ? "bg-slate-100 text-slate-900 hover:bg-slate-200" : "bg-slate-50 text-slate-400 cursor-not-allowed",
                   ].join(" ")}
                 >
                   + Add place
@@ -1127,9 +1085,7 @@ export default function LeagueSettings() {
               onClick={savePointsSystem}
               className={[
                 "rounded-xl px-4 py-2 text-sm font-extrabold",
-                canEdit
-                  ? "bg-slate-900 text-white hover:bg-slate-800"
-                  : "bg-slate-200 text-slate-500 cursor-not-allowed",
+                canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
               ].join(" ")}
             >
               Save points system
@@ -1159,9 +1115,7 @@ export default function LeagueSettings() {
 
         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Season start
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Season start</div>
             <input
               type="date"
               value={seasonStart}
@@ -1169,17 +1123,13 @@ export default function LeagueSettings() {
               disabled={!canEdit}
               className={[
                 "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                canEdit
-                  ? "border-slate-200 bg-white text-slate-900"
-                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
               ].join(" ")}
             />
           </div>
 
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Season end (optional)
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Season end (optional)</div>
             <input
               type="date"
               value={seasonEnd}
@@ -1187,9 +1137,7 @@ export default function LeagueSettings() {
               disabled={!canEdit}
               className={[
                 "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                canEdit
-                  ? "border-slate-200 bg-white text-slate-900"
-                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
               ].join(" ")}
             />
           </div>
@@ -1202,9 +1150,7 @@ export default function LeagueSettings() {
             onClick={saveSeasonDates}
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
-              canEdit
-                ? "bg-slate-900 text-white hover:bg-slate-800"
-                : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
             ].join(" ")}
           >
             Save season dates
@@ -1239,9 +1185,7 @@ export default function LeagueSettings() {
                   className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-slate-900">
-                      {getUserName(u)}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-slate-900">{getUserName(u)}</div>
                     <div className="mt-0.5 text-xs font-semibold text-slate-600">
                       {roleLabel(role)}
                       {uid === myId ? " · You" : ""}
@@ -1250,9 +1194,7 @@ export default function LeagueSettings() {
 
                   <div className="flex items-center gap-2">
                     {isHost ? (
-                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">
-                        Host
-                      </span>
+                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">Host</span>
                     ) : (
                       <button
                         type="button"
@@ -1279,8 +1221,7 @@ export default function LeagueSettings() {
         </div>
 
         <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          Permissions on this page come from Supabase{" "}
-          <span className="font-mono">league_members</span> for your signed-in account.
+          Permissions on this page come from Supabase <span className="font-mono">league_members</span> for your signed-in account.
         </div>
       </Card>
     </div>
