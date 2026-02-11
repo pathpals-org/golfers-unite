@@ -1,11 +1,8 @@
 // src/utils/storage.js
 import { seedData } from "../data/seed";
-
-// ✅ Supabase client
 import { supabase } from "../lib/supabaseClient";
 
 export const KEYS = {
-  // NOTE: these are BASE keys. For per-user safe storage, we scope keys at runtime.
   users: "users",
   league: "league",
   rounds: "rounds",
@@ -19,7 +16,7 @@ export const KEYS = {
   seasonArchives: "seasonArchives",
   seededFlag: "__golfers_unite_seeded__",
 
-  // ✅ Active league selection (scoped per user)
+  // Active league selection (scoped per user)
   activeLeagueId: "__golfers_unite_active_league_id__",
 };
 
@@ -39,8 +36,6 @@ const STORAGE_KEYS = [
 
 /* ---------------------------------------------
    ✅ STORAGE SCOPING (Apple-ready)
-   - Prevents cross-account bleed on the same device/browser
-   - Prevents Netlify domain "first run" seeding from clobbering real data
 ---------------------------------------------- */
 
 const UID_CACHE_KEY = "__golfers_unite_uid_cache__";
@@ -76,27 +71,14 @@ function setCachedUid(uid) {
   else safeSetItem(UID_CACHE_KEY, String(uid));
 }
 
-/**
- * ✅ Synchronous "best effort" uid for key scoping.
- * - We cannot await Supabase here, so we rely on a cached uid.
- * - AuthProvider / app bootstrap should call setStorageUserId(uid) once auth is ready.
- */
 function getStorageUidSync() {
   return getCachedUid();
 }
 
-/**
- * ✅ Call this after auth is resolved (login/logout) so storage becomes correctly scoped.
- * Best place: AuthProvider when session changes.
- */
 export function setStorageUserId(uid) {
   setCachedUid(uid || "");
 }
 
-/**
- * Build a per-user storage key.
- * If uid is unknown, fall back to unscoped base key (offline/boot), but we NEVER seed in prod.
- */
 function scopedKey(baseKey) {
   const uid = getStorageUidSync();
   return uid ? `${baseKey}:${uid}` : baseKey;
@@ -123,10 +105,6 @@ export function set(key, value) {
   }
 }
 
-/**
- * Optional helper: clear scoped caches for current user
- * (Useful on logout if you want strict isolation.)
- */
 export function clearScopedCaches() {
   const uid = getStorageUidSync();
   if (!uid) return;
@@ -136,12 +114,10 @@ export function clearScopedCaches() {
 }
 
 /* ---------------------------------------------
-   Seed (DEV ONLY) — Apple-ready
-   ✅ NEVER seed in production builds.
+   Seed (DEV ONLY) — NEVER seed in production
 ---------------------------------------------- */
 
 export function seedIfNeeded() {
-  // If this is a production build, do nothing. (Netlify/App Store stable)
   if (!import.meta.env.DEV) return;
 
   const hasSeed = safeGetItem(KEYS.seededFlag);
@@ -149,8 +125,6 @@ export function seedIfNeeded() {
 
   const data = seedData();
 
-  // Seed into UNscoped keys for dev convenience only.
-  // (If you want even dev to be user-scoped, change scopedKey usage here.)
   try {
     STORAGE_KEYS.forEach((key) => {
       if (data[key] !== undefined) {
@@ -164,7 +138,7 @@ export function seedIfNeeded() {
 }
 
 /* ---------------------------------------------
-   App-specific helpers (so pages stay consistent)
+   Helpers
 ---------------------------------------------- */
 
 function ensureObj(v) {
@@ -195,11 +169,34 @@ function toISODateOrNull(v) {
   return null;
 }
 
-function dateStringToISO(dateStr) {
-  // Supabase "date" comes back as "YYYY-MM-DD"
-  if (!dateStr || typeof dateStr !== "string") return null;
-  const d = new Date(`${dateStr}T00:00:00.000Z`);
-  return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+// Supabase can store season dates as:
+// - date: "YYYY-MM-DD"
+// - timestamp: ISO string
+function toISOFromAnyDateLike(v) {
+  if (!v) return null;
+
+  // already ISO-ish
+  if (typeof v === "string") {
+    // "YYYY-MM-DD"
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+      const d = new Date(`${v}T00:00:00.000Z`);
+      return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+    }
+    // ISO timestamp
+    const d = new Date(v);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+
+  if (v instanceof Date) return v.toISOString();
+  return null;
+}
+
+function pickFirst(obj, keys) {
+  const o = ensureObj(obj);
+  for (const k of keys) {
+    if (o[k] !== undefined && o[k] !== null) return o[k];
+  }
+  return null;
 }
 
 /* ---------------------------------------------
@@ -229,8 +226,7 @@ export function setActiveLeagueId(leagueId) {
 }
 
 /**
- * ✅ Supabase: fetch memberships for the current authed user.
- * Returns array of league_id strings.
+ * Supabase: fetch memberships for the current authed user.
  */
 async function fetchMyLeagueIds() {
   const { data: auth } = await supabase.auth.getUser();
@@ -248,11 +244,12 @@ async function fetchMyLeagueIds() {
 
 /**
  * ✅ Supabase: fetch league row by id
+ * IMPORTANT: select("*") so we never crash on missing columns.
  */
 async function fetchLeagueById(leagueId) {
   const { data, error } = await supabase
     .from("leagues")
-    .select("id,name,host_user_id,season_start,season_end,points_system,created_at")
+    .select("*")
     .eq("id", leagueId)
     .single();
 
@@ -261,7 +258,7 @@ async function fetchLeagueById(leagueId) {
 }
 
 /**
- * ✅ Supabase: fetch members for a league (user_id + role)
+ * Supabase: fetch members for a league (user_id + role)
  */
 async function fetchLeagueMembers(leagueId) {
   const { data, error } = await supabase
@@ -274,7 +271,7 @@ async function fetchLeagueMembers(leagueId) {
 }
 
 /**
- * ✅ Supabase: fetch profiles for a list of user ids
+ * Supabase: fetch profiles for a list of user ids
  */
 async function fetchProfilesByIds(userIds) {
   const ids = ensureArr(userIds).filter(Boolean);
@@ -296,7 +293,7 @@ async function fetchProfilesByIds(userIds) {
  * - Caches per-user to localStorage (KEYS.league + KEYS.users)
  */
 export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
-  // 0) Cache uid for correct scoping ASAP
+  // Cache uid for correct scoping ASAP
   try {
     const { data: auth } = await supabase.auth.getUser();
     const uid = auth?.user?.id || null;
@@ -305,7 +302,7 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
     // ignore
   }
 
-  // 1) Resolve active league id
+  // Resolve active league id
   let activeId = leagueId || getActiveLeagueId();
 
   if (!activeId) {
@@ -315,45 +312,68 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
   }
 
   if (!activeId) {
-    // No memberships yet — clear cached league/users so UI can show empty state
     setLeagueSafe({});
     setUsers([]);
     return { league: null, users: [] };
   }
 
-  // 2) Fetch league + members + profiles
+  // Fetch league + members + profiles
   const leagueRow = await fetchLeagueById(activeId);
   const members = await fetchLeagueMembers(activeId);
 
   const memberIds = members.map((m) => m.user_id).filter(Boolean);
   const profiles = await fetchProfilesByIds(memberIds);
 
-  // 3) Users list (same shape as before)
+  // Build users list
   const users = profiles.map((p) => ({
     id: p.id,
     name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
     email: p.email || null,
   }));
 
-  // 4) Member roles (NO fabrication — Supabase truth only)
+  // Member roles (Supabase truth only)
   const memberRoles = {};
   members.forEach((m) => {
     if (!m?.user_id) return;
     memberRoles[m.user_id] = normalizeRole(m.role);
   });
 
-  // 5) League object normalized to your existing shape
+  // ✅ Season columns: accept many possible schemas safely
+  const seasonStartRaw = pickFirst(leagueRow, [
+    "season_start",
+    "seasonStart",
+    "season_start_iso",
+    "seasonStartISO",
+    "season_start_date",
+    "seasonStartDate",
+  ]);
+  const seasonEndRaw = pickFirst(leagueRow, [
+    "season_end",
+    "seasonEnd",
+    "season_end_iso",
+    "seasonEndISO",
+    "season_end_date",
+    "seasonEndDate",
+  ]);
+
+  // ✅ Points system columns: accept multiple names safely
+  const pointsSystemRaw = pickFirst(leagueRow, [
+    "points_system",
+    "pointsSystem",
+    "points_system_json",
+    "pointsSystemJson",
+  ]);
+
   const nextLeague = normalizeLeague({
     id: leagueRow?.id,
     name: leagueRow?.name || "League",
     members: memberIds,
     memberRoles,
-    pointsSystem: leagueRow?.points_system || null,
-    seasonStartISO: dateStringToISO(leagueRow?.season_start) || null,
-    seasonEndISO: dateStringToISO(leagueRow?.season_end) || null,
+    pointsSystem: pointsSystemRaw || null,
+    seasonStartISO: toISOFromAnyDateLike(seasonStartRaw),
+    seasonEndISO: toISOFromAnyDateLike(seasonEndRaw),
   });
 
-  // 6) Cache locally (per-user)
   setLeagueSafe(nextLeague);
   setUsers(users);
 
@@ -361,7 +381,7 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
 }
 
 /* ---------------------------------------------
-   USERS / PLAYERS (cached local, user-scoped)
+   USERS (cached local, user-scoped)
 ---------------------------------------------- */
 
 export function getUsers(fallback = []) {
@@ -386,7 +406,6 @@ export function setLeague(leagueObj) {
 
 /* ---------------------------------------------
    LEAGUE ROLES + SEASON HELPERS (cache)
-   ⚠️ IMPORTANT: we no longer "invent" a host.
 ---------------------------------------------- */
 
 export const LEAGUE_ROLES = {
@@ -415,8 +434,7 @@ function normalizeMemberRoles(league) {
     next[id] = normalizeRole(existing[id] || LEAGUE_ROLES.member);
   });
 
-  // ✅ NO FABRICATION OF HOST ROLE.
-  // If roles are missing, UI should reflect "member" and Supabase remains truth anyway.
+  // ✅ NO fabrication of host role.
   return next;
 }
 
@@ -798,4 +816,5 @@ export function addSeasonArchive(archiveItem) {
   set(KEYS.seasonArchives, next);
   return archiveItem;
 }
+
 
