@@ -14,9 +14,11 @@ import {
   getUsers,
   getPointsSystem,
   setPointsSystem,
-  getLeagueRole,
   setLeagueRole,
   LEAGUE_ROLES,
+  syncActiveLeagueFromSupabase,
+  setActiveLeagueId,
+  getActiveLeagueId,
 } from "../utils/storage";
 
 function ensureArr(v) {
@@ -143,8 +145,8 @@ export default function LeagueSettings() {
   const [invitesLoading, setInvitesLoading] = useState(false);
   const [inviteActionId, setInviteActionId] = useState(null);
 
-  // points system
-  useMemo(() => getPointsSystem(null), [league?.pointsSystem]); // keep behavior
+  // points system (keep behavior)
+  useMemo(() => getPointsSystem(null), [league?.pointsSystem]);
 
   // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
@@ -221,7 +223,7 @@ export default function LeagueSettings() {
     };
   }, []);
 
-  // ✅ One-time init: freeze leagueId from state/query/cache (but verify with Supabase later)
+  // ✅ One-time init: freeze leagueId from state/query/cache
   useEffect(() => {
     if (initDoneRef.current) return;
     initDoneRef.current = true;
@@ -232,10 +234,16 @@ export default function LeagueSettings() {
     // 1) state/query
     const navLeagueId = getLeagueIdFromLocation(location);
 
-    // 2) cached fallback
+    // 2) active league id fallback
+    const activeId = getActiveLeagueId() || null;
+
+    // 3) cached fallback
     const cachedLeagueId = cachedLeague?.id || null;
 
-    stableLeagueIdRef.current = navLeagueId || cachedLeagueId || null;
+    stableLeagueIdRef.current = navLeagueId || activeId || cachedLeagueId || null;
+
+    // pin the active league id so other pages stay consistent
+    if (stableLeagueIdRef.current) setActiveLeagueId(stableLeagueIdRef.current);
 
     setLeagueState(cachedLeague);
     setUsersState(cachedUsers);
@@ -264,93 +272,34 @@ export default function LeagueSettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ✅ Fetch league from Supabase (display correctness + can help keep cache aligned)
+  // ✅ SAFE league refresh (don’t depend on non-existent columns)
   async function refreshLeagueFromSupabase(leagueId) {
     if (!leagueId) return;
-
     const reqId = ++leagueReqIdRef.current;
 
     try {
       const { data, error } = await supabase
         .from("leagues")
-        .select("*")
+        // ✅ choose only safe/common columns
+        .select("id,name,points_system,created_at")
         .eq("id", leagueId)
         .single();
 
       if (reqId !== leagueReqIdRef.current) return;
       if (error) throw error;
 
-      // Update local display cache (safe) and state.
-      // This does NOT grant permissions.
-      const merged = { ...getLeagueSafe({}), ...data };
+      // Merge into local cache for UI display (does NOT grant permissions)
+      const merged = {
+        ...getLeagueSafe({}),
+        id: data?.id,
+        name: data?.name,
+        pointsSystem: data?.points_system ?? getLeagueSafe({})?.pointsSystem,
+      };
+
       setLeagueSafe(merged);
       setLeagueState(merged);
-
-      // Season fields if present
-      if (data?.season_start || data?.seasonStartISO) {
-        const iso = data?.seasonStartISO || data?.season_start;
-        setSeasonStart(toISODateInput(iso));
-      }
-      if (data?.season_end || data?.seasonEndISO) {
-        const iso = data?.seasonEndISO || data?.season_end;
-        setSeasonEnd(toISODateInput(iso));
-      }
     } catch {
-      // offline / RLS / etc -> keep cached league for UI
-    }
-  }
-
-  // ✅ Verify leagueId is actually one the user belongs to (and recover if wrong)
-  async function ensureStableLeagueIdIsValid() {
-    if (!authUserId) return;
-
-    // If we already have a stable id, verify membership in it
-    const current = stableLeagueIdRef.current;
-
-    // 1) If we have an id, check membership row exists
-    if (current) {
-      try {
-        const { data, error } = await supabase
-          .from("league_members")
-          .select("league_id, role")
-          .eq("league_id", current)
-          .eq("user_id", authUserId)
-          .maybeSingle();
-
-        if (error) throw error;
-
-        if (data?.league_id) {
-          // Valid. We can refresh league + role normally.
-          return;
-        }
-      } catch {
-        // ignore and attempt recovery
-      }
-    }
-
-    // 2) Recovery: find a league where user is host/co-host first
-    try {
-      const { data: rows, error } = await supabase
-        .from("league_members")
-        .select("league_id, role, created_at")
-        .eq("user_id", authUserId)
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-
-      const list = ensureArr(rows);
-      if (list.length === 0) return;
-
-      const hostish = list.find(
-        (r) => r?.role === LEAGUE_ROLES.host || r?.role === LEAGUE_ROLES.co_host
-      );
-      const pick = hostish?.league_id || list[0]?.league_id || null;
-      if (!pick) return;
-
-      stableLeagueIdRef.current = pick;
-      await refreshLeagueFromSupabase(pick);
-    } catch {
-      // ignore
+      // keep cached UI
     }
   }
 
@@ -367,7 +316,7 @@ export default function LeagueSettings() {
         .from("profiles")
         .select("id, display_name")
         .eq("id", authUserId)
-        .single();
+        .maybeSingle();
 
       if (reqId !== roleReqIdRef.current) return;
       if (profErr) throw profErr;
@@ -387,15 +336,14 @@ export default function LeagueSettings() {
       const role = mem?.role || LEAGUE_ROLES.member;
       setMyRoleLive(role);
 
-      // Optional cache alignment for other screens (not used for permissions here)
+      // Optional cache alignment for other screens
       try {
         setLeagueRole(authUserId, role);
       } catch {
         // ignore
       }
     } catch {
-      // Predictable: don't “flip” to member due to transient failure.
-      // Keep existing role if we already have one; else show view-only.
+      // Don’t flip randomly — fail soft.
       if (reqId !== roleReqIdRef.current) return;
       if (myRoleLive == null) setMyRoleLive(null);
     } finally {
@@ -404,7 +352,7 @@ export default function LeagueSettings() {
     }
   }
 
-  // ✅ When auth becomes available, validate leagueId and refresh everything
+  // ✅ When auth becomes available, sync league cache (members/roles/users) + refresh role
   useEffect(() => {
     if (!authUserId) {
       setMyRoleLive(null);
@@ -413,10 +361,17 @@ export default function LeagueSettings() {
     }
 
     (async () => {
-      await ensureStableLeagueIdIsValid();
-
       const leagueId = stableLeagueIdRef.current;
       if (leagueId) {
+        try {
+          setActiveLeagueId(leagueId);
+          await syncActiveLeagueFromSupabase({ leagueId });
+          setLeagueState(getLeagueSafe({}));
+          setUsersState(ensureArr(getUsers([])));
+        } catch {
+          // ignore, we still try role fetch
+        }
+
         await refreshLeagueFromSupabase(leagueId);
       }
 
@@ -662,18 +617,37 @@ export default function LeagueSettings() {
     setLeagueState(next);
   }
 
-  function toggleCoHost(userId, makeCoHost) {
+  // ✅ THIS IS THE IMPORTANT CHANGE:
+  // Co-host toggle MUST update Supabase league_members, not just localStorage.
+  async function toggleCoHost(userId, makeCoHost) {
     if (!canEdit) return;
     if (!userId) return;
 
-    setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
-    setLeagueState(getLeagueSafe({}));
+    try {
+      const { error } = await supabase
+        .from("league_members")
+        .update({ role: makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member })
+        .eq("league_id", stableLeagueId)
+        .eq("user_id", userId);
+
+      if (error) throw error;
+
+      // Re-sync cache + refresh UI
+      await syncActiveLeagueFromSupabase({ leagueId: stableLeagueId });
+      setLeagueState(getLeagueSafe({}));
+      setUsersState(ensureArr(getUsers([])));
+
+      // keep local alignment too
+      setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
   }
 
   async function sendInviteToFriend(friendProfile) {
     if (!canEdit) return;
 
-    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    const leagueId = stableLeagueId;
     if (!leagueId) return;
 
     if (!myId) {
@@ -726,7 +700,7 @@ export default function LeagueSettings() {
     if (!canEdit) return;
     if (!inviteId) return;
 
-    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    const leagueId = stableLeagueId;
     if (!leagueId) return;
 
     try {
@@ -757,12 +731,17 @@ export default function LeagueSettings() {
     });
   }, [friends, memberSet]);
 
+  // ✅ Admin roles shown should come from synced league.memberRoles (not getLeagueRole())
+  const memberRolesLive = league?.memberRoles || {};
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="League Settings"
         subtitle={
-          canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."
+          canEdit
+            ? "Manage points, season, and admins."
+            : "You can view settings. Only host/co-host can edit."
         }
         right={
           <button
@@ -804,7 +783,9 @@ export default function LeagueSettings() {
           <span
             className={[
               "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
-              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
+              canEdit
+                ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
+                : "bg-slate-50 text-slate-700 ring-slate-200",
             ].join(" ")}
           >
             {canEdit ? "Editing enabled" : "View only"}
@@ -812,7 +793,7 @@ export default function LeagueSettings() {
         </div>
       </Card>
 
-      {/* ✅ Invite to league */}
+      {/* Invite to league */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -823,8 +804,7 @@ export default function LeagueSettings() {
           </div>
 
           <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
-            League ID:{" "}
-            <span className="font-mono">{String(stableLeagueId).slice(0, 8)}…</span>
+            League ID: <span className="font-mono">{String(stableLeagueId).slice(0, 8)}…</span>
           </span>
         </div>
 
@@ -955,7 +935,10 @@ export default function LeagueSettings() {
                           <>
                             {" "}
                             · Sent {created.toLocaleDateString()}{" "}
-                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                            {created.toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
                           </>
                         ) : null}
                       </div>
@@ -992,8 +975,8 @@ export default function LeagueSettings() {
         ) : null}
       </Card>
 
-      {/* Everything below here stays your existing behavior */}
       {/* Points System */}
+      {/* (Everything below stays your existing behavior as requested) */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -1052,7 +1035,6 @@ export default function LeagueSettings() {
         </div>
 
         <div className="mt-5 space-y-4">
-          {/* Placement points */}
           <div>
             <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
               Placement points
@@ -1247,7 +1229,7 @@ export default function LeagueSettings() {
           ) : (
             memberUsers.map((u) => {
               const uid = getUserId(u);
-              const role = getLeagueRole(uid);
+              const role = memberRolesLive?.[uid] || LEAGUE_ROLES.member;
               const isHost = role === LEAGUE_ROLES.host;
               const isCoHost = role === LEAGUE_ROLES.co_host;
 
@@ -1297,7 +1279,8 @@ export default function LeagueSettings() {
         </div>
 
         <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          Permissions on this page come from Supabase <span className="font-mono">league_members</span> for your signed-in account.
+          Permissions on this page come from Supabase{" "}
+          <span className="font-mono">league_members</span> for your signed-in account.
         </div>
       </Card>
     </div>
