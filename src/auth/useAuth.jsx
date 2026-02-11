@@ -2,7 +2,7 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
-// ✅ NEW: keep localStorage scoped per signed-in user (prevents cross-account bleed)
+// ✅ keep localStorage scoped per signed-in user (prevents cross-account bleed)
 import { setStorageUserId } from "../utils/storage";
 
 const AuthContext = createContext(null);
@@ -18,7 +18,6 @@ function withTimeout(promise, ms, label = "Request") {
 async function fetchMyProfile(userId) {
   if (!userId) return null;
 
-  // ✅ Profile fetch can hang (network/RLS). Keep timeout.
   const { data, error } = await withTimeout(
     supabase
       .from("profiles")
@@ -43,15 +42,11 @@ function isInvalidRefreshTokenError(err) {
   );
 }
 
-// Backup cleanup for cases where signOut can't run cleanly
 function clearSupabaseAuthStorageKeys() {
   try {
     const keys = Object.keys(localStorage);
     keys.forEach((k) => {
-      // Supabase v2 stores tokens under sb-<project-ref>-auth-token
       if (k.startsWith("sb-") && k.includes("-auth-token")) localStorage.removeItem(k);
-
-      // Extra safety (some setups)
       if (k.toLowerCase().includes("supabase") && k.toLowerCase().includes("auth")) {
         localStorage.removeItem(k);
       }
@@ -71,13 +66,15 @@ export function AuthProvider({ children }) {
 
   const refreshProfile = async (overrideUserId) => {
     const userId = overrideUserId ?? user?.id ?? null;
-    if (!userId) {
-      setProfile(null);
+    if (!userId) return null;
+
+    try {
+      const p = await fetchMyProfile(userId);
+      if (mountedRef.current && p) setProfile(p);
+      return p;
+    } catch {
       return null;
     }
-    const p = await fetchMyProfile(userId);
-    if (mountedRef.current) setProfile(p);
-    return p;
   };
 
   useEffect(() => {
@@ -91,8 +88,6 @@ export function AuthProvider({ children }) {
         console.warn("supabase.auth.signOut failed, doing local cleanup:", e);
       } finally {
         clearSupabaseAuthStorageKeys();
-
-        // ✅ ensure storage is unscoped after logout / invalid tokens
         setStorageUserId(null);
 
         if (!mountedRef.current) return;
@@ -106,10 +101,6 @@ export function AuthProvider({ children }) {
       setLoading(true);
 
       try {
-        /**
-         * ✅ getSession() should be local, but can be slow on some devices/browsers.
-         * The old 3000ms timeout is too aggressive for production.
-         */
         const { data, error } = await withTimeout(
           supabase.auth.getSession(),
           15000,
@@ -126,8 +117,6 @@ export function AuthProvider({ children }) {
             setSession(null);
             setUser(null);
             setProfile(null);
-
-            // ✅ no authed user => unscoped storage
             setStorageUserId(null);
           }
           return;
@@ -136,14 +125,18 @@ export function AuthProvider({ children }) {
         const s = data?.session ?? null;
         setSession(s);
         setUser(s?.user ?? null);
-
-        // ✅ set storage user id as early as possible (key scoping)
         setStorageUserId(s?.user?.id || null);
 
         if (s?.user?.id) {
-          const p = await fetchMyProfile(s.user.id);
-          if (!mountedRef.current) return;
-          setProfile(p);
+          try {
+            const p = await fetchMyProfile(s.user.id);
+            if (!mountedRef.current) return;
+            // ✅ only overwrite profile if we actually got one
+            if (p) setProfile(p);
+          } catch (e) {
+            console.warn("Profile load failed during bootstrap:", e);
+            // ✅ keep whatever profile we had (don’t force null)
+          }
         } else {
           setProfile(null);
         }
@@ -154,12 +147,9 @@ export function AuthProvider({ children }) {
         if (isInvalidRefreshTokenError(e)) {
           await safeClearSession("Invalid refresh token thrown during bootstrap");
         } else {
-          // If session read times out/fails, fail open (no user), don’t hang the app
           setSession(null);
           setUser(null);
           setProfile(null);
-
-          // ✅ no confirmed user => unscoped storage
           setStorageUserId(null);
         }
       } finally {
@@ -172,32 +162,28 @@ export function AuthProvider({ children }) {
     const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
       if (!mountedRef.current) return;
 
-      // ✅ Keep UI responsive; don’t lock app in loading on auth events
       setSession(newSession ?? null);
       setUser(newSession?.user ?? null);
-
-      // ✅ Always keep storage scoping aligned with auth state
       setStorageUserId(newSession?.user?.id || null);
 
+      // ✅ Don’t flip profile to null just because profile fetch is slow
+      if (!newSession?.user?.id) {
+        setProfile(null);
+        return;
+      }
+
       try {
-        if (newSession?.user?.id) {
-          const p = await fetchMyProfile(newSession.user.id);
-          if (!mountedRef.current) return;
-          setProfile(p);
-        } else {
-          setProfile(null);
-        }
+        const p = await fetchMyProfile(newSession.user.id);
+        if (!mountedRef.current) return;
+        if (p) setProfile(p);
       } catch (e) {
         console.error("Profile refresh after auth change failed:", e);
         if (!mountedRef.current) return;
 
         if (isInvalidRefreshTokenError(e)) {
           await safeClearSession("Invalid refresh token during onAuthStateChange");
-        } else {
-          setProfile(null);
         }
-      } finally {
-        if (mountedRef.current) setLoading(false);
+        // ✅ otherwise: keep existing profile as-is
       }
     });
 

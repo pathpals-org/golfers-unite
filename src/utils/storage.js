@@ -22,6 +22,26 @@ export const KEYS = {
   activeLeagueId: "__golfers_unite_active_league_id__",
 };
 
+// ✅ NEW: identifies which signed-in user the offline/local cache belongs to
+export const STORAGE_USER_KEY = "__golfers_unite_storage_user_id__";
+
+export function getStorageUserId() {
+  try {
+    return localStorage.getItem(STORAGE_USER_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+export function setStorageUserId(userId) {
+  try {
+    if (!userId) localStorage.removeItem(STORAGE_USER_KEY);
+    else localStorage.setItem(STORAGE_USER_KEY, String(userId));
+  } catch {
+    // ignore
+  }
+}
+
 const STORAGE_KEYS = [
   KEYS.users,
   KEYS.league,
