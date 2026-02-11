@@ -14,6 +14,9 @@ import {
   addSeasonArchive,
   getPointsSystem,
   setPointsSystem,
+  // ✅ NEW (Supabase-first league context)
+  syncActiveLeagueFromSupabase,
+  setActiveLeagueId,
 } from "../utils/storage";
 import { buildStandings } from "../utils/stats";
 
@@ -154,9 +157,7 @@ function placementToLabel(map) {
   return places
     .map(
       (p) =>
-        `${p}${
-          p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"
-        }=${m[p]}`
+        `${p}${p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}=${m[p]}`
     )
     .join(", ");
 }
@@ -167,8 +168,10 @@ function mergePointsSystem(raw) {
 
   const placementPoints = normalizePlacement(ps.placementPoints || base.placementPoints);
 
-  const participation = ps.participation && typeof ps.participation === "object" ? ps.participation : {};
-  const bonuses = ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
+  const participation =
+    ps.participation && typeof ps.participation === "object" ? ps.participation : {};
+  const bonuses =
+    ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
 
   const birdie = bonuses.birdie && typeof bonuses.birdie === "object" ? bonuses.birdie : {};
   const eagle = bonuses.eagle && typeof bonuses.eagle === "object" ? bonuses.eagle : {};
@@ -209,14 +212,48 @@ export default function League() {
   const [toast, setToast] = useState("");
   const [showEndSeason, setShowEndSeason] = useState(false);
 
+  // ✅ Supabase-first league hydration (keeps cache in sync per-user)
+  const [leagueLoading, setLeagueLoading] = useState(false);
+  const [leagueSyncError, setLeagueSyncError] = useState("");
+
   const pointsSystem = useMemo(() => {
     return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
   }, [league?.pointsSystem]);
 
+  // ✅ On entering the League screen, attempt to hydrate from Supabase.
+  // If offline / no membership, it falls back to whatever is cached.
   useEffect(() => {
-    setLeagueState(getLeague(null));
-    setUsersState(getUsers([]));
-    setRoundsState(getRounds([]));
+    let alive = true;
+
+    async function syncLeague() {
+      setLeagueLoading(true);
+      setLeagueSyncError("");
+
+      try {
+        await syncActiveLeagueFromSupabase(); // resolves active league id internally
+      } catch (e) {
+        // Don’t block UI; just show cached league if present.
+        const msg = String(e?.message || "");
+        if (alive && msg) setLeagueSyncError(msg);
+      } finally {
+        if (!alive) return;
+
+        // Always re-read cache after sync attempt (or failure)
+        setLeagueState(getLeague(null));
+        setUsersState(getUsers([]));
+        setRoundsState(getRounds([]));
+
+        setLeagueLoading(false);
+      }
+    }
+
+    // Only run on actual page entry changes (not every re-render)
+    syncLeague();
+
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.pathname]);
 
   // Ensure league has a pointsSystem once we have a league (safe default)
@@ -245,14 +282,40 @@ export default function League() {
     return buildStandings(memberUsers, leagueRounds, pointsSystem);
   }, [league, users, leagueRounds, pointsSystem]);
 
+  // ✅ No league: production-safe messaging (no "seed" instruction)
   if (!league) {
     return (
       <div className="pt-2">
         <EmptyState
           icon="🏌️"
-          title="No league yet"
-          description="Seed data should create a demo league automatically. If not, refresh or clear localStorage and reload."
+          title={leagueLoading ? "Loading your league…" : "No league yet"}
+          description={
+            leagueLoading
+              ? "Checking your league membership…"
+              : "Create a league (or accept an invite) to unlock standings and settings."
+          }
+          actions={
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => navigate("/friends")}
+                className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
+              >
+                Find golfers
+              </button>
+              <button
+                onClick={() => navigate("/profile")}
+                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
+              >
+                Go to Profile
+              </button>
+            </div>
+          }
         />
+        {leagueSyncError ? (
+          <div className="mt-3 rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
+            {leagueSyncError}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -379,6 +442,12 @@ export default function League() {
               League admins can edit points in{" "}
               <span className="font-extrabold text-slate-700">League Settings</span>.
             </div>
+
+            {leagueLoading ? (
+              <div className="mt-2 text-[11px] font-semibold text-slate-400">
+                Syncing league…
+              </div>
+            ) : null}
           </div>
 
           <div className="ml-auto text-right">
@@ -400,7 +469,11 @@ export default function League() {
           </button>
 
           <button
-            onClick={() => navigate("/?scope=league")}
+            onClick={() => {
+              // ✅ Pin this league as active in cache, so LeagueSettings stays stable
+              setActiveLeagueId(league?.id);
+              navigate("/?scope=league");
+            }}
             className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
             title="Opens the feed filtered to League banter"
           >
@@ -408,7 +481,12 @@ export default function League() {
           </button>
 
           <button
-            onClick={() => navigate("/league-settings")}
+            onClick={() => {
+              // ✅ This fixes your settings “wrong league” issue:
+              // we pass stable leagueId AND persist active league selection.
+              setActiveLeagueId(league?.id);
+              navigate("/league-settings", { state: { leagueId: league.id } });
+            }}
             className="ml-auto rounded-xl bg-white px-4 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
           >
             League Settings
