@@ -1,5 +1,5 @@
 // src/pages/LeagueSettings.jsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import Card from "../components/ui/Card";
 import EmptyState from "../components/ui/EmptyState";
@@ -48,7 +48,14 @@ function getUserId(u) {
 }
 
 function getUserName(u) {
-  return u?.name || u?.fullName || u?.displayName || u?.username || u?.display_name || "Golfer";
+  return (
+    u?.name ||
+    u?.fullName ||
+    u?.displayName ||
+    u?.username ||
+    u?.display_name ||
+    "Golfer"
+  );
 }
 
 function normalizePlacement(v) {
@@ -99,6 +106,12 @@ export default function LeagueSettings() {
   const [myProfile, setMyProfile] = useState(null);
   const [myRoleLive, setMyRoleLive] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
+
+  // 🔒 Make league id stable for this page session
+  const stableLeagueIdRef = useRef(null);
+
+  // Prevent stale async responses from overwriting newer role state
+  const roleReqIdRef = useRef(0);
 
   // Invite status UI
   const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
@@ -179,14 +192,17 @@ export default function LeagueSettings() {
   // ✅ Display name prefers Supabase profile, falls back to cached local user
   const myDisplayName = myProfile?.display_name || getUserName(me);
 
-  // ✅ Permissions: Supabase role is truth; fallback to cached role only if we have no live role yet
-  const myRole = myRoleLive || getLeagueRole(myId);
-  const canEdit = myRole === LEAGUE_ROLES.host || myRole === LEAGUE_ROLES.co_host;
+  // ✅ Permissions: Supabase truth ONLY
+  const myRole = myRoleLive || LEAGUE_ROLES.member;
+  const canEdit = myRoleLive === LEAGUE_ROLES.host || myRoleLive === LEAGUE_ROLES.co_host;
 
   async function refreshMyProfileAndRole() {
-    if (!authUserId || !league?.id) return;
+    const leagueId = stableLeagueIdRef.current;
+    if (!authUserId || !leagueId) return;
 
+    const reqId = ++roleReqIdRef.current;
     setRoleLoading(true);
+
     try {
       // Profile
       const { data: prof, error: profErr } = await supabase
@@ -194,43 +210,43 @@ export default function LeagueSettings() {
         .select("id, display_name")
         .eq("id", authUserId)
         .single();
+
+      if (reqId !== roleReqIdRef.current) return;
       if (profErr) throw profErr;
       setMyProfile(prof || null);
 
-      // Role
+      // Role (Supabase truth)
       const { data: mem, error: memErr } = await supabase
         .from("league_members")
         .select("role")
-        .eq("league_id", league.id)
+        .eq("league_id", leagueId)
         .eq("user_id", authUserId)
         .maybeSingle();
+
+      if (reqId !== roleReqIdRef.current) return;
       if (memErr) throw memErr;
 
       const role = mem?.role || LEAGUE_ROLES.member;
       setMyRoleLive(role);
 
-      // Keep cache aligned (does NOT grant permissions; Supabase still enforces)
-      setLeagueRole(authUserId, role);
+      // Optional: keep cache aligned for non-permission display elsewhere (NOT used for canEdit here)
+      try {
+        setLeagueRole(authUserId, role);
+      } catch {
+        // ignore cache write errors
+      }
     } catch {
-      // If offline/blocked, don't hard-fail the UI; it will remain view-only by default
-      if (!myRoleLive) setMyRoleLive(null);
+      // If offline/blocked, default to view-only (Apple-ready predictable)
+      if (reqId !== roleReqIdRef.current) return;
+      setMyRoleLive(null);
     } finally {
+      if (reqId !== roleReqIdRef.current) return;
       setRoleLoading(false);
     }
   }
 
-  // refresh when league changes / navigation changes
-  useEffect(() => {
-    refreshMyProfileAndRole();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUserId, league?.id, location.key]);
-
   async function loadPendingInvites({ leagueId }) {
     if (!leagueId) return;
-    if (!canEdit) {
-      setPendingInvites([]);
-      return;
-    }
 
     setInvitesLoading(true);
     try {
@@ -318,11 +334,17 @@ export default function LeagueSettings() {
     }
   }
 
-  // ✅ Keep local cache in sync on navigation
+  // ✅ One-way: sync local cached league/users on navigation ONLY (NO canEdit dependency)
   useEffect(() => {
     const l = getLeagueSafe({});
+    const u = ensureArr(getUsers([]));
+
+    // Initialize / update stable league id ONLY when navigation changes
+    const nextLeagueId = l?.id || null;
+    stableLeagueIdRef.current = nextLeagueId;
+
     setLeagueState(l);
-    setUsersState(ensureArr(getUsers([])));
+    setUsersState(u);
 
     setSeasonStart(toISODateInput(l?.seasonStartISO));
     setSeasonEnd(toISODateInput(l?.seasonEndISO));
@@ -343,10 +365,17 @@ export default function LeagueSettings() {
       hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
     });
 
-    // load invites when league present (permissions gate inside)
-    if (l?.id) loadPendingInvites({ leagueId: l.id });
+    // Clear invite UI status on navigation so it feels clean/predictable
+    setInviteStatus({ type: "", message: "" });
+    setPendingInvites([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.key, canEdit]);
+  }, [location.key]);
+
+  // ✅ Refresh role whenever auth user OR stable league id changes
+  useEffect(() => {
+    refreshMyProfileAndRole();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUserId, location.key]);
 
   // load friends when we have auth user
   useEffect(() => {
@@ -354,6 +383,20 @@ export default function LeagueSettings() {
     loadFriendsForInvites({ userId: myId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myId]);
+
+  // ✅ Load pending invites only after permissions are confirmed (no league re-sync)
+  useEffect(() => {
+    const leagueId = stableLeagueIdRef.current;
+    if (!leagueId) return;
+
+    if (!canEdit) {
+      setPendingInvites([]);
+      return;
+    }
+
+    loadPendingInvites({ leagueId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit, location.key]);
 
   if (!league?.id) {
     return (
@@ -498,7 +541,7 @@ export default function LeagueSettings() {
     const inviteeUserId = friendProfile?.id || null;
     if (!inviteeUserId) return;
 
-    // Already a member?
+    // Already a member? (local list; Supabase will enforce anyway)
     const memberSetLocal = new Set(ensureArr(members));
     if (memberSetLocal.has(inviteeUserId)) {
       setInviteStatus({ type: "info", message: "They’re already in this league." });
@@ -596,6 +639,7 @@ export default function LeagueSettings() {
               Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
               <span className="font-extrabold">{roleLabel(myRole)}</span>
               {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
+              {!authUserId ? <span className="ml-2 text-slate-400">(not signed in)</span> : null}
             </div>
 
             <button
@@ -746,8 +790,7 @@ export default function LeagueSettings() {
               pendingInvites.map((inv) => {
                 const invitee = inv?.invitee || null;
                 const display =
-                  invitee?.display_name ||
-                  String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
 
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
@@ -1207,7 +1250,9 @@ export default function LeagueSettings() {
             onClick={saveSeasonDates}
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
-              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              canEdit
+                ? "bg-slate-900 text-white hover:bg-slate-800"
+                : "bg-slate-200 text-slate-500 cursor-not-allowed",
             ].join(" ")}
           >
             Save season dates
@@ -1282,7 +1327,7 @@ export default function LeagueSettings() {
         </div>
 
         <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          This now uses the signed-in Supabase account for permissions.
+          Permissions on this page are derived from Supabase <span className="font-mono">league_members</span> for your signed-in account.
         </div>
       </Card>
     </div>
