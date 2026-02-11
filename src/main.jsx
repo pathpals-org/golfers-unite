@@ -7,8 +7,10 @@ import "./index.css";
 import { seedIfNeeded } from "./utils/storage";
 import { AuthProvider } from "./auth/useAuth";
 
-// Bootstrap once (safe in dev + StrictMode)
-seedIfNeeded();
+// ✅ DEV ONLY: seed local demo data
+if (import.meta.env.DEV) {
+  seedIfNeeded();
+}
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
@@ -17,6 +19,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
     </AuthProvider>
   </React.StrictMode>
 );
+
 
 
 

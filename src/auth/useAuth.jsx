@@ -2,6 +2,9 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
+// ✅ NEW: keep localStorage scoped per signed-in user (prevents cross-account bleed)
+import { setStorageUserId } from "../utils/storage";
+
 const AuthContext = createContext(null);
 
 function withTimeout(promise, ms, label = "Request") {
@@ -88,6 +91,10 @@ export function AuthProvider({ children }) {
         console.warn("supabase.auth.signOut failed, doing local cleanup:", e);
       } finally {
         clearSupabaseAuthStorageKeys();
+
+        // ✅ ensure storage is unscoped after logout / invalid tokens
+        setStorageUserId(null);
+
         if (!mountedRef.current) return;
         setSession(null);
         setUser(null);
@@ -119,6 +126,9 @@ export function AuthProvider({ children }) {
             setSession(null);
             setUser(null);
             setProfile(null);
+
+            // ✅ no authed user => unscoped storage
+            setStorageUserId(null);
           }
           return;
         }
@@ -126,6 +136,9 @@ export function AuthProvider({ children }) {
         const s = data?.session ?? null;
         setSession(s);
         setUser(s?.user ?? null);
+
+        // ✅ set storage user id as early as possible (key scoping)
+        setStorageUserId(s?.user?.id || null);
 
         if (s?.user?.id) {
           const p = await fetchMyProfile(s.user.id);
@@ -145,6 +158,9 @@ export function AuthProvider({ children }) {
           setSession(null);
           setUser(null);
           setProfile(null);
+
+          // ✅ no confirmed user => unscoped storage
+          setStorageUserId(null);
         }
       } finally {
         if (mountedRef.current) setLoading(false);
@@ -159,6 +175,9 @@ export function AuthProvider({ children }) {
       // ✅ Keep UI responsive; don’t lock app in loading on auth events
       setSession(newSession ?? null);
       setUser(newSession?.user ?? null);
+
+      // ✅ Always keep storage scoping aligned with auth state
+      setStorageUserId(newSession?.user?.id || null);
 
       try {
         if (newSession?.user?.id) {
