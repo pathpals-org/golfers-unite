@@ -1,845 +1,1263 @@
-// src/pages/Feed.jsx
+// src/pages/LeagueSettings.jsx
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams, Link, useLocation } from "react-router-dom";
-import { KEYS, get, set, getLeague } from "../utils/storage";
-import { supabase } from "../lib/supabaseClient";
-import { useAuth } from "../auth/useAuth";
-
+import { useLocation, useNavigate } from "react-router-dom";
 import Card from "../components/ui/Card";
 import EmptyState from "../components/ui/EmptyState";
+import PageHeader from "../components/ui/PageHeader";
 
-const FEED_POSTS = "feed_posts";
-const FEED_LIKES = "feed_post_likes";
-const FEED_COMMENTS = "feed_post_comments";
-const PROFILES_TABLE = "profiles";
+import { supabase } from "../lib/supabaseClient";
+
+import {
+  getLeagueSafe,
+  setLeagueSafe,
+  setLeagueSeasonDates,
+  getUsers,
+  getPointsSystem,
+  setPointsSystem,
+  getLeagueRole,
+  setLeagueRole,
+  LEAGUE_ROLES,
+} from "../utils/storage";
 
 function ensureArr(v) {
   return Array.isArray(v) ? v : [];
 }
 
-function uid(prefix = "id") {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+function ensureObj(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
 
-function safeUUID(prefix = "post") {
-  try {
-    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-      return crypto.randomUUID();
-    }
-  } catch {}
-  return uid(prefix);
+function safeNum(n, fallback = 0) {
+  const x = typeof n === "string" ? Number(n) : n;
+  return Number.isFinite(x) ? x : fallback;
 }
 
-function timeAgo(iso) {
+function toISODateInput(iso) {
   if (!iso) return "";
-  const d = new Date(iso);
-  const diff = Date.now() - d.getTime();
-  const mins = Math.floor(diff / (1000 * 60));
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d`;
+  try {
+    return new Date(iso).toISOString().slice(0, 10);
+  } catch {
+    return "";
+  }
 }
 
-function getUserById(users, userId) {
-  return users.find((x) => (x?.id || x?._id) === userId) || null;
+function fromISODateInput(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toISOString();
 }
 
-function getAuthorName(users, userId) {
-  const u = getUserById(users, userId);
-  return u?.display_name || u?.username || u?.name || "Golfer";
+function getUserId(u) {
+  return u?.id || u?._id || null;
 }
 
-function formatSupabaseError(e) {
-  const msg =
-    e?.message ||
-    e?.error_description ||
-    (typeof e === "string" ? e : "") ||
-    "Unknown error";
-  const code = e?.code ? ` [${e.code}]` : "";
-  const details = e?.details ? ` • ${e.details}` : "";
-  const hint = e?.hint ? ` • ${e.hint}` : "";
-  return `${msg}${code}${details}${hint}`.trim();
-}
-
-function isAbortError(e) {
-  const name = String(e?.name || "");
-  const msg = String(e?.message || "");
-  return name === "AbortError" || msg.toLowerCase().includes("aborted");
-}
-
-function Pill({ active, onClick, children }) {
+function getUserName(u) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        "rounded-full px-3 py-1.5 text-xs font-extrabold ring-1 transition",
-        active
-          ? "bg-emerald-600 text-white ring-emerald-600"
-          : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
-      ].join(" ")}
-    >
-      {children}
-    </button>
+    u?.name ||
+    u?.fullName ||
+    u?.displayName ||
+    u?.username ||
+    u?.display_name ||
+    "Golfer"
   );
 }
 
-function AudienceChip({ children }) {
-  return (
-    <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] font-extrabold text-slate-700 ring-1 ring-slate-200">
-      {children}
-    </span>
-  );
+function normalizePlacement(v) {
+  const raw = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  const next = {};
+  Object.keys(raw).forEach((k) => {
+    const place = Math.trunc(Number(k));
+    if (!Number.isFinite(place) || place <= 0) return;
+    next[place] = Math.trunc(safeNum(raw[k], 0));
+  });
+  return next;
 }
 
-function ScopeSwitch({ scope, setScope, leagueName }) {
-  return (
-    <Card className="p-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-            Feed
-          </div>
-          <div className="truncate text-base font-extrabold text-slate-900">
-            {scope === "public"
-              ? "Public Banter"
-              : scope === "friends"
-              ? "Friends Feed"
-              : "League Banter"}
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Pill active={scope === "public"} onClick={() => setScope("public")}>
-            Public
-          </Pill>
-          <Pill active={scope === "friends"} onClick={() => setScope("friends")}>
-            Friends
-          </Pill>
-          <Pill active={scope === "league"} onClick={() => setScope("league")}>
-            League
-          </Pill>
-        </div>
-      </div>
-
-      {scope === "league" ? (
-        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-          <div className="text-xs font-semibold text-slate-600">
-            League:{" "}
-            <span className="font-extrabold text-slate-900">
-              {leagueName || "Your league"}
-            </span>
-          </div>
-          <Link
-            to="/leagues"
-            className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-extrabold text-slate-800 ring-1 ring-slate-200 hover:bg-slate-200"
-          >
-            View table →
-          </Link>
-        </div>
-      ) : null}
-    </Card>
-  );
+function placementRowsFromMap(map) {
+  return Object.keys(normalizePlacement(map))
+    .map((k) => Number(k))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
 }
 
-function ActionChip({ children, onClick }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-200 active:scale-[0.99]"
-    >
-      {children}
-    </button>
-  );
+function roleLabel(role) {
+  if (role === LEAGUE_ROLES.host) return "Host";
+  if (role === LEAGUE_ROLES.co_host) return "Co-host";
+  return "Member";
 }
 
-function CommentRow({ c, users, meId, onDelete }) {
-  const name = getAuthorName(users, c.userId);
-  const canDelete = Boolean(meId && c?.userId && String(c.userId) === String(meId));
-
-  return (
-    <div className="flex items-start gap-2">
-      <div className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-slate-900 text-white ring-2 ring-white text-xs">
-        🙂
-      </div>
-
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <div className="truncate text-xs font-extrabold text-slate-900">
-                {name}
-              </div>
-              <div className="text-[11px] font-semibold text-slate-500">
-                · {timeAgo(c.createdAt)}
-              </div>
-            </div>
-          </div>
-
-          {canDelete ? (
-            <button
-              type="button"
-              onClick={() => onDelete?.(c)}
-              className="rounded-full bg-white px-2 py-1 text-[11px] font-extrabold text-rose-700 ring-1 ring-rose-200 hover:bg-rose-50"
-              title="Delete comment"
-            >
-              Delete
-            </button>
-          ) : null}
-        </div>
-
-        <div className="mt-0.5 whitespace-pre-wrap text-sm font-semibold text-slate-800">
-          {c.text}
-        </div>
-      </div>
-    </div>
-  );
+function humanizeSupabaseError(err) {
+  const msg = err?.message || String(err || "");
+  if (!msg) return "Something went wrong.";
+  return msg;
 }
 
-function PostCard({
-  post,
-  users,
-  meId,
-  onLike,
-  onComment,
-  onDeleteComment,
-  showComments,
-  onToggleComments,
-}) {
-  const author = getAuthorName(users, post.userId);
-  const authorUser = getUserById(users, post.userId);
-
-  const handicap =
-    authorUser?.handicap_index ??
-    authorUser?.handicap ??
-    authorUser?.hcp ??
-    authorUser?.index ??
-    authorUser?.handicapIndex ??
-    null;
-
-  const showHcp = handicap !== null && handicap !== undefined && handicap !== "";
-  const liked = (post.likes || []).includes(meId);
-  const likeCount = post.likes?.length || 0;
-  const commentCount = post.comments?.length || 0;
-
-  return (
-    <Card className="p-4">
-      <div className="flex items-start gap-3">
-        <div className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-slate-900 text-white ring-2 ring-white shadow-sm">
-          🏌️
-        </div>
-
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <div className="truncate text-sm font-extrabold text-slate-900">
-              {author}
-            </div>
-
-            {showHcp ? (
-              <span className="rounded-full bg-emerald-50 px-2 py-1 text-[11px] font-extrabold text-emerald-800 ring-1 ring-emerald-200">
-                Hcp {handicap}
-              </span>
-            ) : null}
-
-            <div className="text-xs font-semibold text-slate-500">
-              · {timeAgo(post.createdAt)}
-            </div>
-          </div>
-
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {post?.toPublic ? <AudienceChip>Public</AudienceChip> : null}
-            {post?.toFriends ? <AudienceChip>Friends</AudienceChip> : null}
-            {post?.toLeague ? <AudienceChip>League</AudienceChip> : null}
-          </div>
-        </div>
-      </div>
-
-      {post?.text ? (
-        <div className="mt-3 whitespace-pre-wrap text-[15px] font-semibold leading-relaxed text-slate-900">
-          {post.text}
-        </div>
-      ) : null}
-
-      <div className="mt-4">
-        <div className="h-px w-full bg-gradient-to-r from-transparent via-slate-200 to-transparent" />
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <ActionChip onClick={() => onLike(post.id)}>
-              <span>👍</span>
-              <span>{likeCount}</span>
-            </ActionChip>
-
-            <ActionChip
-              onClick={() => {
-                onToggleComments(post.id);
-                onComment(post.id);
-              }}
-            >
-              💬 <span>{commentCount}</span>
-            </ActionChip>
-
-            <button
-              type="button"
-              onClick={() => onToggleComments(post.id)}
-              className="rounded-full bg-white px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 active:scale-[0.99]"
-            >
-              {showComments ? "Hide" : "View"} comments
-            </button>
-          </div>
-        </div>
-
-        {showComments ? (
-          <div className="mt-3 space-y-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
-            {commentCount === 0 ? (
-              <div className="text-xs font-semibold text-slate-500">
-                No comments yet.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {(post.comments || [])
-                  .slice()
-                  .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0))
-                  .map((c) => (
-                    <CommentRow
-                      key={c.id}
-                      c={c}
-                      users={users}
-                      meId={meId}
-                      onDelete={(comment) => onDeleteComment?.(post.id, comment)}
-                    />
-                  ))}
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => onComment(post.id)}
-              className="w-full rounded-xl bg-white px-3 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-100 active:scale-[0.99]"
-            >
-              Add a comment
-            </button>
-          </div>
-        ) : null}
-      </div>
-    </Card>
-  );
+function isUniqueViolation(err) {
+  return String(err?.code || "") === "23505";
 }
 
-function cacheKeyForUser(userId) {
-  return `${KEYS.playPosts}::${userId || "anon"}`;
+function getLeagueIdFromLocation(location) {
+  // Priority: navigation state, then query string
+  const stateId = location?.state?.leagueId || location?.state?.id || null;
+  if (stateId) return stateId;
+
+  try {
+    const sp = new URLSearchParams(location?.search || "");
+    const q = sp.get("leagueId") || sp.get("league_id");
+    if (q) return q;
+  } catch {
+    // ignore
+  }
+
+  return null;
 }
 
-export default function Feed() {
-  const [searchParams, setSearchParams] = useSearchParams();
+export default function LeagueSettings() {
+  const navigate = useNavigate();
   const location = useLocation();
 
-  const { user, profile } = useAuth();
-  const meId = user?.id || "anon";
+  const [league, setLeagueState] = useState(() => getLeagueSafe({}));
+  const [users, setUsersState] = useState(() => ensureArr(getUsers([])));
 
-  const [league] = useState(() => getLeague(null));
+  // Supabase auth user
+  const [authUserId, setAuthUserId] = useState(null);
 
-  const initialScope = (() => {
-    const s = (searchParams.get("scope") || "public").toLowerCase();
-    if (s === "friends" || s === "league" || s === "public") return s;
-    return "public";
-  })();
+  // Supabase profile + role (preferred truth)
+  const [myProfile, setMyProfile] = useState(null);
+  const [myRoleLive, setMyRoleLive] = useState(null);
+  const [roleLoading, setRoleLoading] = useState(false);
 
-  const [scope, setScopeState] = useState(initialScope);
+  // Stable league context for this page
+  const stableLeagueIdRef = useRef(null);
+  const initDoneRef = useRef(false);
 
-  function setScope(next) {
-    setScopeState(next);
-    const sp = new URLSearchParams(searchParams);
-    if (next === "public") sp.delete("scope");
-    else sp.set("scope", next);
-    setSearchParams(sp, { replace: true });
-  }
+  // Prevent stale async responses overwriting
+  const roleReqIdRef = useRef(0);
+  const leagueReqIdRef = useRef(0);
 
-  const [text, setText] = useState("");
-  const [toPublic, setToPublic] = useState(true);
-  const [toFriends, setToFriends] = useState(false);
-  const [toLeague, setToLeague] = useState(false);
+  // Invite status UI
+  const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
 
-  const [posts, setPosts] = useState(() => ensureArr(get(cacheKeyForUser(meId), [])));
-  const [users, setUsers] = useState(() => (profile ? [profile] : []));
-  const [openComments, setOpenComments] = useState(() => ({}));
+  // Friends for invite list (Supabase source)
+  const [friends, setFriends] = useState([]);
+  const [friendsLoading, setFriendsLoading] = useState(false);
 
-  const [loading, setLoading] = useState(false);
-  const [notice, setNotice] = useState("");
-  const [debugErr, setDebugErr] = useState("");
+  // Pending invites UI
+  const [pendingInvites, setPendingInvites] = useState([]);
+  const [invitesLoading, setInvitesLoading] = useState(false);
+  const [inviteActionId, setInviteActionId] = useState(null);
 
-  const lastFetchRef = useRef(0);
+  // points draft
+  const [pointsDraft, setPointsDraft] = useState(() => {
+    const ps = getPointsSystem(null);
+    return {
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
 
-  function writeCache(nextPosts) {
-    set(cacheKeyForUser(meId), ensureArr(nextPosts));
-  }
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
 
-  async function loadFeedSupabase() {
-    setDebugErr("");
-
-    if (!user?.id) {
-      setNotice("");
-      setPosts(ensureArr(get(cacheKeyForUser("anon"), [])));
-      return;
-    }
-
-    const now = Date.now();
-    if (now - lastFetchRef.current < 1000) return;
-    lastFetchRef.current = now;
-
-    setLoading(true);
-    setNotice("");
-
-    try {
-      const { data: postRows, error: postErr } = await supabase
-        .from(FEED_POSTS)
-        .select("id, user_id, league_id, text, to_public, to_friends, to_league, created_at")
-        .order("created_at", { ascending: false })
-        .limit(200);
-
-      if (postErr) throw postErr;
-
-      const rows = postRows || [];
-      const postIds = rows.map((r) => r.id);
-      const authorIds = Array.from(new Set(rows.map((r) => r.user_id).filter(Boolean)));
-
-      let likesByPost = {};
-      let commentsByPost = {};
-
-      if (postIds.length) {
-        const [{ data: likeRows, error: likeErr }, { data: commentRows, error: cErr }] =
-          await Promise.all([
-            supabase.from(FEED_LIKES).select("post_id, user_id").in("post_id", postIds),
-            supabase
-              .from(FEED_COMMENTS)
-              .select("id, post_id, user_id, text, created_at")
-              .in("post_id", postIds)
-              .order("created_at", { ascending: true }),
-          ]);
-
-        if (likeErr) throw likeErr;
-        if (cErr) throw cErr;
-
-        likesByPost = (likeRows || []).reduce((acc, r) => {
-          (acc[r.post_id] ||= []).push(r.user_id);
-          return acc;
-        }, {});
-
-        commentsByPost = (commentRows || []).reduce((acc, r) => {
-          (acc[r.post_id] ||= []).push({
-            id: r.id,
-            userId: r.user_id,
-            text: r.text,
-            createdAt: r.created_at,
-          });
-          return acc;
-        }, {});
-      }
-
-      if (authorIds.length) {
-        const { data: profs, error: pErr } = await supabase
-          .from(PROFILES_TABLE)
-          .select("id, username, display_name, handicap_index")
-          .in("id", authorIds);
-
-        if (!pErr && profs) setUsers(profs);
-      } else {
-        setUsers(profile ? [profile] : []);
-      }
-
-      const normalized = rows.map((r) => ({
-        id: r.id,
-        userId: r.user_id,
-        leagueId: r.league_id ?? null,
-        text: r.text ?? "",
-        createdAt: r.created_at,
-        toPublic: !!r.to_public,
-        toFriends: !!r.to_friends,
-        toLeague: !!r.to_league,
-        likes: ensureArr(likesByPost[r.id]),
-        comments: ensureArr(commentsByPost[r.id]),
-      }));
-
-      setPosts(normalized);
-      writeCache(normalized);
-    } catch (e) {
-      if (isAbortError(e)) return;
-
-      const cached = ensureArr(get(cacheKeyForUser(meId), []));
-      setPosts(cached);
-
-      const pretty = formatSupabaseError(e);
-      console.error("Feed load failed:", e);
-
-      setNotice(
-        cached.length
-          ? "You’re viewing cached feed (offline / temporarily unavailable)."
-          : "Feed unavailable right now (offline / temporarily unavailable)."
-      );
-      setDebugErr(pretty);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    loadFeedSupabase();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.key, user?.id]);
-
-  useEffect(() => {
-    const onFocus = () => loadFeedSupabase();
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.id]);
-
-  useEffect(() => {
-    setPosts(ensureArr(get(cacheKeyForUser(meId), [])));
-    setUsers(profile ? [profile] : []);
-    setNotice("");
-    setDebugErr("");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meId]);
-
-  useEffect(() => {
-    writeCache(posts);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [posts, meId]);
-
-  const filteredSorted = useMemo(() => {
-    return posts
-      .filter((p) => {
-        if (scope === "public") return !!p?.toPublic;
-        if (scope === "friends") return !!p?.toFriends;
-        if (scope === "league") {
-          if (!p?.toLeague) return false;
-          if (!league?.id) return true;
-          return p?.leagueId === league.id;
-        }
-        return true;
-      })
-      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-  }, [posts, scope, league?.id]);
-
-  async function toggleLike(postId) {
-    if (!user?.id) {
-      setNotice("Sign in to like posts.");
-      return;
-    }
-
-    const had = (posts.find((p) => p.id === postId)?.likes || []).includes(meId);
-
-    setPosts((prev) =>
-      prev.map((p) =>
-        p.id !== postId
-          ? p
-          : {
-              ...p,
-              likes: had
-                ? (p.likes || []).filter((id) => id !== meId)
-                : [...(p.likes || []), meId],
-            }
-      )
-    );
-
-    try {
-      if (had) {
-        const { error } = await supabase
-          .from(FEED_LIKES)
-          .delete()
-          .eq("post_id", postId)
-          .eq("user_id", meId);
-        if (error) throw error;
-      } else {
-        const { error } = await supabase
-          .from(FEED_LIKES)
-          .upsert([{ post_id: postId, user_id: meId }], { onConflict: "post_id,user_id" });
-        if (error) throw error;
-      }
-    } catch (e) {
-      console.error("Like save failed:", e);
-      setNotice("Couldn’t save like (offline). Changes kept in cache.");
-    }
-  }
-
-  async function addComment(postId) {
-    if (!user?.id) {
-      setNotice("Sign in to comment.");
-      return;
-    }
-
-    const txt = window.prompt("Comment");
-    if (!txt || !txt.trim()) return;
-
-    const optimistic = {
-      id: safeUUID("c"),
-      userId: meId,
-      text: txt.trim(),
-      createdAt: new Date().toISOString(),
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
     };
+  });
 
-    setPosts((prev) =>
-      prev.map((p) =>
-        p.id !== postId ? p : { ...p, comments: [...(p.comments || []), optimistic] }
-      )
-    );
-    setOpenComments((prev) => ({ ...prev, [postId]: true }));
+  // season dates draft
+  const [seasonStart, setSeasonStart] = useState(() => toISODateInput(league?.seasonStartISO));
+  const [seasonEnd, setSeasonEnd] = useState(() => toISODateInput(league?.seasonEndISO));
+
+  const members = useMemo(() => ensureArr(league?.members), [league?.members]);
+
+  const memberUsers = useMemo(() => {
+    const setIds = new Set(members);
+    return users.filter((u) => setIds.has(getUserId(u)));
+  }, [users, members]);
+
+  // display fallback "me"
+  const me = useMemo(() => {
+    if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
+    return users?.[0] || null;
+  }, [authUserId, users]);
+
+  const myId = authUserId || getUserId(me);
+  const myDisplayName = myProfile?.display_name || getUserName(me);
+
+  // Cached role (UI-only fallback)
+  const cachedRole = useMemo(() => {
+    if (!authUserId) return null;
+    const roles = ensureObj(league?.memberRoles);
+    return roles[authUserId] || null;
+  }, [league?.memberRoles, authUserId]);
+
+  const isHostByLeagueRow = Boolean(
+    authUserId && league?.host_user_id && league.host_user_id === authUserId
+  );
+
+  const effectiveRole =
+    myRoleLive ||
+    (isHostByLeagueRow ? LEAGUE_ROLES.host : null) ||
+    cachedRole ||
+    LEAGUE_ROLES.member;
+
+  const canEdit = effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.co_host;
+
+  // ✅ IMPORTANT: compute this BEFORE any early return
+  const stableLeagueId = stableLeagueIdRef.current || league?.id || null;
+
+  // ✅ These hooks MUST be before any early return (fixes React #310)
+  const memberSet = useMemo(() => new Set(ensureArr(members)), [members]);
+
+  const pendingInviteeSet = useMemo(
+    () => new Set(ensureArr(pendingInvites).map((x) => x?.invitee_user_id).filter(Boolean)),
+    [pendingInvites]
+  );
+
+  const friendsNotInLeague = useMemo(() => {
+    return ensureArr(friends).filter((p) => {
+      const id = p?.id;
+      if (!id) return false;
+      if (memberSet.has(id)) return false;
+      return true;
+    });
+  }, [friends, memberSet]);
+
+  // Auth bootstrap (Netlify-safe)
+  useEffect(() => {
+    let alive = true;
+
+    async function boot() {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!alive) return;
+        setAuthUserId(data?.session?.user?.id || null);
+      } catch {
+        if (!alive) return;
+        setAuthUserId(null);
+      }
+    }
+
+    boot();
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!alive) return;
+      setAuthUserId(session?.user?.id || null);
+    });
+
+    return () => {
+      alive = false;
+      try {
+        sub?.subscription?.unsubscribe?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  // Freeze leagueId ASAP
+  useEffect(() => {
+    const navLeagueId = getLeagueIdFromLocation(location);
+    if (navLeagueId) stableLeagueIdRef.current = navLeagueId;
+  }, [location]);
+
+  // One-time init: cache UI state
+  useEffect(() => {
+    if (initDoneRef.current) return;
+    initDoneRef.current = true;
+
+    const cachedLeague = getLeagueSafe({});
+    const cachedUsers = ensureArr(getUsers([]));
+
+    const navLeagueId = getLeagueIdFromLocation(location);
+    const cachedLeagueId = cachedLeague?.id || null;
+
+    stableLeagueIdRef.current = navLeagueId || cachedLeagueId || null;
+
+    setLeagueState(cachedLeague);
+    setUsersState(cachedUsers);
+
+    setSeasonStart(toISODateInput(cachedLeague?.seasonStartISO));
+    setSeasonEnd(toISODateInput(cachedLeague?.seasonEndISO));
+
+    const ps = getPointsSystem(null);
+    setPointsDraft({
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
+
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
+    });
+
+    setInviteStatus({ type: "", message: "" });
+    setPendingInvites([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function refreshLeagueFromSupabase(leagueId) {
+    if (!leagueId) return;
+
+    const reqId = ++leagueReqIdRef.current;
 
     try {
-      const { data, error } = await supabase
-        .from(FEED_COMMENTS)
-        .insert([{ post_id: postId, user_id: meId, text: optimistic.text }])
-        .select("id, post_id, user_id, text, created_at")
+      const { data, error } = await supabase.from("leagues").select("*").eq("id", leagueId).single();
+
+      if (reqId !== leagueReqIdRef.current) return;
+      if (error) throw error;
+
+      const merged = { ...getLeagueSafe({}), ...data };
+      setLeagueSafe(merged);
+      setLeagueState(merged);
+
+      if (data?.season_start || data?.seasonStartISO) {
+        const iso = data?.seasonStartISO || data?.season_start;
+        setSeasonStart(toISODateInput(iso));
+      }
+      if (data?.season_end || data?.seasonEndISO) {
+        const iso = data?.seasonEndISO || data?.season_end;
+        setSeasonEnd(toISODateInput(iso));
+      }
+    } catch {
+      // keep cached league for UI
+    }
+  }
+
+  async function ensureStableLeagueIdIsValid() {
+    if (!authUserId) return;
+
+    const current = stableLeagueIdRef.current;
+
+    if (current) {
+      try {
+        const { data, error } = await supabase
+          .from("league_members")
+          .select("league_id, role")
+          .eq("league_id", current)
+          .eq("user_id", authUserId)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (data?.league_id) return;
+      } catch {
+        // attempt recovery
+      }
+    }
+
+    try {
+      const { data: rows, error } = await supabase
+        .from("league_members")
+        .select("league_id, role, created_at")
+        .eq("user_id", authUserId)
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      const list = ensureArr(rows);
+      if (list.length === 0) return;
+
+      const hostish = list.find((r) => r?.role === LEAGUE_ROLES.host || r?.role === LEAGUE_ROLES.co_host);
+      const pick = hostish?.league_id || list[0]?.league_id || null;
+      if (!pick) return;
+
+      stableLeagueIdRef.current = pick;
+      await refreshLeagueFromSupabase(pick);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function refreshMyProfileAndRole() {
+    const leagueId = stableLeagueIdRef.current;
+    if (!authUserId || !leagueId) return;
+
+    const reqId = ++roleReqIdRef.current;
+    setRoleLoading(true);
+
+    try {
+      const { data: prof, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, display_name")
+        .eq("id", authUserId)
         .single();
 
-      if (error) throw error;
+      if (reqId !== roleReqIdRef.current) return;
+      if (!profErr) setMyProfile(prof || null);
 
-      setPosts((prev) =>
-        prev.map((p) => {
-          if (p.id !== postId) return p;
-          const next = (p.comments || []).map((c) =>
-            c.id === optimistic.id
-              ? { id: data.id, userId: data.user_id, text: data.text, createdAt: data.created_at }
-              : c
-          );
-          return { ...p, comments: next };
-        })
-      );
-    } catch (e) {
-      console.error("Comment save failed:", e);
-      setNotice("Couldn’t save comment (offline). Changes kept in cache.");
-    }
-  }
+      const { data: mem, error: memErr } = await supabase
+        .from("league_members")
+        .select("role")
+        .eq("league_id", leagueId)
+        .eq("user_id", authUserId)
+        .maybeSingle();
 
-  // ✅ NEW: delete comment
-  async function deleteComment(postId, comment) {
-    if (!user?.id) {
-      setNotice("Sign in to delete comments.");
-      return;
-    }
-    if (!comment?.id) return;
+      if (reqId !== roleReqIdRef.current) return;
+      if (memErr) throw memErr;
 
-    // Only allow deleting your own comment in UI (hard guard)
-    if (String(comment.userId) !== String(meId)) {
-      setNotice("You can only delete your own comments.");
-      return;
-    }
+      const role = mem?.role || LEAGUE_ROLES.member;
+      setMyRoleLive(role);
 
-    const ok = window.confirm("Delete this comment?");
-    if (!ok) return;
-
-    // Optimistic remove
-    setPosts((prev) =>
-      prev.map((p) => {
-        if (p.id !== postId) return p;
-        const nextComments = (p.comments || []).filter((c) => c.id !== comment.id);
-        return { ...p, comments: nextComments };
-      })
-    );
-
-    try {
-      const { error } = await supabase
-        .from(FEED_COMMENTS)
-        .delete()
-        .eq("id", comment.id);
-
-      if (error) throw error;
-    } catch (e) {
-      console.error("Delete comment failed:", e);
-
-      // restore on failure
-      setPosts((prev) =>
-        prev.map((p) => {
-          if (p.id !== postId) return p;
-          const exists = (p.comments || []).some((c) => c.id === comment.id);
-          if (exists) return p;
-          return { ...p, comments: [...(p.comments || []), comment].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)) };
-        })
-      );
-
-      setNotice("Couldn’t delete comment (offline). Kept in cache.");
-    }
-  }
-
-  async function submitPost() {
-    if (!text.trim()) return;
-    if (!toPublic && !toFriends && !toLeague) return;
-
-    if (!user?.id) {
-      setNotice("Sign in to post.");
-      return;
-    }
-
-    setLoading(true);
-    setNotice("");
-
-    try {
-      const payload = {
-        user_id: meId,
-        league_id: toLeague ? league?.id || null : null,
-        text: text.trim(),
-        to_public: toPublic,
-        to_friends: toFriends,
-        to_league: toLeague,
-      };
-
-      const { error } = await supabase.from(FEED_POSTS).insert(payload);
-      if (error) throw error;
-
-      setText("");
-      await loadFeedSupabase();
-    } catch (e) {
-      console.error("Post insert failed:", e);
-
-      const offline = {
-        id: safeUUID("post"),
-        userId: meId,
-        leagueId: toLeague ? league?.id || null : null,
-        text: text.trim(),
-        createdAt: new Date().toISOString(),
-        toPublic,
-        toFriends,
-        toLeague,
-        likes: [],
-        comments: [],
-      };
-
-      setPosts((prev) => [offline, ...prev]);
-      setText("");
-      setNotice("Couldn’t post right now (offline). Saved in your cache.");
+      try {
+        setLeagueRole(authUserId, role);
+      } catch {
+        // ignore
+      }
+    } catch {
+      if (reqId !== roleReqIdRef.current) return;
+      if (myRoleLive == null) setMyRoleLive(null);
     } finally {
-      setLoading(false);
+      if (reqId !== roleReqIdRef.current) return;
+      setRoleLoading(false);
     }
   }
 
-  function toggleComments(postId) {
-    setOpenComments((prev) => ({ ...prev, [postId]: !prev[postId] }));
+  useEffect(() => {
+    if (!authUserId) {
+      setMyRoleLive(null);
+      setMyProfile(null);
+      return;
+    }
+
+    (async () => {
+      await ensureStableLeagueIdIsValid();
+
+      const leagueId = stableLeagueIdRef.current;
+      if (leagueId) await refreshLeagueFromSupabase(leagueId);
+
+      await refreshMyProfileAndRole();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUserId]);
+
+  async function loadPendingInvites({ leagueId }) {
+    if (!leagueId) return;
+
+    setInvitesLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("league_invites")
+        .select(
+          `
+          id,
+          league_id,
+          inviter_user_id,
+          invitee_user_id,
+          status,
+          created_at,
+          invitee:profiles!league_invites_invitee_user_id_fkey (
+            id,
+            display_name
+          )
+        `
+        )
+        .eq("league_id", leagueId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setPendingInvites(ensureArr(data));
+    } catch {
+      setPendingInvites([]);
+    } finally {
+      setInvitesLoading(false);
+    }
   }
 
-  const emptyCopy =
-    scope === "public"
-      ? { icon: "🏌️", title: "No banter yet", description: "Start the public golf feed with something funny." }
-      : scope === "friends"
-      ? { icon: "👥", title: "No friends posts yet", description: "When friends start posting, you'll see it here." }
-      : { icon: "🏆", title: "No league banter yet", description: "Post a league moment to get the chat going." };
+  async function loadFriendsForInvites({ userId }) {
+    if (!userId) {
+      setFriends([]);
+      return;
+    }
+
+    setFriendsLoading(true);
+    try {
+      const { data: rows, error } = await supabase
+        .from("friendships")
+        .select("id,user_low,user_high,status")
+        .eq("status", "accepted")
+        .or(`user_low.eq.${userId},user_high.eq.${userId}`);
+
+      if (error) throw error;
+
+      const rels = ensureArr(rows);
+      const friendIds = rels
+        .map((r) => {
+          const low = r?.user_low || null;
+          const high = r?.user_high || null;
+          if (!low || !high) return null;
+          return low === userId ? high : low;
+        })
+        .filter(Boolean);
+
+      const uniq = Array.from(new Set(friendIds));
+
+      if (uniq.length === 0) {
+        setFriends([]);
+        return;
+      }
+
+      const { data: profs, error: profErr } = await supabase
+        .from("profiles")
+        .select("id,display_name")
+        .in("id", uniq);
+
+      if (profErr) throw profErr;
+
+      const next = ensureArr(profs).sort((a, b) => {
+        const an = String(a?.display_name || "").toLowerCase();
+        const bn = String(b?.display_name || "").toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      setFriends(next);
+    } catch (e) {
+      setFriends([]);
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setFriendsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!myId) return;
+    loadFriendsForInvites({ userId: myId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myId]);
+
+  useEffect(() => {
+    const lid = stableLeagueIdRef.current || league?.id || null;
+    if (!lid) return;
+
+    if (!canEdit) {
+      setPendingInvites([]);
+      return;
+    }
+
+    loadPendingInvites({ leagueId: lid });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit]);
+
+  // ✅ NOW it’s safe to early return (NO hooks below this line)
+  if (!stableLeagueId) {
+    return (
+      <div className="pt-2">
+        <EmptyState
+          icon="⚙️"
+          title="No league selected"
+          description="Open League Settings from a specific league."
+          actions={
+            <button
+              onClick={() => navigate("/leagues")}
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
+            >
+              Back to Leagues
+            </button>
+          }
+        />
+      </div>
+    );
+  }
+
+  function setPreset(preset) {
+    if (!canEdit) return;
+
+    if (preset === "default") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3, 2: 2, 3: 0 }),
+      }));
+      return;
+    }
+    if (preset === "yourLeague") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3, 2: 1, 3: 0 }),
+      }));
+      return;
+    }
+    if (preset === "winnerOnly") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3 }),
+      }));
+    }
+  }
+
+  function updatePlacement(place, value) {
+    if (!canEdit) return;
+    const p = Math.trunc(safeNum(place, NaN));
+    if (!Number.isFinite(p) || p <= 0) return;
+    const v = Math.trunc(safeNum(value, 0));
+    setPointsDraft((d) => ({
+      ...d,
+      placementPoints: { ...(d.placementPoints || {}), [p]: v },
+    }));
+  }
+
+  function removePlacement(place) {
+    if (!canEdit) return;
+    const p = Math.trunc(safeNum(place, NaN));
+    if (!Number.isFinite(p) || p <= 0) return;
+    setPointsDraft((d) => {
+      const next = { ...(d.placementPoints || {}) };
+      delete next[p];
+      return { ...d, placementPoints: next };
+    });
+  }
+
+  function addPlacementRow() {
+    if (!canEdit) return;
+    setPointsDraft((d) => {
+      const cur = normalizePlacement(d.placementPoints);
+      const existingPlaces = Object.keys(cur).map((k) => Number(k));
+      const nextPlace = existingPlaces.length ? Math.max(...existingPlaces) + 1 : 4;
+      return { ...d, placementPoints: { ...cur, [nextPlace]: 0 } };
+    });
+  }
+
+  function savePointsSystem() {
+    if (!canEdit) return;
+
+    const placementPoints = normalizePlacement(pointsDraft.placementPoints);
+    const safePlacement = Object.keys(placementPoints).length ? placementPoints : { 1: 3, 2: 2, 3: 0 };
+
+    const merged = {
+      placementPoints: safePlacement,
+      participation: {
+        enabled: Boolean(pointsDraft.participationEnabled),
+        points: Math.trunc(safeNum(pointsDraft.participationPoints, 1)),
+      },
+      bonuses: {
+        enabled: Boolean(pointsDraft.bonusesEnabled),
+        birdie: { enabled: Boolean(pointsDraft.birdieEnabled), points: Math.trunc(safeNum(pointsDraft.birdiePoints, 1)) },
+        eagle: { enabled: Boolean(pointsDraft.eagleEnabled), points: Math.trunc(safeNum(pointsDraft.eaglePoints, 2)) },
+        hio: { enabled: Boolean(pointsDraft.hioEnabled), points: Math.trunc(safeNum(pointsDraft.hioPoints, 5)) },
+      },
+    };
+
+    const next = setPointsSystem(merged);
+    const nextLeague = { ...getLeagueSafe({}), pointsSystem: next };
+    setLeagueSafe(nextLeague);
+    setLeagueState(nextLeague);
+  }
+
+  function saveSeasonDates() {
+    if (!canEdit) return;
+
+    const startISO = fromISODateInput(seasonStart) || league?.seasonStartISO;
+    const endISO = seasonEnd ? fromISODateInput(seasonEnd) : null;
+
+    const next = setLeagueSeasonDates({ startISO, endISO });
+    setLeagueState(next);
+  }
+
+  function toggleCoHost(userId, makeCoHost) {
+    if (!canEdit) return;
+    if (!userId) return;
+
+    setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
+    setLeagueState(getLeagueSafe({}));
+  }
+
+  async function sendInviteToFriend(friendProfile) {
+    if (!canEdit) return;
+
+    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    if (!leagueId) return;
+
+    if (!myId) {
+      setInviteStatus({ type: "error", message: "You must be signed in to invite." });
+      return;
+    }
+
+    const inviteeUserId = friendProfile?.id || null;
+    if (!inviteeUserId) return;
+
+    const memberSetLocal = new Set(ensureArr(members));
+    if (memberSetLocal.has(inviteeUserId)) {
+      setInviteStatus({ type: "info", message: "They’re already in this league." });
+      return;
+    }
+
+    setInviteActionId(inviteeUserId);
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      const { error: invErr } = await supabase.from("league_invites").insert({
+        league_id: leagueId,
+        inviter_user_id: myId,
+        invitee_user_id: inviteeUserId,
+        status: "pending",
+      });
+
+      if (invErr) {
+        if (isUniqueViolation(invErr)) {
+          setInviteStatus({ type: "info", message: "Invite already pending for that golfer." });
+          return;
+        }
+        throw invErr;
+      }
+
+      await loadPendingInvites({ leagueId });
+
+      setInviteStatus({
+        type: "success",
+        message: "Invite sent ✅ They’ll see it in their invites and can accept to join.",
+      });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setInviteActionId(null);
+    }
+  }
+
+  async function cancelInvite(inviteId) {
+    if (!canEdit) return;
+    if (!inviteId) return;
+
+    const leagueId = stableLeagueIdRef.current || league?.id || null;
+    if (!leagueId) return;
+
+    try {
+      const { error } = await supabase.from("league_invites").delete().eq("id", inviteId);
+      if (error) throw error;
+
+      await loadPendingInvites({ leagueId });
+      setInviteStatus({ type: "info", message: "Invite cancelled." });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
+  }
+
+  const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
 
   return (
-    <div className="space-y-4">
-      <ScopeSwitch scope={scope} setScope={setScope} leagueName={league?.name} />
+    <div className="space-y-6">
+      <PageHeader
+        title="League Settings"
+        subtitle={canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."}
+        right={
+          <button
+            type="button"
+            onClick={() => navigate("/league")}
+            className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
+          >
+            Back
+          </button>
+        }
+      />
 
-      {notice ? (
-        <Card className="p-3">
-          <div className="text-sm font-semibold text-slate-700">{notice}</div>
-          {debugErr ? (
-            <div className="mt-2 text-xs font-mono font-semibold text-rose-700">
-              {debugErr}
+      {/* Admin status */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Your access</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
+              <span className="font-extrabold">{roleLabel(effectiveRole)}</span>
+              {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
             </div>
-          ) : null}
-        </Card>
-      ) : null}
-
-      <Card className="p-4">
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={3}
-          placeholder="What happened on the course?"
-          className="w-full resize-none rounded-2xl bg-slate-50 p-3 text-[15px] font-semibold text-slate-900 placeholder:text-slate-400 ring-1 ring-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-600"
-        />
-
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-            Post to:
-          </div>
-
-          <Pill active={toPublic} onClick={() => setToPublic((v) => !v)}>Public</Pill>
-          <Pill active={toFriends} onClick={() => setToFriends((v) => !v)}>Friends</Pill>
-          <Pill active={toLeague} onClick={() => setToLeague((v) => !v)}>League</Pill>
-
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              type="button"
-              className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-200 active:scale-[0.99]"
-              onClick={() => setText("")}
-            >
-              Clear
-            </button>
 
             <button
               type="button"
-              onClick={submitPost}
-              disabled={loading || text.trim().length === 0 || (!toPublic && !toFriends && !toLeague) || !user?.id}
+              onClick={refreshMyProfileAndRole}
+              disabled={!authUserId || roleLoading}
               className={[
-                "rounded-xl px-4 py-2 text-sm font-extrabold text-white transition active:scale-[0.99]",
-                !loading && user?.id && text.trim().length > 0 && (toPublic || toFriends || toLeague)
-                  ? "bg-emerald-600 hover:bg-emerald-500"
-                  : "bg-slate-300 cursor-not-allowed",
+                "mt-3 rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !authUserId || roleLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
               ].join(" ")}
-              title={!user?.id ? "Sign in to post" : ""}
             >
-              {loading ? "Posting…" : "Post"}
+              {roleLoading ? "Refreshing…" : "Refresh permissions"}
             </button>
           </div>
+
+          <span
+            className={[
+              "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
+              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
+            ].join(" ")}
+          >
+            {canEdit ? "Editing enabled" : "View only"}
+          </span>
         </div>
 
-        {!user?.id ? (
-          <div className="mt-2 text-xs font-semibold text-slate-600">
-            Sign in to post, like, and comment.
-          </div>
-        ) : !toPublic && !toFriends && !toLeague ? (
-          <div className="mt-2 text-xs font-semibold text-rose-600">
-            Pick at least one destination (Public / Friends / League).
+        {myRoleLive == null ? (
+          <div className="mt-3 text-[11px] font-semibold text-slate-500">
+            If role lookup is slow/blocked, we fall back to cached host/co-host so you can keep working.
           </div>
         ) : null}
       </Card>
 
-      {filteredSorted.length === 0 ? (
-        <EmptyState
-          icon={emptyCopy.icon}
-          title={emptyCopy.title}
-          description={emptyCopy.description}
-          actions={
-            <button
-              className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-extrabold text-white hover:bg-emerald-500 active:scale-[0.99]"
-              onClick={() => {
-                if (scope === "league") {
-                  setText((t) => t || "League update: I’ve just had a meltdown on 17.");
-                  setToLeague(true);
-                } else if (scope === "friends") {
-                  setText((t) => t || "Anyone playing this weekend?");
-                  setToFriends(true);
-                } else {
-                  setText((t) => t || "Golf is a beautiful sport and I hate it.");
-                  setToPublic(true);
-                }
-              }}
-            >
-              Start the banter
-            </button>
-          }
-        />
-      ) : (
-        <div className="space-y-3">
-          {filteredSorted.map((p) => (
-            <PostCard
-              key={p.id}
-              post={p}
-              users={users}
-              meId={meId}
-              onLike={toggleLike}
-              onComment={addComment}
-              onDeleteComment={deleteComment}
-              showComments={!!openComments[p.id]}
-              onToggleComments={toggleComments}
-            />
-          ))}
+      {/* Invite friends */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Invite friends</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Host/co-host can invite accepted friends. They join only after they accept.
+            </div>
+          </div>
+
+          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+            League ID: <span className="font-mono">{String(stableLeagueId).slice(0, 8)}…</span>
+          </span>
         </div>
-      )}
+
+        <div className="mt-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Friends not in this league
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || friendsLoading}
+              onClick={() => loadFriendsForInvites({ userId: myId })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || friendsLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {friendsLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can invite friends to the league.
+              </div>
+            ) : friendsLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading friends…</div>
+            ) : friendsNotInLeague.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">
+                No inviteable friends found (either none accepted yet, or they’re already in the league).
+              </div>
+            ) : (
+              friendsNotInLeague.map((p) => {
+                const pid = p?.id;
+                const name = p?.display_name || "Friend";
+                const alreadyInvited = pendingInviteeSet.has(pid);
+                const busy = inviteActionId === pid;
+
+                return (
+                  <div
+                    key={pid}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
+                    </div>
+
+                    {alreadyInvited ? (
+                      <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+                        Invited
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => sendInviteToFriend(p)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold",
+                          busy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-slate-900 text-white hover:bg-slate-800",
+                        ].join(" ")}
+                      >
+                        {busy ? "Inviting…" : "Invite"}
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* Pending invites */}
+        <div className="mt-6">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Pending invites
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || invitesLoading}
+              onClick={() => loadPendingInvites({ leagueId: stableLeagueId })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || invitesLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {invitesLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can view and manage league invites.
+              </div>
+            ) : invitesLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
+            ) : pendingInvites.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">No pending invites.</div>
+            ) : (
+              pendingInvites.map((inv) => {
+                const invitee = inv?.invitee || null;
+                const display =
+                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                const created = inv?.created_at ? new Date(inv.created_at) : null;
+
+                return (
+                  <div
+                    key={inv.id}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
+                      <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                        Status: <span className="font-extrabold">Pending</span>
+                        {created ? (
+                          <>
+                            {" "}
+                            · Sent {created.toLocaleDateString()}{" "}
+                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => cancelInvite(inv.id)}
+                      className="rounded-xl bg-rose-600 px-3 py-2 text-xs font-extrabold text-white hover:bg-rose-500"
+                      title="Cancel invite"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {inviteStatus?.message ? (
+          <div
+            className={[
+              "mt-4 rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+              inviteStatus.type === "success"
+                ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
+                : inviteStatus.type === "info"
+                ? "bg-slate-50 text-slate-800 ring-slate-200"
+                : "bg-rose-50 text-rose-900 ring-rose-200",
+            ].join(" ")}
+          >
+            {inviteStatus.message}
+          </div>
+        ) : null}
+      </Card>
+
+      {/* Points System */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Points system</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Configure how points are awarded in this league.
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("default")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="1st=3, 2nd=2, 3rd=0"
+            >
+              Default (3/2/0)
+            </button>
+
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("yourLeague")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="1st=3, 2nd=1, 3rd=0"
+            >
+              Your League (3/1/0)
+            </button>
+
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("winnerOnly")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="Winner only"
+            >
+              Winner only
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-4">
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Placement points
+            </div>
+
+            <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
+              <div className="grid grid-cols-[70px_1fr_54px] items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
+                <div>Place</div>
+                <div>Points</div>
+                <div className="text-right">Del</div>
+              </div>
+
+              <div className="divide-y divide-slate-200 bg-white">
+                {placementRows.length === 0 ? (
+                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">
+                    No placement rules set yet.
+                  </div>
+                ) : (
+                  placementRows.map((p) => (
+                    <div key={p} className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2">
+                      <div className="text-sm font-extrabold text-slate-900">
+                        {p}
+                        {p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}
+                      </div>
+
+                      <input
+                        value={String(pointsDraft.placementPoints?.[p] ?? 0)}
+                        onChange={(e) => updatePlacement(p, e.target.value)}
+                        inputMode="numeric"
+                        disabled={!canEdit}
+                        className={[
+                          "w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                          canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                        ].join(" ")}
+                        aria-label={`Points for place ${p}`}
+                      />
+
+                      <div className="text-right">
+                        <button
+                          type="button"
+                          disabled={!canEdit}
+                          onClick={() => removePlacement(p)}
+                          className={[
+                            "rounded-xl px-3 py-2 text-xs font-extrabold",
+                            canEdit ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-slate-100 text-slate-400 cursor-not-allowed",
+                          ].join(" ")}
+                          title="Remove this place"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="border-t border-slate-200 bg-white px-4 py-3">
+                <button
+                  type="button"
+                  disabled={!canEdit}
+                  onClick={addPlacementRow}
+                  className={[
+                    "rounded-xl px-4 py-2 text-xs font-extrabold",
+                    canEdit ? "bg-slate-100 text-slate-900 hover:bg-slate-200" : "bg-slate-50 text-slate-400 cursor-not-allowed",
+                  ].join(" ")}
+                >
+                  + Add place
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-2 text-xs font-semibold text-slate-500">
+              Anyone outside these places gets <span className="font-extrabold">0</span> points.
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={savePointsSystem}
+              className={[
+                "rounded-xl px-4 py-2 text-sm font-extrabold",
+                canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              ].join(" ")}
+            >
+              Save points system
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigate("/league")}
+              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </Card>
+
+      {/* Season dates */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Season dates</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Used for standings, trophies, and archiving. Example: April → April.
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Season start
+            </div>
+            <input
+              type="date"
+              value={seasonStart}
+              onChange={(e) => setSeasonStart(e.target.value)}
+              disabled={!canEdit}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+              ].join(" ")}
+            />
+          </div>
+
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Season end (optional)
+            </div>
+            <input
+              type="date"
+              value={seasonEnd}
+              onChange={(e) => setSeasonEnd(e.target.value)}
+              disabled={!canEdit}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+              ].join(" ")}
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={!canEdit}
+            onClick={saveSeasonDates}
+            className={[
+              "rounded-xl px-4 py-2 text-sm font-extrabold",
+              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+            ].join(" ")}
+          >
+            Save season dates
+          </button>
+        </div>
+      </Card>
+
+      {/* Admins */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Admins</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Host and co-hosts can manage points and league settings.
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          {memberUsers.length === 0 ? (
+            <div className="text-sm font-semibold text-slate-600">No members found.</div>
+          ) : (
+            memberUsers.map((u) => {
+              const uid = getUserId(u);
+              const role = getLeagueRole(uid);
+              const isHost = role === LEAGUE_ROLES.host;
+              const isCoHost = role === LEAGUE_ROLES.co_host;
+
+              return (
+                <div
+                  key={uid}
+                  className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-extrabold text-slate-900">
+                      {getUserName(u)}
+                    </div>
+                    <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                      {roleLabel(role)}
+                      {uid === myId ? " · You" : ""}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {isHost ? (
+                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">
+                        Host
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!canEdit}
+                        onClick={() => toggleCoHost(uid, !isCoHost)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                          !canEdit
+                            ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                            : isCoHost
+                            ? "bg-emerald-600 text-white ring-emerald-600 hover:bg-emerald-500"
+                            : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+                        ].join(" ")}
+                        title={isCoHost ? "Remove co-host" : "Make co-host"}
+                      >
+                        {isCoHost ? "Co-host ✓" : "Make co-host"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div className="mt-3 text-[11px] font-semibold text-slate-500">
+          Permissions prefer Supabase <span className="font-mono">league_members</span>, with safe fallbacks to keep Host access working during migration.
+        </div>
+      </Card>
     </div>
   );
 }
+
 
