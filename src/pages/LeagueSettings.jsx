@@ -102,10 +102,21 @@ function getLeagueIdFromLocation(location) {
   return null;
 }
 
+// ✅ Make DB role strings safe/consistent
 function normalizeDbRole(role) {
   const r = String(role || "").trim().toLowerCase();
   if (r === "host") return LEAGUE_ROLES.host;
-  if (r === "co_host" || r === "co-host" || r === "cohost" || r === "co host") return LEAGUE_ROLES.co_host;
+
+  if (
+    r === "co_host" ||
+    r === "co-host" ||
+    r === "cohost" ||
+    r === "co host" ||
+    r === "cohost_user"
+  ) {
+    return LEAGUE_ROLES.co_host;
+  }
+
   return LEAGUE_ROLES.member;
 }
 
@@ -133,29 +144,38 @@ export default function LeagueSettings() {
   const [league, setLeagueState] = useState(() => getLeagueSafe({}));
   const [users, setUsersState] = useState(() => ensureArr(getUsers([])));
 
+  // ✅ Supabase auth user id
   const [authUserId, setAuthUserId] = useState(null);
 
+  // ✅ Supabase profile + role (truth)
   const [myProfile, setMyProfile] = useState(null);
   const [myRoleLive, setMyRoleLive] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
+  // 🔒 Stable league context for this page
   const stableLeagueIdRef = useRef(null);
   const initDoneRef = useRef(false);
 
+  // Prevent stale async responses overwriting
   const roleReqIdRef = useRef(0);
   const leagueReqIdRef = useRef(0);
 
+  // Invite status UI
   const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
 
+  // Friends for invite list (Supabase source of truth)
   const [friends, setFriends] = useState([]);
   const [friendsLoading, setFriendsLoading] = useState(false);
 
+  // Pending invites UI
   const [pendingInvites, setPendingInvites] = useState([]);
   const [invitesLoading, setInvitesLoading] = useState(false);
   const [inviteActionId, setInviteActionId] = useState(null);
 
+  // points system (keep behavior)
   useMemo(() => getPointsSystem(null), [league?.pointsSystem]);
 
+  // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
     const ps = getPointsSystem(null);
     return {
@@ -174,6 +194,7 @@ export default function LeagueSettings() {
     };
   });
 
+  // season dates draft
   const [seasonStart, setSeasonStart] = useState(() => toISODateInput(league?.seasonStartISO));
   const [seasonEnd, setSeasonEnd] = useState(() => toISODateInput(league?.seasonEndISO));
 
@@ -184,6 +205,7 @@ export default function LeagueSettings() {
     return users.filter((u) => setIds.has(getUserId(u)));
   }, [users, members]);
 
+  // ✅ Display fallback "me" (NOT used for permissions)
   const me = useMemo(() => {
     if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
     return users?.[0] || null;
@@ -192,6 +214,7 @@ export default function LeagueSettings() {
   const myId = authUserId || getUserId(me);
   const myDisplayName = myProfile?.display_name || getUserName(me);
 
+  // ✅ Permissions: Supabase truth only
   const myRole = myRoleLive || LEAGUE_ROLES.member;
   const canEdit = myRoleLive === LEAGUE_ROLES.host || myRoleLive === LEAGUE_ROLES.co_host;
 
@@ -241,6 +264,7 @@ export default function LeagueSettings() {
 
     stableLeagueIdRef.current = navLeagueId || activeId || cachedLeagueId || null;
 
+    // pin the active league id so other pages stay consistent
     if (stableLeagueIdRef.current) setActiveLeagueId(stableLeagueIdRef.current);
 
     setLeagueState(cachedLeague);
@@ -286,7 +310,6 @@ export default function LeagueSettings() {
           stableLeagueIdRef.current = leagueId;
           setActiveLeagueId(leagueId);
 
-          // pull latest into cache + refresh UI
           await syncActiveLeagueFromSupabase({ leagueId });
           if (!alive) return;
 
@@ -304,6 +327,7 @@ export default function LeagueSettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authUserId]);
 
+  // ✅ SAFE league refresh (don’t depend on non-existent columns)
   async function refreshLeagueFromSupabase(leagueId) {
     if (!leagueId) return;
     const reqId = ++leagueReqIdRef.current;
@@ -340,6 +364,7 @@ export default function LeagueSettings() {
     setRoleLoading(true);
 
     try {
+      // Profile
       const { data: prof, error: profErr } = await supabase
         .from("profiles")
         .select("id, display_name")
@@ -350,6 +375,7 @@ export default function LeagueSettings() {
       if (profErr) throw profErr;
       setMyProfile(prof || null);
 
+      // Role (truth)
       const { data: mem, error: memErr } = await supabase
         .from("league_members")
         .select("role")
@@ -363,6 +389,7 @@ export default function LeagueSettings() {
       const role = normalizeDbRole(mem?.role);
       setMyRoleLive(role);
 
+      // Optional cache alignment for other screens
       try {
         setLeagueRole(authUserId, role);
       } catch {
@@ -377,6 +404,7 @@ export default function LeagueSettings() {
     }
   }
 
+  // ✅ When auth becomes available, sync league cache (members/roles/users) + refresh role
   useEffect(() => {
     if (!authUserId) {
       setMyRoleLive(null);
@@ -493,12 +521,14 @@ export default function LeagueSettings() {
     }
   }
 
+  // Load friends when user id available
   useEffect(() => {
     if (!myId) return;
     loadFriendsForInvites({ userId: myId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myId]);
 
+  // Load pending invites only when editing is enabled
   useEffect(() => {
     const leagueId = stableLeagueIdRef.current || league?.id || null;
     if (!leagueId) return;
@@ -512,6 +542,7 @@ export default function LeagueSettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canEdit]);
 
+  // Stable league id for this page
   const stableLeagueId = stableLeagueIdRef.current || league?.id || null;
 
   if (!stableLeagueId) {
@@ -638,6 +669,7 @@ export default function LeagueSettings() {
     setLeagueState(next);
   }
 
+  // ✅ Co-host toggle MUST update Supabase league_members
   async function toggleCoHost(userId, makeCoHost) {
     if (!canEdit) return;
     if (!userId) return;
@@ -651,10 +683,12 @@ export default function LeagueSettings() {
 
       if (error) throw error;
 
+      // Re-sync cache + refresh UI
       await syncActiveLeagueFromSupabase({ leagueId: stableLeagueId });
       setLeagueState(getLeagueSafe({}));
       setUsersState(ensureArr(getUsers([])));
 
+      // keep local alignment too
       setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
     } catch (e) {
       setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
@@ -748,6 +782,7 @@ export default function LeagueSettings() {
     });
   }, [friends, memberSet]);
 
+  // ✅ Admin roles shown should come from synced league.memberRoles
   const memberRolesLive = league?.memberRoles || {};
 
   return (
@@ -766,6 +801,7 @@ export default function LeagueSettings() {
         }
       />
 
+      {/* Admin status */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -802,7 +838,7 @@ export default function LeagueSettings() {
         </div>
       </Card>
 
-      {/* Invite friends */}
+      {/* Invite to league */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -853,10 +889,7 @@ export default function LeagueSettings() {
                 const busy = inviteActionId === pid;
 
                 return (
-                  <div
-                    key={pid}
-                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
-                  >
+                  <div key={pid} className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
                     </div>
@@ -919,10 +952,7 @@ export default function LeagueSettings() {
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
                 return (
-                  <div
-                    key={inv.id}
-                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
-                  >
+                  <div key={inv.id} className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
                       <div className="mt-0.5 text-xs font-semibold text-slate-600">
@@ -1240,8 +1270,6 @@ export default function LeagueSettings() {
     </div>
   );
 }
-
-
 
 
 
