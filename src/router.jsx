@@ -1,5 +1,5 @@
 // src/router.jsx
-import { createBrowserRouter, Navigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, useRouteError } from "react-router-dom";
 
 import App from "./App";
 
@@ -17,40 +17,61 @@ import LeagueSettings from "./pages/LeagueSettings";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 
-const router = createBrowserRouter([
-  // Auth routes OUTSIDE the App layout (no TopNav/BottomTabs)
-  { path: "/login", element: <Login /> },
-  { path: "/signup", element: <Signup /> },
+function RouteError() {
+  const err = useRouteError();
+  const msg =
+    err?.message ||
+    (typeof err === "string" ? err : "") ||
+    "This page crashed.";
 
-  // Main app (with nav)
+  return (
+    <div className="mx-auto w-full max-w-xl px-4 py-10">
+      <div className="rounded-2xl bg-white p-5 ring-1 ring-slate-200">
+        <div className="text-sm font-extrabold text-slate-900">Page crashed</div>
+        <div className="mt-2 text-sm font-semibold text-slate-700">
+          {msg}
+        </div>
+        <div className="mt-4 text-xs font-mono text-slate-500 whitespace-pre-wrap">
+          {err?.stack || ""}
+        </div>
+        <a
+          className="mt-4 inline-block rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
+          href="/"
+        >
+          Back to home
+        </a>
+      </div>
+    </div>
+  );
+}
+
+const router = createBrowserRouter([
+  { path: "/login", element: <Login />, errorElement: <RouteError /> },
+  { path: "/signup", element: <Signup />, errorElement: <RouteError /> },
+
   {
     path: "/",
     element: <App />,
+    errorElement: <RouteError />,
     children: [
-      { index: true, element: <Feed /> },
+      { index: true, element: <Feed />, errorElement: <RouteError /> },
 
-      // Main league page (your app uses /leagues as the real league page)
-      { path: "leagues", element: <League /> },
+      { path: "leagues", element: <League />, errorElement: <RouteError /> },
+      { path: "league-settings", element: <LeagueSettings />, errorElement: <RouteError /> },
 
-      // League settings (supports query string: /league-settings?leagueId=...)
-      { path: "league-settings", element: <LeagueSettings /> },
+      { path: "post", element: <SubmitRound />, errorElement: <RouteError /> },
+      { path: "friends", element: <FindGolfers />, errorElement: <RouteError /> },
+      { path: "profile", element: <Profile />, errorElement: <RouteError /> },
 
-      { path: "post", element: <SubmitRound /> },
-      { path: "friends", element: <FindGolfers /> },
-      { path: "profile", element: <Profile /> },
+      { path: "rules", element: <Rules />, errorElement: <RouteError /> },
+      { path: "majors", element: <Majors />, errorElement: <RouteError /> },
 
-      { path: "rules", element: <Rules /> },
-      { path: "majors", element: <Majors /> },
-
-      // Legacy/alias routes
       { path: "league", element: <Navigate to="/leagues" replace /> },
       { path: "submit", element: <Navigate to="/post" replace /> },
       { path: "find", element: <Navigate to="/friends" replace /> },
 
-      // Placeholder (future)
       { path: "marketplace", element: <Navigate to="/" replace /> },
 
-      // Fallback
       { path: "*", element: <Navigate to="/" replace /> },
     ],
   },
