@@ -3,10 +3,14 @@ import { seedData } from "../data/seed";
 import { supabase } from "../lib/supabaseClient";
 
 /**
- * ✅ IMPORTANT MIGRATION NOTE
- * Supabase is the source of truth.
- * localStorage is ONLY a demo/offline cache layer while you migrate.
- * This file keeps the cache safe + scoped per signed-in user to prevent cross-account bleed.
+ * ✅ MIGRATION NOTE (Golfers Unite)
+ * Supabase is the SOURCE OF TRUTH going forward.
+ * localStorage is ONLY a safe UI cache / offline demo fallback during migration.
+ *
+ * Critical rules:
+ * - Permissions must be based ONLY on Supabase league_members.role (never cached roles).
+ * - League settings must be able to resolve a leagueId even if router state is missing.
+ * - Fail-soft: if Supabase is unavailable, do NOT wipe caches.
  */
 
 /* ---------------------------------------------
@@ -14,9 +18,9 @@ import { supabase } from "../lib/supabaseClient";
 ---------------------------------------------- */
 
 export const KEYS = {
-  users: "users",
-  league: "league",
-  rounds: "rounds",
+  users: "users", // UI cache
+  league: "league", // UI cache (active league summary)
+  rounds: "rounds", // UI cache (active league rounds)
   trophies: "trophies",
   badges: "badges",
   listings: "listings",
@@ -27,7 +31,7 @@ export const KEYS = {
   seasonArchives: "seasonArchives",
   seededFlag: "__golfers_unite_seeded__",
 
-  // active league selection (support multiple leagues later)
+  // Active league selection (stored in Supabase if possible, local fallback)
   activeLeagueId: "__golfers_unite_active_league_id__",
 };
 
@@ -82,7 +86,11 @@ export function get(key, fallback = null) {
 }
 
 export function set(key, value) {
-  localStorage.setItem(scopedKey(key), JSON.stringify(value));
+  try {
+    localStorage.setItem(scopedKey(key), JSON.stringify(value));
+  } catch {
+    // ignore
+  }
 }
 
 export function remove(key) {
@@ -126,30 +134,25 @@ export function seedIfNeeded() {
 }
 
 /* ---------------------------------------------
-   App-specific helpers (safe normalizers)
+   Safe normalizers
 ---------------------------------------------- */
 
 function ensureObj(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
-
 function ensureArr(v) {
   return Array.isArray(v) ? v : [];
 }
-
 function isNum(n) {
   return typeof n === "number" && Number.isFinite(n);
 }
-
 function toInt(n, fallback = 0) {
   const x = typeof n === "string" ? Number(n) : n;
   return Number.isFinite(x) ? Math.trunc(x) : fallback;
 }
-
 function isISODateString(v) {
   return typeof v === "string" && v.length >= 10;
 }
-
 function toISODateOrNull(v) {
   if (!v) return null;
   if (v instanceof Date) return v.toISOString();
@@ -158,19 +161,30 @@ function toISODateOrNull(v) {
 }
 
 /* ---------------------------------------------
-   ACTIVE LEAGUE (cache helper)
+   Supabase auth helper
+---------------------------------------------- */
+
+async function getAuthedUserId() {
+  const { data: auth } = await supabase.auth.getUser();
+  return auth?.user?.id || null;
+}
+
+/* ---------------------------------------------
+   ACTIVE LEAGUE (Supabase source of truth + local fallback)
+
+   We TRY to store activeLeagueId in profiles.active_league_id (if that column exists).
+   If the column doesn't exist yet, this will fail-soft and use localStorage only.
 ---------------------------------------------- */
 
 export function getActiveLeagueId() {
   try {
-    // Active league is also scoped (per user)
     return localStorage.getItem(scopedKey(KEYS.activeLeagueId)) || null;
   } catch {
     return null;
   }
 }
 
-export function setActiveLeagueId(leagueId) {
+function setActiveLeagueIdLocal(leagueId) {
   try {
     if (!leagueId) localStorage.removeItem(scopedKey(KEYS.activeLeagueId));
     else localStorage.setItem(scopedKey(KEYS.activeLeagueId), String(leagueId));
@@ -179,28 +193,71 @@ export function setActiveLeagueId(leagueId) {
   }
 }
 
+/**
+ * Writes active league preference to Supabase (profiles.active_league_id) if available,
+ * and ALWAYS updates local fallback cache.
+ */
+export async function setActiveLeagueId(leagueId) {
+  setActiveLeagueIdLocal(leagueId);
+
+  try {
+    const uid = await getAuthedUserId();
+    if (!uid) return leagueId || null;
+
+    // Fail-soft if column doesn't exist or RLS blocks it.
+    await supabase.from("profiles").update({ active_league_id: leagueId || null }).eq("id", uid);
+
+    return leagueId || null;
+  } catch {
+    return leagueId || null;
+  }
+}
+
+/**
+ * Reads active league preference from Supabase first (profiles.active_league_id),
+ * falling back to local.
+ */
+export async function getActiveLeagueIdSupabaseFirst() {
+  const local = getActiveLeagueId();
+
+  try {
+    const uid = await getAuthedUserId();
+    if (!uid) return local;
+
+    const { data, error } = await supabase.from("profiles").select("active_league_id").eq("id", uid).single();
+
+    if (error) return local;
+
+    const fromDb = data?.active_league_id || null;
+    if (fromDb && fromDb !== local) setActiveLeagueIdLocal(fromDb);
+    return fromDb || local;
+  } catch {
+    return local;
+  }
+}
+
 /* ---------------------------------------------
    Supabase helpers (source of truth reads)
 ---------------------------------------------- */
 
-async function fetchMyLeagueIds() {
-  const { data: auth } = await supabase.auth.getUser();
-  const uid = auth?.user?.id;
+async function fetchMyLeagueMemberships() {
+  const uid = await getAuthedUserId();
   if (!uid) return [];
 
-  const { data, error } = await supabase
-    .from("league_members")
-    .select("league_id")
-    .eq("user_id", uid);
+  const { data, error } = await supabase.from("league_members").select("league_id,role,created_at").eq("user_id", uid);
 
   if (error) throw error;
-  return ensureArr(data).map((r) => r.league_id).filter(Boolean);
+  return ensureArr(data).filter((r) => r?.league_id);
+}
+
+async function fetchMyLeagueIds() {
+  const rows = await fetchMyLeagueMemberships();
+  return rows.map((r) => r.league_id).filter(Boolean);
 }
 
 /**
  * IMPORTANT:
- * Your DB does NOT have leagues.season_start (you saw that error).
- * So we only select columns we know exist.
+ * Only select columns we know exist.
  */
 async function fetchLeagueById(leagueId) {
   const { data, error } = await supabase
@@ -214,10 +271,7 @@ async function fetchLeagueById(leagueId) {
 }
 
 async function fetchLeagueMembers(leagueId) {
-  const { data, error } = await supabase
-    .from("league_members")
-    .select("user_id,role")
-    .eq("league_id", leagueId);
+  const { data, error } = await supabase.from("league_members").select("user_id,role").eq("league_id", leagueId);
 
   if (error) throw error;
   return ensureArr(data);
@@ -237,80 +291,90 @@ async function fetchProfilesByIds(userIds) {
 }
 
 /**
- * ✅ Main sync (Supabase -> cache):
- * - Supabase is truth
- * - localStorage is just a cache (scoped)
+ * ROUNDS (Supabase) — minimal assumptions:
+ * - table: rounds
+ * - has: id, league_id, user_id, created_at
+ * - and other fields your app uses (score, playerId, etc.)
  *
- * FAIL-SOFT:
- * - If Supabase fails (offline/RLS/transient), DO NOT wipe cache.
- * - Return cached values so app stays usable.
+ * We select * to avoid breaking if you store extra fields.
  */
-export async function syncActiveLeagueFromSupabase({ leagueId = null } = {}) {
-  const cachedLeague = getLeagueSafe({});
-  const cachedUsers = ensureArr(getUsers([]));
+async function fetchRoundsByLeagueId(leagueId) {
+  const { data, error } = await supabase
+    .from("rounds")
+    .select("*")
+    .eq("league_id", leagueId)
+    .order("created_at", { ascending: false });
 
-  try {
-    // 1) Resolve active league id
-    let activeId = leagueId || getActiveLeagueId();
-
-    if (!activeId) {
-      const myLeagueIds = await fetchMyLeagueIds();
-      activeId = myLeagueIds[0] || null;
-      if (activeId) setActiveLeagueId(activeId);
-    }
-
-    // No memberships: return cache (demo/offline)
-    if (!activeId) {
-      return { league: cachedLeague?.id ? cachedLeague : null, users: cachedUsers };
-    }
-
-    // 2) Fetch league + members + profiles
-    const leagueRow = await fetchLeagueById(activeId);
-    const members = await fetchLeagueMembers(activeId);
-
-    const memberIds = members.map((m) => m.user_id).filter(Boolean);
-    const profiles = await fetchProfilesByIds(memberIds);
-
-    // 3) Build users list for UI
-    const users = profiles.map((p) => ({
-      id: p.id,
-      name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
-      email: p.email || null,
-    }));
-
-    // 4) Build league object in normalized format
-    const memberRoles = {};
-    members.forEach((m) => {
-      if (!m?.user_id) return;
-      memberRoles[m.user_id] = normalizeRole(m.role);
-    });
-
-    const nextLeague = normalizeLeague({
-      id: leagueRow?.id,
-      name: leagueRow?.name || "League",
-      members: memberIds,
-      memberRoles,
-      pointsSystem: leagueRow?.points_system || null,
-
-      // Season fields are local-only unless you add DB columns later.
-      // Keep stable for UI.
-      seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
-      seasonEndISO: cachedLeague?.seasonEndISO || null,
-    });
-
-    // 5) Cache (scoped)
-    setLeagueSafe(nextLeague);
-    setUsers(users);
-
-    return { league: nextLeague, users };
-  } catch {
-    // FAIL-SOFT: keep cached fallback
-    return { league: cachedLeague?.id ? cachedLeague : null, users: cachedUsers };
-  }
+  if (error) throw error;
+  return ensureArr(data);
 }
 
 /* ---------------------------------------------
-   USERS / PLAYERS (cached local)
+   LEAGUE ROLES (Supabase truth)
+---------------------------------------------- */
+
+export const LEAGUE_ROLES = {
+  host: "host",
+  co_host: "co_host",
+  member: "member",
+};
+
+function normalizeRole(role) {
+  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host || role === LEAGUE_ROLES.member
+    ? role
+    : LEAGUE_ROLES.member;
+}
+
+/**
+ * ✅ Source-of-truth permission check.
+ * NEVER use cached roles for permissions.
+ */
+export async function getMyLeagueRoleSupabase(leagueId) {
+  if (!leagueId) return LEAGUE_ROLES.member;
+
+  const uid = await getAuthedUserId();
+  if (!uid) return LEAGUE_ROLES.member;
+
+  const { data, error } = await supabase
+    .from("league_members")
+    .select("role")
+    .eq("league_id", leagueId)
+    .eq("user_id", uid)
+    .maybeSingle();
+
+  if (error) {
+    // fail-soft: default to member (view-only)
+    return LEAGUE_ROLES.member;
+  }
+
+  return normalizeRole(data?.role);
+}
+
+export async function isMyLeagueAdminSupabase(leagueId) {
+  const role = await getMyLeagueRoleSupabase(leagueId);
+  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host;
+}
+
+/**
+ * Toggle co-host in Supabase. Only a host/co_host should be allowed by RLS.
+ * After calling this, the UI should call syncActiveLeagueFromSupabase({ leagueId }).
+ */
+export async function setMemberRoleSupabase({ leagueId, userId, role }) {
+  if (!leagueId || !userId) throw new Error("Missing leagueId/userId");
+  const nextRole = normalizeRole(role);
+
+  const { error } = await supabase
+    .from("league_members")
+    .update({ role: nextRole })
+    .eq("league_id", leagueId)
+    .eq("user_id", userId);
+
+  if (error) throw error;
+  return { leagueId, userId, role: nextRole };
+}
+
+/* ---------------------------------------------
+   LEAGUE + USERS (UI caches)
 ---------------------------------------------- */
 
 export function getUsers(fallback = []) {
@@ -321,10 +385,6 @@ export function setUsers(users) {
   set(KEYS.users, ensureArr(users));
 }
 
-/* ---------------------------------------------
-   LEAGUE (cached local)
----------------------------------------------- */
-
 export function getLeague(fallback = {}) {
   return get(KEYS.league, fallback) || fallback;
 }
@@ -334,22 +394,8 @@ export function setLeague(leagueObj) {
 }
 
 /* ---------------------------------------------
-   LEAGUE ROLES + SEASON HELPERS (cache only)
+   League cache normalizers (UI-only)
 ---------------------------------------------- */
-
-export const LEAGUE_ROLES = {
-  host: "host",
-  co_host: "co_host",
-  member: "member",
-};
-
-function normalizeRole(role) {
-  return role === LEAGUE_ROLES.host ||
-    role === LEAGUE_ROLES.co_host ||
-    role === LEAGUE_ROLES.member
-    ? role
-    : LEAGUE_ROLES.member;
-}
 
 function normalizeMemberRoles(league) {
   const l = ensureObj(league);
@@ -363,12 +409,6 @@ function normalizeMemberRoles(league) {
     next[id] = normalizeRole(existing[id] || LEAGUE_ROLES.member);
   });
 
-  // cache-safety: ensure a host exists
-  const hasHost = Object.values(next).some((r) => r === LEAGUE_ROLES.host);
-  if (!hasHost && members.length) {
-    next[members[0]] = LEAGUE_ROLES.host;
-  }
-
   return next;
 }
 
@@ -378,10 +418,7 @@ function normalizeLeague(league) {
   const members = ensureArr(l.members);
   const memberRoles = normalizeMemberRoles({ ...l, members });
 
-  const seasonStartISO = isISODateString(l.seasonStartISO)
-    ? l.seasonStartISO
-    : new Date().toISOString();
-
+  const seasonStartISO = isISODateString(l.seasonStartISO) ? l.seasonStartISO : new Date().toISOString();
   const seasonEndISO = isISODateString(l.seasonEndISO) ? l.seasonEndISO : null;
 
   return {
@@ -405,51 +442,8 @@ export function setLeagueSafe(leagueObj) {
   return next;
 }
 
-export function getLeagueRole(userId) {
-  const league = getLeagueSafe({});
-  const roles = ensureObj(league.memberRoles);
-  if (!userId) return LEAGUE_ROLES.member;
-  return normalizeRole(roles[userId] || LEAGUE_ROLES.member);
-}
-
-export function isLeagueAdmin(userId) {
-  const role = getLeagueRole(userId);
-  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host;
-}
-
-export function setLeagueRole(userId, role) {
-  if (!userId) return null;
-
-  const league = getLeagueSafe({});
-  const roles = ensureObj(league.memberRoles);
-
-  const nextRoles = {
-    ...roles,
-    [userId]: normalizeRole(role),
-  };
-
-  const nextLeague = {
-    ...league,
-    memberRoles: nextRoles,
-  };
-
-  setLeagueSafe(nextLeague);
-  return nextLeague;
-}
-
-export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
-  const league = getLeagueSafe({});
-  const next = {
-    ...league,
-    seasonStartISO: toISODateOrNull(startISO) || league.seasonStartISO,
-    seasonEndISO: toISODateOrNull(endISO),
-  };
-  setLeagueSafe(next);
-  return next;
-}
-
 /* ---------------------------------------------
-   POINTS SYSTEM (cached local)
+   POINTS SYSTEM (Supabase truth via leagues.points_system)
 ---------------------------------------------- */
 
 export const DEFAULT_POINTS_SYSTEM = {
@@ -482,24 +476,14 @@ function normalizePlacementPoints(v) {
 function normalizePointsSystem(ps) {
   const raw = ensureObj(ps);
 
-  const mode =
-    raw.mode === "stableford" || raw.mode === "handicap" || raw.mode === "medal"
-      ? raw.mode
-      : DEFAULT_POINTS_SYSTEM.mode;
+  const mode = raw.mode === "stableford" || raw.mode === "handicap" || raw.mode === "medal" ? raw.mode : DEFAULT_POINTS_SYSTEM.mode;
 
-  const placementPoints = normalizePlacementPoints(
-    raw.placementPoints ?? raw.placement ?? raw.pointsTable
-  );
+  const placementPoints = normalizePlacementPoints(raw.placementPoints ?? raw.placement ?? raw.pointsTable);
 
   const participationRaw = ensureObj(raw.participation);
   const participation = {
-    enabled: Boolean(
-      participationRaw.enabled ?? DEFAULT_POINTS_SYSTEM.participation.enabled
-    ),
-    points: toInt(
-      participationRaw.points ?? DEFAULT_POINTS_SYSTEM.participation.points,
-      DEFAULT_POINTS_SYSTEM.participation.points
-    ),
+    enabled: Boolean(participationRaw.enabled ?? DEFAULT_POINTS_SYSTEM.participation.enabled),
+    points: toInt(participationRaw.points ?? DEFAULT_POINTS_SYSTEM.participation.points, DEFAULT_POINTS_SYSTEM.participation.points),
   };
 
   const bonusesRaw = ensureObj(raw.bonuses);
@@ -511,24 +495,15 @@ function normalizePointsSystem(ps) {
     enabled: Boolean(bonusesRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.enabled),
     birdie: {
       enabled: Boolean(birdieRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.birdie.enabled),
-      points: toInt(
-        birdieRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.birdie.points,
-        DEFAULT_POINTS_SYSTEM.bonuses.birdie.points
-      ),
+      points: toInt(birdieRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.birdie.points, DEFAULT_POINTS_SYSTEM.bonuses.birdie.points),
     },
     eagle: {
       enabled: Boolean(eagleRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.eagle.enabled),
-      points: toInt(
-        eagleRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.eagle.points,
-        DEFAULT_POINTS_SYSTEM.bonuses.eagle.points
-      ),
+      points: toInt(eagleRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.eagle.points, DEFAULT_POINTS_SYSTEM.bonuses.eagle.points),
     },
     hio: {
       enabled: Boolean(hioRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.hio.enabled),
-      points: toInt(
-        hioRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.hio.points,
-        DEFAULT_POINTS_SYSTEM.bonuses.hio.points
-      ),
+      points: toInt(hioRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.hio.points, DEFAULT_POINTS_SYSTEM.bonuses.hio.points),
     },
   };
 
@@ -548,6 +523,10 @@ function normalizePointsSystem(ps) {
   };
 }
 
+/**
+ * Returns points system from cached league object (UI cache),
+ * but the SOURCE OF TRUTH update happens via setPointsSystemSupabase.
+ */
 export function getPointsSystem(fallback = null) {
   const league = getLeagueSafe({});
   const stored = league?.pointsSystem;
@@ -557,6 +536,11 @@ export function getPointsSystem(fallback = null) {
   return normalizePointsSystem(stored);
 }
 
+/**
+ * ✅ Back-compat: old callers expect a sync function named setPointsSystem().
+ * During migration we keep this, but it only updates the UI cache.
+ * Supabase truth update must be done with setPointsSystemSupabase().
+ */
 export function setPointsSystem(pointsSystem) {
   const league = getLeagueSafe({});
   const current = getPointsSystem(DEFAULT_POINTS_SYSTEM);
@@ -565,23 +549,268 @@ export function setPointsSystem(pointsSystem) {
   return merged;
 }
 
-export function setPlacementPoints(placementPoints) {
-  return setPointsSystem({ placementPoints });
+/**
+ * ✅ Supabase truth update for leagues.points_system.
+ * Also updates local UI cache.
+ */
+export async function setPointsSystemSupabase({ leagueId, pointsSystem }) {
+  if (!leagueId) throw new Error("Missing leagueId");
+
+  const merged = normalizePointsSystem(pointsSystem || DEFAULT_POINTS_SYSTEM);
+
+  const { error } = await supabase.from("leagues").update({ points_system: merged }).eq("id", leagueId);
+
+  if (error) throw error;
+
+  // Update UI cache
+  const league = getLeagueSafe({});
+  if (league?.id && String(league.id) === String(leagueId)) {
+    setLeagueSafe({ ...league, pointsSystem: merged });
+  }
+
+  return merged;
 }
 
-export function calculateLeaguePoints({
-  place = null,
-  bonusFlags = {},
-  played = true,
-  pointsSystem = null,
-} = {}) {
+/* ---------------------------------------------
+   ROUNDS (Supabase truth + UI cache)
+---------------------------------------------- */
+
+export function getRounds(fallback = []) {
+  // UI cache read (sync)
+  return get(KEYS.rounds, fallback) || fallback;
+}
+
+export function setRounds(rounds) {
+  // UI cache write (sync)
+  set(KEYS.rounds, ensureArr(rounds));
+}
+
+/**
+ * ✅ Supabase truth read for rounds (and hydrates UI cache).
+ */
+export async function syncRoundsFromSupabase({ leagueId }) {
+  const cached = getRounds([]);
+
+  try {
+    if (!leagueId) return cached;
+    const rows = await fetchRoundsByLeagueId(leagueId);
+    setRounds(rows);
+    return rows;
+  } catch {
+    // fail-soft
+    return cached;
+  }
+}
+
+/**
+ * ✅ Supabase truth create for rounds (and updates UI cache).
+ * NOTE: we keep this async to avoid breaking older sync callers.
+ */
+export async function addRoundSupabase({ leagueId, round }) {
+  if (!leagueId) throw new Error("Missing leagueId");
+
+  const uid = await getAuthedUserId();
+
+  const payload = {
+    ...ensureObj(round),
+    league_id: leagueId,
+    user_id: uid || ensureObj(round)?.user_id || null,
+  };
+
+  const { data, error } = await supabase.from("rounds").insert(payload).select("*").single();
+
+  if (error) throw error;
+
+  // Update UI cache
+  const current = getRounds([]);
+  setRounds([data, ...current]);
+
+  return data;
+}
+
+export async function updateRoundSupabase({ roundId, patch }) {
+  if (!roundId) throw new Error("Missing roundId");
+
+  const { data, error } = await supabase.from("rounds").update(ensureObj(patch)).eq("id", roundId).select("*").single();
+
+  if (error) throw error;
+
+  // Update UI cache
+  const current = getRounds([]);
+  const next = current.map((r) => (r?.id === roundId ? data : r));
+  setRounds(next);
+
+  return data;
+}
+
+export async function deleteRoundSupabase({ roundId }) {
+  if (!roundId) throw new Error("Missing roundId");
+
+  const { error } = await supabase.from("rounds").delete().eq("id", roundId);
+  if (error) throw error;
+
+  // Update UI cache
+  const current = getRounds([]);
+  setRounds(current.filter((r) => r?.id !== roundId));
+
+  return true;
+}
+
+/**
+ * Backwards compat helpers (LOCAL ONLY) — keep during migration,
+ * but your League pages should use the Supabase async versions.
+ */
+export function addRound(round) {
+  const rounds = getRounds([]);
+  const next = [round, ...rounds];
+  setRounds(next);
+  return round;
+}
+
+export function getRoundsByPlayer(playerId) {
+  const rounds = getRounds([]);
+  return rounds.filter((r) => r?.playerId === playerId);
+}
+
+/* ---------------------------------------------
+   ✅ MAIN SYNC: Supabase -> UI cache hydration
+
+   This is the function your League/LeagueSettings pages should call.
+   It resolves a leagueId, fetches league + members + profiles,
+   caches league/users, and optionally hydrates rounds.
+
+   IMPORTANT:
+   - Permission checks must not use cached roles.
+---------------------------------------------- */
+
+export async function resolveLeagueIdSupabaseFirst({ preferredLeagueId = null } = {}) {
+  // 1) preferred input
+  if (preferredLeagueId) return String(preferredLeagueId);
+
+  // 2) supabase profile active_league_id (if exists) else local
+  const fromPref = await getActiveLeagueIdSupabaseFirst();
+  if (fromPref) return String(fromPref);
+
+  // 3) membership fallback (most recent membership)
+  try {
+    const memberships = await fetchMyLeagueMemberships();
+    if (memberships.length) {
+      // prefer latest created_at (already selected), but be safe
+      const pick = memberships[0]?.league_id || null;
+      if (pick) {
+        await setActiveLeagueId(pick);
+        return String(pick);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+/**
+ * ✅ Hydrate all required UI cached data for an active league.
+ * - Supabase is truth
+ * - caches are safe UI only
+ *
+ * Returns:
+ *  { league, users, rounds }
+ */
+export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds = true } = {}) {
+  const cachedLeague = getLeagueSafe({});
+  const cachedUsers = ensureArr(getUsers([]));
+  const cachedRounds = ensureArr(getRounds([]));
+
+  try {
+    // 1) Resolve league id (supabase preference -> local -> membership fallback)
+    const activeId = await resolveLeagueIdSupabaseFirst({ preferredLeagueId: leagueId });
+
+    // No membership / no league chosen
+    if (!activeId) {
+      return {
+        league: cachedLeague?.id ? cachedLeague : null,
+        users: cachedUsers,
+        rounds: cachedRounds,
+      };
+    }
+
+    // ensure preference stored (fail-soft)
+    await setActiveLeagueId(activeId);
+
+    // 2) Fetch league + members + profiles
+    const leagueRow = await fetchLeagueById(activeId);
+    const members = await fetchLeagueMembers(activeId);
+
+    const memberIds = ensureArr(members).map((m) => m.user_id).filter(Boolean);
+    const profiles = await fetchProfilesByIds(memberIds);
+
+    // 3) Build users list for UI
+    const users = profiles.map((p) => ({
+      id: p.id,
+      name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
+      email: p.email || null,
+    }));
+
+    // 4) Roles map (UI cache only — DO NOT use for permissions)
+    const memberRoles = {};
+    members.forEach((m) => {
+      if (!m?.user_id) return;
+      memberRoles[m.user_id] = normalizeRole(m.role);
+    });
+
+    // 5) Build league object in normalized format (UI cache)
+    const nextLeague = normalizeLeague({
+      id: leagueRow?.id,
+      name: leagueRow?.name || "League",
+      host_user_id: leagueRow?.host_user_id || null,
+      members: memberIds,
+      memberRoles,
+      pointsSystem: leagueRow?.points_system || null,
+
+      // Season fields are UI-only unless you add DB columns later.
+      seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
+      seasonEndISO: cachedLeague?.seasonEndISO || null,
+    });
+
+    setLeagueSafe(nextLeague);
+    setUsers(users);
+
+    // 6) Optionally hydrate rounds (supabase truth -> cache)
+    let rounds = cachedRounds;
+    if (withRounds) {
+      rounds = await syncRoundsFromSupabase({ leagueId: activeId });
+    }
+
+    return { league: nextLeague, users, rounds };
+  } catch {
+    // FAIL-SOFT: keep cached fallback
+    return {
+      league: cachedLeague?.id ? cachedLeague : null,
+      users: cachedUsers,
+      rounds: cachedRounds,
+    };
+  }
+}
+
+/**
+ * ✅ Alias requested in your spec:
+ * syncActiveLeagueFromSupabase({ leagueId }) should hydrate all required cached UI data.
+ * (Already does, but we export a named alias to match the brief exactly.)
+ */
+export const syncActiveLeagueFromSupabaseHydrate = syncActiveLeagueFromSupabase;
+
+/* ---------------------------------------------
+   POINTS CALC HELPERS (pure)
+---------------------------------------------- */
+
+export function calculateLeaguePoints({ place = null, bonusFlags = {}, played = true, pointsSystem = null } = {}) {
   const ps = normalizePointsSystem(pointsSystem || getPointsSystem(DEFAULT_POINTS_SYSTEM));
 
   const p = toInt(place, NaN);
   const placementPoints = Number.isFinite(p) && p > 0 ? toInt(ps.placementPoints[p], 0) : 0;
 
-  const participationPoints =
-    played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
+  const participationPoints = played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
 
   let bonusPoints = 0;
   const flags = ensureObj(bonusFlags);
@@ -628,30 +857,6 @@ export function sortRoundsForRanking(rounds, pointsSystem = null) {
     const bv = isNum(b?.score) ? b.score : 999999;
     return av - bv;
   });
-}
-
-/* ---------------------------------------------
-   ROUNDS (still local for now)
----------------------------------------------- */
-
-export function getRounds(fallback = []) {
-  return get(KEYS.rounds, fallback) || fallback;
-}
-
-export function setRounds(rounds) {
-  set(KEYS.rounds, ensureArr(rounds));
-}
-
-export function addRound(round) {
-  const rounds = getRounds([]);
-  const next = [round, ...rounds];
-  setRounds(next);
-  return round;
-}
-
-export function getRoundsByPlayer(playerId) {
-  const rounds = getRounds([]);
-  return rounds.filter((r) => r?.playerId === playerId);
 }
 
 /* ---------------------------------------------
@@ -745,6 +950,55 @@ export function addSeasonArchive(archiveItem) {
   set(KEYS.seasonArchives, next);
   return archiveItem;
 }
+
+/* ---------------------------------------------
+   Legacy cached role helpers (UI only - DO NOT USE FOR PERMISSIONS)
+---------------------------------------------- */
+
+export function getLeagueRole(userId) {
+  const league = getLeagueSafe({});
+  const roles = ensureObj(league.memberRoles);
+  if (!userId) return LEAGUE_ROLES.member;
+  return normalizeRole(roles[userId] || LEAGUE_ROLES.member);
+}
+
+export function isLeagueAdmin(userId) {
+  const role = getLeagueRole(userId);
+  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host;
+}
+
+export function setLeagueRole(userId, role) {
+  if (!userId) return null;
+
+  const league = getLeagueSafe({});
+  const roles = ensureObj(league.memberRoles);
+
+  const nextRoles = {
+    ...roles,
+    [userId]: normalizeRole(role),
+  };
+
+  const nextLeague = {
+    ...league,
+    memberRoles: nextRoles,
+  };
+
+  setLeagueSafe(nextLeague);
+  return nextLeague;
+}
+
+export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
+  const league = getLeagueSafe({});
+  const next = {
+    ...league,
+    seasonStartISO: toISODateOrNull(startISO) || league.seasonStartISO,
+    seasonEndISO: toISODateOrNull(endISO),
+  };
+  setLeagueSafe(next);
+  return next;
+}
+
+
 
 
 

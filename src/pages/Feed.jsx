@@ -1,7 +1,15 @@
 // src/pages/Feed.jsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, Link, useLocation } from "react-router-dom";
-import { KEYS, get, set, getLeague } from "../utils/storage";
+import {
+  KEYS,
+  get,
+  set,
+  getLeagueSafe,
+  syncActiveLeagueFromSupabase,
+  resolveLeagueIdSupabaseFirst,
+  setActiveLeagueId,
+} from "../utils/storage";
 import { supabase } from "../lib/supabaseClient";
 import { useAuth } from "../auth/useAuth";
 
@@ -18,9 +26,7 @@ function ensureArr(v) {
 }
 
 function uid(prefix = "id") {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2, 8)}`;
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function safeUUID(prefix = "post") {
@@ -56,10 +62,7 @@ function getAuthorName(users, userId) {
 
 function formatSupabaseError(e) {
   const msg =
-    e?.message ||
-    e?.error_description ||
-    (typeof e === "string" ? e : "") ||
-    "Unknown error";
+    e?.message || e?.error_description || (typeof e === "string" ? e : "") || "Unknown error";
   const code = e?.code ? ` [${e.code}]` : "";
   const details = e?.details ? ` • ${e.details}` : "";
   const hint = e?.hint ? ` • ${e.hint}` : "";
@@ -102,9 +105,7 @@ function ScopeSwitch({ scope, setScope, leagueName }) {
     <Card className="p-3">
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-            Feed
-          </div>
+          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Feed</div>
           <div className="truncate text-base font-extrabold text-slate-900">
             {scope === "public"
               ? "Public Banter"
@@ -131,9 +132,7 @@ function ScopeSwitch({ scope, setScope, leagueName }) {
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
           <div className="text-xs font-semibold text-slate-600">
             League:{" "}
-            <span className="font-extrabold text-slate-900">
-              {leagueName || "Your league"}
-            </span>
+            <span className="font-extrabold text-slate-900">{leagueName || "Your league"}</span>
           </div>
           <Link
             to="/leagues"
@@ -159,7 +158,7 @@ function ActionChip({ children, onClick }) {
   );
 }
 
-function CommentRow({ c, users }) {
+function CommentRow({ c, users, canDelete, onDelete }) {
   const name = getAuthorName(users, c.userId);
   return (
     <div className="flex items-start gap-2">
@@ -168,12 +167,19 @@ function CommentRow({ c, users }) {
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <div className="truncate text-xs font-extrabold text-slate-900">
-            {name}
-          </div>
-          <div className="text-[11px] font-semibold text-slate-500">
-            · {timeAgo(c.createdAt)}
-          </div>
+          <div className="truncate text-xs font-extrabold text-slate-900">{name}</div>
+          <div className="text-[11px] font-semibold text-slate-500">· {timeAgo(c.createdAt)}</div>
+
+          {canDelete ? (
+            <button
+              type="button"
+              onClick={onDelete}
+              className="ml-auto rounded-full bg-rose-50 px-2 py-1 text-[11px] font-extrabold text-rose-700 ring-1 ring-rose-200 hover:bg-rose-100"
+              title="Delete comment"
+            >
+              Delete
+            </button>
+          ) : null}
         </div>
         <div className="mt-0.5 whitespace-pre-wrap text-sm font-semibold text-slate-800">
           {c.text}
@@ -189,6 +195,7 @@ function PostCard({
   meId,
   onLike,
   onComment,
+  onDeleteComment,
   showComments,
   onToggleComments,
 }) {
@@ -217,9 +224,7 @@ function PostCard({
 
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <div className="truncate text-sm font-extrabold text-slate-900">
-              {author}
-            </div>
+            <div className="truncate text-sm font-extrabold text-slate-900">{author}</div>
 
             {showHcp ? (
               <span className="rounded-full bg-emerald-50 px-2 py-1 text-[11px] font-extrabold text-emerald-800 ring-1 ring-emerald-200">
@@ -227,9 +232,7 @@ function PostCard({
               </span>
             ) : null}
 
-            <div className="text-xs font-semibold text-slate-500">
-              · {timeAgo(post.createdAt)}
-            </div>
+            <div className="text-xs font-semibold text-slate-500">· {timeAgo(post.createdAt)}</div>
           </div>
 
           <div className="mt-2 flex flex-wrap gap-1.5">
@@ -277,19 +280,20 @@ function PostCard({
         {showComments ? (
           <div className="mt-3 space-y-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
             {commentCount === 0 ? (
-              <div className="text-xs font-semibold text-slate-500">
-                No comments yet.
-              </div>
+              <div className="text-xs font-semibold text-slate-500">No comments yet.</div>
             ) : (
               <div className="space-y-3">
                 {(post.comments || [])
                   .slice()
-                  .sort(
-                    (a, b) =>
-                      new Date(a.createdAt || 0) - new Date(b.createdAt || 0)
-                  )
+                  .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0))
                   .map((c) => (
-                    <CommentRow key={c.id} c={c} users={users} />
+                    <CommentRow
+                      key={c.id}
+                      c={c}
+                      users={users}
+                      canDelete={String(c.userId || "") === String(meId || "")}
+                      onDelete={() => onDeleteComment(post.id, c.id)}
+                    />
                   ))}
               </div>
             )}
@@ -319,7 +323,8 @@ export default function Feed() {
   const { user, profile } = useAuth();
   const meId = user?.id || "anon";
 
-  const [league] = useState(() => getLeague(null));
+  // ✅ Keep league reactive from cache (and hydrate it Supabase-first on mount)
+  const [league, setLeague] = useState(() => getLeagueSafe(null));
 
   const initialScope = (() => {
     const s = (searchParams.get("scope") || "public").toLowerCase();
@@ -342,9 +347,7 @@ export default function Feed() {
   const [toFriends, setToFriends] = useState(false);
   const [toLeague, setToLeague] = useState(false);
 
-  const [posts, setPosts] = useState(() =>
-    ensureArr(get(cacheKeyForUser(meId), []))
-  );
+  const [posts, setPosts] = useState(() => ensureArr(get(cacheKeyForUser(meId), [])));
   const [users, setUsers] = useState(() => (profile ? [profile] : []));
   const [openComments, setOpenComments] = useState(() => ({}));
 
@@ -357,6 +360,44 @@ export default function Feed() {
   function writeCache(nextPosts) {
     set(cacheKeyForUser(meId), ensureArr(nextPosts));
   }
+
+  // ✅ Hydrate pinned active league so League Banter filtering works on refresh/new tab
+  useEffect(() => {
+    let alive = true;
+
+    async function hydrateLeague() {
+      try {
+        if (!user?.id) {
+          if (!alive) return;
+          setLeague(getLeagueSafe(null));
+          return;
+        }
+
+        const resolved = await resolveLeagueIdSupabaseFirst({});
+        if (resolved) {
+          // eslint-disable-next-line no-void
+          void setActiveLeagueId(resolved);
+          await syncActiveLeagueFromSupabase({ leagueId: resolved, withRounds: false });
+        } else {
+          // still hydrate whatever the cache has
+          await syncActiveLeagueFromSupabase({ leagueId: null, withRounds: false });
+        }
+
+        if (!alive) return;
+        setLeague(getLeagueSafe(null));
+      } catch {
+        if (!alive) return;
+        setLeague(getLeagueSafe(null));
+      }
+    }
+
+    hydrateLeague();
+
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, location.key]);
 
   async function loadFeedSupabase() {
     setDebugErr("");
@@ -450,7 +491,6 @@ export default function Feed() {
     } catch (e) {
       // ✅ AbortError is not a real failure — ignore it
       if (isAbortError(e)) {
-        // keep current UI; don’t show offline banners for aborted in-flight requests
         return;
       }
 
@@ -497,15 +537,19 @@ export default function Feed() {
   }, [posts, meId]);
 
   const filteredSorted = useMemo(() => {
+    const activeLeagueId = league?.id ? String(league.id) : null;
+
     return posts
       .filter((p) => {
         if (scope === "public") return !!p?.toPublic;
         if (scope === "friends") return !!p?.toFriends;
+
         if (scope === "league") {
           if (!p?.toLeague) return false;
-          if (!league?.id) return true;
-          return p?.leagueId === league.id;
+          if (!activeLeagueId) return true; // fail-soft
+          return String(p?.leagueId || "") === activeLeagueId;
         }
+
         return true;
       })
       .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
@@ -525,27 +569,19 @@ export default function Feed() {
           ? p
           : {
               ...p,
-              likes: had
-                ? (p.likes || []).filter((id) => id !== meId)
-                : [...(p.likes || []), meId],
+              likes: had ? (p.likes || []).filter((id) => id !== meId) : [...(p.likes || []), meId],
             }
       )
     );
 
     try {
       if (had) {
-        const { error } = await supabase
-          .from(FEED_LIKES)
-          .delete()
-          .eq("post_id", postId)
-          .eq("user_id", meId);
+        const { error } = await supabase.from(FEED_LIKES).delete().eq("post_id", postId).eq("user_id", meId);
         if (error) throw error;
       } else {
-        const { error } = await supabase
-          .from(FEED_LIKES)
-          .upsert([{ post_id: postId, user_id: meId }], {
-            onConflict: "post_id,user_id",
-          });
+        const { error } = await supabase.from(FEED_LIKES).upsert([{ post_id: postId, user_id: meId }], {
+          onConflict: "post_id,user_id",
+        });
         if (error) throw error;
       }
     } catch (e) {
@@ -571,9 +607,7 @@ export default function Feed() {
     };
 
     setPosts((prev) =>
-      prev.map((p) =>
-        p.id !== postId ? p : { ...p, comments: [...(p.comments || []), optimistic] }
-      )
+      prev.map((p) => (p.id !== postId ? p : { ...p, comments: [...(p.comments || []), optimistic] }))
     );
     setOpenComments((prev) => ({ ...prev, [postId]: true }));
 
@@ -600,6 +634,53 @@ export default function Feed() {
     } catch (e) {
       console.error("Comment save failed:", e);
       setNotice("Couldn’t save comment (offline). Changes kept in cache.");
+    }
+  }
+
+  // ✅ Delete comment button (author-only in UI; RLS should enforce server-side)
+  async function deleteComment(postId, commentId) {
+    if (!user?.id) {
+      setNotice("Sign in to delete comments.");
+      return;
+    }
+    if (!postId || !commentId) return;
+
+    // find + optimistic remove
+    let removed = null;
+
+    setPosts((prev) =>
+      prev.map((p) => {
+        if (p.id !== postId) return p;
+        const nextComments = (p.comments || []).filter((c) => {
+          if (c.id === commentId) {
+            removed = c;
+            return false;
+          }
+          return true;
+        });
+        return { ...p, comments: nextComments };
+      })
+    );
+
+    // if it was never saved to Supabase (optimistic temp id), just keep removed
+    if (!removed) return;
+
+    try {
+      const { error } = await supabase.from(FEED_COMMENTS).delete().eq("id", commentId).eq("user_id", meId);
+      if (error) throw error;
+      setNotice("Comment deleted.");
+    } catch (e) {
+      console.error("Comment delete failed:", e);
+
+      // rollback
+      setPosts((prev) =>
+        prev.map((p) => {
+          if (p.id !== postId) return p;
+          return { ...p, comments: [...(p.comments || []), removed].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)) };
+        })
+      );
+
+      setNotice("Couldn’t delete comment (offline / no permission).");
     }
   }
 
@@ -660,10 +741,22 @@ export default function Feed() {
 
   const emptyCopy =
     scope === "public"
-      ? { icon: "🏌️", title: "No banter yet", description: "Start the public golf feed with something funny." }
+      ? {
+          icon: "🏌️",
+          title: "No banter yet",
+          description: "Start the public golf feed with something funny.",
+        }
       : scope === "friends"
-      ? { icon: "👥", title: "No friends posts yet", description: "When friends start posting, you'll see it here." }
-      : { icon: "🏆", title: "No league banter yet", description: "Post a league moment to get the chat going." };
+      ? {
+          icon: "👥",
+          title: "No friends posts yet",
+          description: "When friends start posting, you'll see it here.",
+        }
+      : {
+          icon: "🏆",
+          title: "No league banter yet",
+          description: "Post a league moment to get the chat going.",
+        };
 
   return (
     <div className="space-y-4">
@@ -673,9 +766,7 @@ export default function Feed() {
         <Card className="p-3">
           <div className="text-sm font-semibold text-slate-700">{notice}</div>
           {debugErr ? (
-            <div className="mt-2 text-xs font-mono font-semibold text-rose-700">
-              {debugErr}
-            </div>
+            <div className="mt-2 text-xs font-mono font-semibold text-rose-700">{debugErr}</div>
           ) : null}
         </Card>
       ) : null}
@@ -690,13 +781,17 @@ export default function Feed() {
         />
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-            Post to:
-          </div>
+          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Post to:</div>
 
-          <Pill active={toPublic} onClick={() => setToPublic((v) => !v)}>Public</Pill>
-          <Pill active={toFriends} onClick={() => setToFriends((v) => !v)}>Friends</Pill>
-          <Pill active={toLeague} onClick={() => setToLeague((v) => !v)}>League</Pill>
+          <Pill active={toPublic} onClick={() => setToPublic((v) => !v)}>
+            Public
+          </Pill>
+          <Pill active={toFriends} onClick={() => setToFriends((v) => !v)}>
+            Friends
+          </Pill>
+          <Pill active={toLeague} onClick={() => setToLeague((v) => !v)}>
+            League
+          </Pill>
 
           <div className="ml-auto flex items-center gap-2">
             <button
@@ -710,7 +805,12 @@ export default function Feed() {
             <button
               type="button"
               onClick={submitPost}
-              disabled={loading || text.trim().length === 0 || (!toPublic && !toFriends && !toLeague) || !user?.id}
+              disabled={
+                loading ||
+                text.trim().length === 0 ||
+                (!toPublic && !toFriends && !toLeague) ||
+                !user?.id
+              }
               className={[
                 "rounded-xl px-4 py-2 text-sm font-extrabold text-white transition active:scale-[0.99]",
                 !loading && user?.id && text.trim().length > 0 && (toPublic || toFriends || toLeague)
@@ -770,6 +870,7 @@ export default function Feed() {
               meId={meId}
               onLike={toggleLike}
               onComment={addComment}
+              onDeleteComment={deleteComment}
               showComments={!!openComments[p.id]}
               onToggleComments={toggleComments}
             />
@@ -779,5 +880,6 @@ export default function Feed() {
     </div>
   );
 }
+
 
 

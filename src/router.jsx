@@ -1,5 +1,4 @@
 // src/router.jsx
-import React from "react";
 import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import App from "./App";
@@ -12,7 +11,7 @@ import FindGolfers from "./pages/FindGolfers";
 import Profile from "./pages/Profile";
 import Rules from "./pages/Rules";
 import Majors from "./pages/Majors";
-import LeagueSettings from "./pages/LeagueSettings"; // ✅ ADD
+import LeagueSettings from "./pages/LeagueSettings";
 
 // Auth
 import Login from "./pages/Login";
@@ -30,8 +29,11 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Feed /> },
 
+      // Main league page (your app uses /leagues as the real league page)
       { path: "leagues", element: <League /> },
-      { path: "league-settings", element: <LeagueSettings /> }, // ✅ ADD ROUTE
+
+      // League settings (supports query string: /league-settings?leagueId=...)
+      { path: "league-settings", element: <LeagueSettings /> },
 
       { path: "post", element: <SubmitRound /> },
       { path: "friends", element: <FindGolfers /> },
@@ -40,19 +42,21 @@ const router = createBrowserRouter([
       { path: "rules", element: <Rules /> },
       { path: "majors", element: <Majors /> },
 
+      // Legacy/alias routes
       { path: "league", element: <Navigate to="/leagues" replace /> },
       { path: "submit", element: <Navigate to="/post" replace /> },
       { path: "find", element: <Navigate to="/friends" replace /> },
 
+      // Placeholder (future)
       { path: "marketplace", element: <Navigate to="/" replace /> },
 
+      // Fallback
       { path: "*", element: <Navigate to="/" replace /> },
     ],
   },
 ]);
 
 export default router;
-
 
 
 
