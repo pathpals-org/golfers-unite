@@ -38,6 +38,15 @@ const DEFAULT_POINTS_SYSTEM = {
   },
 };
 
+function cleanLeagueId(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  if (low === "undefined" || low === "null") return null;
+  return s;
+}
+
 function formatSeasonRange(startISO) {
   if (!startISO) return "";
   const start = new Date(startISO);
@@ -162,8 +171,7 @@ function mergePointsSystem(raw) {
 
   const placementPoints = normalizePlacement(ps.placementPoints || base.placementPoints);
 
-  const participation =
-    ps.participation && typeof ps.participation === "object" ? ps.participation : {};
+  const participation = ps.participation && typeof ps.participation === "object" ? ps.participation : {};
   const bonuses = ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
 
   const birdie = bonuses.birdie && typeof bonuses.birdie === "object" ? bonuses.birdie : {};
@@ -201,10 +209,7 @@ function humanizeSupabaseError(err) {
 }
 
 async function insertLeagueRobust({ name, userId }) {
-  const attempts = [
-    { name, host_user_id: userId },
-    { name },
-  ];
+  const attempts = [{ name, host_user_id: userId }, { name }];
 
   let lastErr = null;
 
@@ -265,7 +270,7 @@ export default function League() {
 
   // Freeze leagueId ASAP from nav state / query
   useEffect(() => {
-    const navLeagueId = getLeagueIdFromLocation(location);
+    const navLeagueId = cleanLeagueId(getLeagueIdFromLocation(location));
     if (navLeagueId) stableLeagueIdRef.current = navLeagueId;
   }, [location]);
 
@@ -273,34 +278,31 @@ export default function League() {
     return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
   }, [league?.pointsSystem]);
 
-  /**
-   * ✅ Hydrate from Supabase (single source of truth)
-   * - preferred leagueId: nav state/query → stable ref → cached
-   * - resolves final leagueId via storage resolver
-   * - hydrates caches (league/users/rounds)
-   */
   useEffect(() => {
     let alive = true;
 
     async function syncLeague() {
-      if (authLoading) return; // wait for auth
+      if (authLoading) return;
       setLeagueLoading(true);
       setLeagueSyncError("");
 
       try {
-        const preferred =
+        const preferredRaw =
           getLeagueIdFromLocation(location) ||
           stableLeagueIdRef.current ||
           (getLeagueSafe(null)?.id ?? null);
+
+        const preferred = cleanLeagueId(preferredRaw);
 
         const resolved = await resolveLeagueIdSupabaseFirst({
           preferredLeagueId: preferred,
         });
 
-        if (resolved) stableLeagueIdRef.current = String(resolved);
+        const resolvedClean = cleanLeagueId(resolved);
+        if (resolvedClean) stableLeagueIdRef.current = resolvedClean;
 
         await syncActiveLeagueFromSupabase({
-          leagueId: resolved || null,
+          leagueId: resolvedClean || null,
           withRounds: true,
         });
       } catch (e) {
@@ -308,8 +310,6 @@ export default function League() {
         if (alive && msg) setLeagueSyncError(msg);
       } finally {
         if (!alive) return;
-
-        // Always read from cache after sync (single storage layer)
         setLeagueState(getLeagueSafe(null));
         setUsersState(getUsers([]));
         setRoundsState(getRounds([]));
@@ -325,10 +325,6 @@ export default function League() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authLoading, user?.id, location.key]);
 
-  /**
-   * ✅ Ensure points_system exists in Supabase for this league.
-   * If the league row has no points system, we set a safe default ONCE.
-   */
   useEffect(() => {
     let alive = true;
 
@@ -343,7 +339,7 @@ export default function League() {
           if (!alive) return;
           setLeagueState(getLeagueSafe(null));
         } catch {
-          // Fail-soft: UI can still show defaults even if update fails
+          // fail-soft
         }
       }
     }
@@ -358,8 +354,6 @@ export default function League() {
 
   const leagueRounds = useMemo(() => {
     if (!league?.id) return [];
-
-    // Support both old local shape (leagueId) and Supabase shape (league_id)
     return rounds.filter((r) => {
       const lid = r?.league_id || r?.leagueId || null;
       if (!lid) return false;
@@ -390,13 +384,11 @@ export default function League() {
     setCreateErr("");
 
     try {
-      // 1) Create league
       const leagueRow = await insertLeagueRobust({ name, userId: user.id });
 
-      const leagueId = leagueRow?.id;
+      const leagueId = cleanLeagueId(leagueRow?.id);
       if (!leagueId) throw new Error("League created but id missing.");
 
-      // 2) Create membership as host
       const { error: memErr } = await supabase.from("league_members").insert({
         league_id: leagueId,
         user_id: user.id,
@@ -404,12 +396,10 @@ export default function League() {
       });
       if (memErr) throw memErr;
 
-      // 3) Pin active league + sync cache
       stableLeagueIdRef.current = String(leagueId);
       await setActiveLeagueId(leagueId);
       await syncActiveLeagueFromSupabase({ leagueId, withRounds: true });
 
-      // 4) Refresh UI from cache
       setLeagueState(getLeagueSafe(null));
       setUsersState(getUsers([]));
       setRoundsState(getRounds([]));
@@ -424,7 +414,6 @@ export default function League() {
     }
   }
 
-  // ✅ No league yet (production flow)
   if (!league) {
     return (
       <div className="pt-2 space-y-3">
@@ -530,8 +519,6 @@ export default function League() {
   }
 
   function endSeasonConfirm() {
-    // NOTE: this whole end-season flow is still local-only (demo),
-    // and can be migrated later without breaking current functionality.
     const trophies = getTrophies([]);
 
     const champion = standings[0];
@@ -600,20 +587,22 @@ export default function League() {
 
     const nextLeague = { ...league, seasonStartISO: endedAtISO };
 
-    // eslint-disable-next-line no-void
-    void setActiveLeagueId(league.id); // keep active pinned
+    // keep active pinned (ONLY if valid)
+    const lid = cleanLeagueId(league?.id);
+    if (lid) {
+      // eslint-disable-next-line no-void
+      void setActiveLeagueId(lid);
+    }
 
-    // Clear only this league's rounds (demo/local cache)
     const remaining = rounds.filter((r) => {
-      const lid = r?.league_id || r?.leagueId || null;
-      return String(lid || "") !== String(league.id);
+      const rid = r?.league_id || r?.leagueId || null;
+      return String(rid || "") !== String(league.id);
     });
     setRoundsState(remaining);
 
     setShowEndSeason(false);
     setToast("Season ended — trophies awarded + standings archived 🏆");
 
-    // Re-sync fail-soft, then merge local season start into cache for now.
     // eslint-disable-next-line no-void
     void (async () => {
       try {
@@ -686,8 +675,13 @@ export default function League() {
 
           <button
             onClick={() => {
+              const lid = cleanLeagueId(league?.id);
+              if (!lid) {
+                setToast("League not ready yet — try again in a second.");
+                return;
+              }
               // eslint-disable-next-line no-void
-              void setActiveLeagueId(league?.id);
+              void setActiveLeagueId(lid);
               navigate("/?scope=league");
             }}
             className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
@@ -698,11 +692,17 @@ export default function League() {
 
           <button
             onClick={() => {
-              // eslint-disable-next-line no-void
-              void setActiveLeagueId(league?.id);
+              const lid = cleanLeagueId(league?.id);
+              if (!lid) {
+                setToast("League not ready yet — try again in a second.");
+                return;
+              }
 
-              const url = `/league-settings?leagueId=${encodeURIComponent(league.id)}`;
-              navigate(url, { state: { leagueId: league.id } });
+              // eslint-disable-next-line no-void
+              void setActiveLeagueId(lid);
+
+              const url = `/league-settings?leagueId=${encodeURIComponent(lid)}`;
+              navigate(url, { state: { leagueId: lid } });
             }}
             className="ml-auto rounded-xl bg-white px-4 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
           >
@@ -726,7 +726,11 @@ export default function League() {
 
         {standings.length === 0 ? (
           <div className="p-4">
-            <EmptyState icon="📋" title="No rounds yet" description="Submit the first round to populate the league table." />
+            <EmptyState
+              icon="📋"
+              title="No rounds yet"
+              description="Submit the first round to populate the league table."
+            />
           </div>
         ) : (
           <div className="divide-y divide-slate-200">
@@ -809,6 +813,7 @@ export default function League() {
     </div>
   );
 }
+
 
 
 
