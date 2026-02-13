@@ -231,17 +231,29 @@ async function insertLeagueRobust({ name, userId }) {
 
 function getLeagueIdFromLocation(location) {
   const stateId = location?.state?.leagueId || location?.state?.id || null;
-  if (stateId) return stateId;
+  const cleanState = cleanLeagueId(stateId);
+  if (cleanState) return cleanState;
 
   try {
     const sp = new URLSearchParams(location?.search || "");
     const q = sp.get("leagueId") || sp.get("league_id");
-    if (q) return q;
+    const cleanQ = cleanLeagueId(q);
+    if (cleanQ) return cleanQ;
   } catch {
     // ignore
   }
 
   return null;
+}
+
+/** ✅ Single source of truth for button actions: always returns the best available leagueId. */
+function resolveBestLeagueId({ league, stableLeagueIdRef }) {
+  return (
+    cleanLeagueId(league?.id) ||
+    cleanLeagueId(stableLeagueIdRef?.current) ||
+    cleanLeagueId(getLeagueSafe(null)?.id) ||
+    null
+  );
 }
 
 export default function League() {
@@ -588,10 +600,10 @@ export default function League() {
     const nextLeague = { ...league, seasonStartISO: endedAtISO };
 
     // keep active pinned (ONLY if valid)
-    const lid = cleanLeagueId(league?.id);
-    if (lid) {
+    const lidPinned = cleanLeagueId(league?.id);
+    if (lidPinned) {
       // eslint-disable-next-line no-void
-      void setActiveLeagueId(lid);
+      void setActiveLeagueId(lidPinned);
     }
 
     const remaining = rounds.filter((r) => {
@@ -675,7 +687,7 @@ export default function League() {
 
           <button
             onClick={() => {
-              const lid = cleanLeagueId(league?.id);
+              const lid = resolveBestLeagueId({ league, stableLeagueIdRef });
               if (!lid) {
                 setToast("League not ready yet — try again in a second.");
                 return;
@@ -692,12 +704,13 @@ export default function League() {
 
           <button
             onClick={() => {
-              const lid = cleanLeagueId(league?.id);
+              const lid = resolveBestLeagueId({ league, stableLeagueIdRef });
               if (!lid) {
                 setToast("League not ready yet — try again in a second.");
                 return;
               }
 
+              // Keep it pinned for settings + any other screens.
               // eslint-disable-next-line no-void
               void setActiveLeagueId(lid);
 
@@ -750,7 +763,9 @@ export default function League() {
 
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{row.name}</div>
-                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">⭐ {row.majors} majors</div>
+                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">
+                        ⭐ {row.majors} majors
+                      </div>
                     </div>
 
                     <div className="text-center text-sm font-extrabold text-slate-900">{row.rounds}</div>

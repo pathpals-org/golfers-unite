@@ -8,15 +8,24 @@ import PageHeader from "../components/ui/PageHeader";
 import { supabase } from "../lib/supabaseClient";
 
 import {
+  // UI cache getters (safe)
   getLeagueSafe,
-  setLeagueSafe,
-  setLeagueSeasonDates,
   getUsers,
   getPointsSystem,
-  setPointsSystem,
-  getLeagueRole,
-  setLeagueRole,
+
+  // ✅ Supabase-first storage layer
+  syncActiveLeagueFromSupabase,
+  resolveLeagueIdSupabaseFirst,
+  getActiveLeagueIdSupabaseFirst,
+  setActiveLeagueId,
+  getMyLeagueRoleSupabase,
+  setMemberRoleSupabase,
+  setPointsSystemSupabase,
+
   LEAGUE_ROLES,
+
+  // cache-only season helpers (UI-only)
+  setLeagueSeasonDates,
 } from "../utils/storage";
 
 function ensureArr(v) {
@@ -96,27 +105,15 @@ function isUniqueViolation(err) {
   return String(err?.code || "") === "23505";
 }
 
-/** ✅ Reject null/undefined/"undefined"/"null"/"" */
-function cleanLeagueId(v) {
-  if (v === null || v === undefined) return null;
-  const s = String(v).trim();
-  if (!s) return null;
-  const low = s.toLowerCase();
-  if (low === "undefined" || low === "null") return null;
-  return s;
-}
-
 function getLeagueIdFromLocation(location) {
   // Priority: navigation state, then query string
   const stateId = location?.state?.leagueId || location?.state?.id || null;
-  const cleanState = cleanLeagueId(stateId);
-  if (cleanState) return cleanState;
+  if (stateId) return stateId;
 
   try {
     const sp = new URLSearchParams(location?.search || "");
     const q = sp.get("leagueId") || sp.get("league_id");
-    const cleanQ = cleanLeagueId(q);
-    if (cleanQ) return cleanQ;
+    if (q) return q;
   } catch {
     // ignore
   }
@@ -124,6 +121,13 @@ function getLeagueIdFromLocation(location) {
   return null;
 }
 
+/**
+ * ✅ League Settings rules:
+ * - leagueId resolution order: state -> query -> activeLeagueId -> Supabase membership fallback
+ * - permissions based ONLY on Supabase league_members.role
+ * - co-host toggle writes Supabase then re-syncs caches
+ * - /league route is a redirect in your router, so we navigate to /leagues instead
+ */
 export default function LeagueSettings() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -134,18 +138,18 @@ export default function LeagueSettings() {
   // Supabase auth user
   const [authUserId, setAuthUserId] = useState(null);
 
-  // Supabase profile + role (preferred truth)
-  const [myProfile, setMyProfile] = useState(null);
+  // Live role (source of truth)
   const [myRoleLive, setMyRoleLive] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
-  // Stable league context for this page
-  const stableLeagueIdRef = useRef(null);
-  const initDoneRef = useRef(false);
+  // Stable leagueId for this page
+  const [leagueId, setLeagueId] = useState(() => {
+    return getLeagueIdFromLocation(location) || null;
+  });
 
-  // Prevent stale async responses overwriting
+  // Prevent stale async overwrites
+  const hydrateReqIdRef = useRef(0);
   const roleReqIdRef = useRef(0);
-  const leagueReqIdRef = useRef(0);
 
   // Invite status UI
   const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
@@ -158,6 +162,9 @@ export default function LeagueSettings() {
   const [pendingInvites, setPendingInvites] = useState([]);
   const [invitesLoading, setInvitesLoading] = useState(false);
   const [inviteActionId, setInviteActionId] = useState(null);
+
+  // keep behavior (ensures cache points stays consistent)
+  useMemo(() => getPointsSystem(null), [league?.pointsSystem]);
 
   // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
@@ -178,13 +185,9 @@ export default function LeagueSettings() {
     };
   });
 
-  // season dates draft
-  const [seasonStart, setSeasonStart] = useState(() =>
-    toISODateInput(league?.seasonStartISO)
-  );
-  const [seasonEnd, setSeasonEnd] = useState(() =>
-    toISODateInput(league?.seasonEndISO)
-  );
+  // season dates draft (UI-only for now)
+  const [seasonStart, setSeasonStart] = useState(() => toISODateInput(league?.seasonStartISO));
+  const [seasonEnd, setSeasonEnd] = useState(() => toISODateInput(league?.seasonEndISO));
 
   const members = useMemo(() => ensureArr(league?.members), [league?.members]);
 
@@ -193,42 +196,32 @@ export default function LeagueSettings() {
     return users.filter((u) => setIds.has(getUserId(u)));
   }, [users, members]);
 
-  // display fallback "me"
   const me = useMemo(() => {
     if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
     return users?.[0] || null;
   }, [authUserId, users]);
 
   const myId = authUserId || getUserId(me);
-  const myDisplayName = myProfile?.display_name || getUserName(me);
+  const myDisplayName = getUserName(me);
 
-  // Cached role (UI-only fallback)
-  const cachedRole = useMemo(() => {
-    if (!authUserId) return null;
-    const roles = ensureObj(league?.memberRoles);
-    return roles[authUserId] || null;
-  }, [league?.memberRoles, authUserId]);
-
-  const isHostByLeagueRow = Boolean(
-    authUserId && league?.host_user_id && league.host_user_id === authUserId
-  );
-
-  const effectiveRole =
-    myRoleLive ||
-    (isHostByLeagueRow ? LEAGUE_ROLES.host : null) ||
-    cachedRole ||
-    LEAGUE_ROLES.member;
-
+  // ✅ Permissions based ONLY on Supabase league_members.role
+  const effectiveRole = myRoleLive || LEAGUE_ROLES.member;
   const canEdit = effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.co_host;
 
-  // ✅ IMPORTANT: compute this BEFORE any early return
-  const stableLeagueId = cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
+  // ✅ Stable league id for this page
+  const stableLeagueId = leagueId || league?.id || null;
 
-  // ✅ These hooks MUST be before any early return (fixes React #310)
+  // ✅ MUST be above early return (hooks rule)
+  const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
+
   const memberSet = useMemo(() => new Set(ensureArr(members)), [members]);
-
   const pendingInviteeSet = useMemo(
-    () => new Set(ensureArr(pendingInvites).map((x) => x?.invitee_user_id).filter(Boolean)),
+    () =>
+      new Set(
+        ensureArr(pendingInvites)
+          .map((x) => x?.invitee_user_id)
+          .filter(Boolean)
+      ),
     [pendingInvites]
   );
 
@@ -273,189 +266,150 @@ export default function LeagueSettings() {
     };
   }, []);
 
-  // Freeze leagueId ASAP (SANITISED)
+  /**
+   * ✅ LeagueId resolution (state -> query -> activeLeagueId -> membership fallback)
+   * Runs on location changes and on login.
+   */
   useEffect(() => {
-    const navLeagueId = getLeagueIdFromLocation(location);
-    if (navLeagueId) stableLeagueIdRef.current = navLeagueId;
-  }, [location]);
+    let alive = true;
 
-  // One-time init: cache UI state
+    async function resolveLeagueId() {
+      const fromNav = getLeagueIdFromLocation(location);
+      if (fromNav) {
+        if (!alive) return;
+        setLeagueId(String(fromNav));
+        return;
+      }
+
+      // Prefer Supabase profile active league, else local
+      const activePref = await getActiveLeagueIdSupabaseFirst();
+      if (!alive) return;
+
+      if (activePref) {
+        setLeagueId(String(activePref));
+        return;
+      }
+
+      // membership fallback
+      const fallback = await resolveLeagueIdSupabaseFirst({ preferredLeagueId: null });
+      if (!alive) return;
+
+      if (fallback) setLeagueId(String(fallback));
+    }
+
+    resolveLeagueId();
+
+    return () => {
+      alive = false;
+    };
+  }, [location, authUserId]);
+
+  /**
+   * ✅ Hydrate page data for the resolved leagueId.
+   * This uses the single storage layer and caches safe UI data.
+   */
   useEffect(() => {
-    if (initDoneRef.current) return;
-    initDoneRef.current = true;
+    let alive = true;
 
-    const cachedLeague = getLeagueSafe({});
-    const cachedUsers = ensureArr(getUsers([]));
+    async function hydrate() {
+      if (!leagueId) return;
 
-    const navLeagueId = getLeagueIdFromLocation(location);
-    const cachedLeagueId = cleanLeagueId(cachedLeague?.id);
+      const reqId = ++hydrateReqIdRef.current;
 
-    stableLeagueIdRef.current = navLeagueId || cachedLeagueId || null;
-
-    setLeagueState(cachedLeague);
-    setUsersState(cachedUsers);
-
-    setSeasonStart(toISODateInput(cachedLeague?.seasonStartISO));
-    setSeasonEnd(toISODateInput(cachedLeague?.seasonEndISO));
-
-    const ps = getPointsSystem(null);
-    setPointsDraft({
-      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
-
-      participationEnabled: Boolean(ps?.participation?.enabled),
-      participationPoints: safeNum(ps?.participation?.points, 1),
-
-      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
-      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
-      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
-      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
-      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
-      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
-      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
-    });
-
-    setInviteStatus({ type: "", message: "" });
-    setPendingInvites([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function refreshLeagueFromSupabase(leagueId) {
-    const lid = cleanLeagueId(leagueId);
-    if (!lid) return;
-
-    const reqId = ++leagueReqIdRef.current;
-
-    try {
-      const { data, error } = await supabase.from("leagues").select("*").eq("id", lid).single();
-
-      if (reqId !== leagueReqIdRef.current) return;
-      if (error) throw error;
-
-      const merged = { ...getLeagueSafe({}), ...data };
-      setLeagueSafe(merged);
-      setLeagueState(merged);
-
-      if (data?.season_start || data?.seasonStartISO) {
-        const iso = data?.seasonStartISO || data?.season_start;
-        setSeasonStart(toISODateInput(iso));
-      }
-      if (data?.season_end || data?.seasonEndISO) {
-        const iso = data?.seasonEndISO || data?.season_end;
-        setSeasonEnd(toISODateInput(iso));
-      }
-    } catch {
-      // keep cached league for UI
-    }
-  }
-
-  async function ensureStableLeagueIdIsValid() {
-    if (!authUserId) return;
-
-    const current = cleanLeagueId(stableLeagueIdRef.current);
-
-    if (current) {
-      try {
-        const { data, error } = await supabase
-          .from("league_members")
-          .select("league_id, role")
-          .eq("league_id", current)
-          .eq("user_id", authUserId)
-          .maybeSingle();
-
-        if (error) throw error;
-        if (data?.league_id) return;
-      } catch {
-        // attempt recovery
-      }
-    }
-
-    try {
-      const { data: rows, error } = await supabase
-        .from("league_members")
-        .select("league_id, role, created_at")
-        .eq("user_id", authUserId)
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-
-      const list = ensureArr(rows);
-      if (list.length === 0) return;
-
-      const hostish = list.find((r) => r?.role === LEAGUE_ROLES.host || r?.role === LEAGUE_ROLES.co_host);
-      const pick = cleanLeagueId(hostish?.league_id || list[0]?.league_id || null);
-      if (!pick) return;
-
-      stableLeagueIdRef.current = pick;
-      await refreshLeagueFromSupabase(pick);
-    } catch {
-      // ignore
-    }
-  }
-
-  async function refreshMyProfileAndRole() {
-    const leagueId = cleanLeagueId(stableLeagueIdRef.current);
-    if (!authUserId || !leagueId) return;
-
-    const reqId = ++roleReqIdRef.current;
-    setRoleLoading(true);
-
-    try {
-      const { data: prof, error: profErr } = await supabase
-        .from("profiles")
-        .select("id, display_name")
-        .eq("id", authUserId)
-        .single();
-
-      if (reqId !== roleReqIdRef.current) return;
-      if (!profErr) setMyProfile(prof || null);
-
-      const { data: mem, error: memErr } = await supabase
-        .from("league_members")
-        .select("role")
-        .eq("league_id", leagueId)
-        .eq("user_id", authUserId)
-        .maybeSingle();
-
-      if (reqId !== roleReqIdRef.current) return;
-      if (memErr) throw memErr;
-
-      const role = mem?.role || LEAGUE_ROLES.member;
-      setMyRoleLive(role);
+      // fail-soft: show cached immediately
+      setLeagueState(getLeagueSafe({}));
+      setUsersState(ensureArr(getUsers([])));
 
       try {
-        setLeagueRole(authUserId, role);
+        const { league: l, users: u } = await syncActiveLeagueFromSupabase({
+          leagueId,
+          withRounds: false,
+        });
+
+        if (!alive) return;
+        if (reqId !== hydrateReqIdRef.current) return;
+
+        if (l?.id) {
+          setLeagueState(l);
+          setUsersState(ensureArr(u));
+
+          // Align local drafts to hydrated data
+          setSeasonStart(toISODateInput(l?.seasonStartISO));
+          setSeasonEnd(toISODateInput(l?.seasonEndISO));
+
+          const ps = getPointsSystem(null);
+          setPointsDraft({
+            placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+            participationEnabled: Boolean(ps?.participation?.enabled),
+            participationPoints: safeNum(ps?.participation?.points, 1),
+
+            bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+            birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+            birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+            eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+            eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+            hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+            hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
+          });
+
+          // Persist as active league preference (Supabase if possible, local fallback always)
+          await setActiveLeagueId(l.id);
+        }
       } catch {
-        // ignore
+        // fail-soft: keep cached UI
       }
-    } catch {
-      if (reqId !== roleReqIdRef.current) return;
-      if (myRoleLive == null) setMyRoleLive(null);
-    } finally {
-      if (reqId !== roleReqIdRef.current) return;
-      setRoleLoading(false);
     }
-  }
 
+    hydrate();
+
+    return () => {
+      alive = false;
+    };
+  }, [leagueId]);
+
+  /**
+   * ✅ Fetch my role from Supabase (source of truth) whenever leagueId/auth changes.
+   */
   useEffect(() => {
-    if (!authUserId) {
-      setMyRoleLive(null);
-      setMyProfile(null);
-      return;
+    let alive = true;
+
+    async function refreshRole() {
+      if (!authUserId || !leagueId) {
+        setMyRoleLive(null);
+        return;
+      }
+
+      const reqId = ++roleReqIdRef.current;
+      setRoleLoading(true);
+
+      try {
+        const role = await getMyLeagueRoleSupabase(leagueId);
+
+        if (!alive) return;
+        if (reqId !== roleReqIdRef.current) return;
+
+        setMyRoleLive(role);
+      } catch {
+        if (!alive) return;
+        if (reqId !== roleReqIdRef.current) return;
+        // Fail-soft: default to member (view-only)
+        setMyRoleLive(LEAGUE_ROLES.member);
+      } finally {
+        if (!alive) return;
+        if (reqId !== roleReqIdRef.current) return;
+        setRoleLoading(false);
+      }
     }
 
-    (async () => {
-      await ensureStableLeagueIdIsValid();
+    refreshRole();
 
-      const leagueId = cleanLeagueId(stableLeagueIdRef.current);
-      if (leagueId) await refreshLeagueFromSupabase(leagueId);
+    return () => {
+      alive = false;
+    };
+  }, [authUserId, leagueId]);
 
-      await refreshMyProfileAndRole();
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUserId]);
-
-  async function loadPendingInvites({ leagueId }) {
-    const lid = cleanLeagueId(leagueId);
+  async function loadPendingInvites({ leagueId: lid }) {
     if (!lid) return;
 
     setInvitesLoading(true);
@@ -551,7 +505,7 @@ export default function LeagueSettings() {
   }, [myId]);
 
   useEffect(() => {
-    const lid = cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
+    const lid = leagueId || league?.id || null;
     if (!lid) return;
 
     if (!canEdit) {
@@ -561,9 +515,8 @@ export default function LeagueSettings() {
 
     loadPendingInvites({ leagueId: lid });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canEdit]);
+  }, [canEdit, leagueId]);
 
-  // ✅ NOW it’s safe to early return (NO hooks below this line)
   if (!stableLeagueId) {
     return (
       <div className="pt-2">
@@ -606,6 +559,7 @@ export default function LeagueSettings() {
         ...d,
         placementPoints: normalizePlacement({ 1: 3 }),
       }));
+      return;
     }
   }
 
@@ -641,13 +595,12 @@ export default function LeagueSettings() {
     });
   }
 
-  function savePointsSystem() {
+  async function savePointsSystem() {
     if (!canEdit) return;
 
     const placementPoints = normalizePlacement(pointsDraft.placementPoints);
-    const safePlacement = Object.keys(placementPoints).length
-      ? placementPoints
-      : { 1: 3, 2: 2, 3: 0 };
+    const safePlacement =
+      Object.keys(placementPoints).length > 0 ? placementPoints : { 1: 3, 2: 2, 3: 0 };
 
     const merged = {
       placementPoints: safePlacement,
@@ -672,15 +625,20 @@ export default function LeagueSettings() {
       },
     };
 
-    const next = setPointsSystem(merged);
-    const nextLeague = { ...getLeagueSafe({}), pointsSystem: next };
-    setLeagueSafe(nextLeague);
-    setLeagueState(nextLeague);
+    try {
+      await setPointsSystemSupabase({ leagueId: stableLeagueId, pointsSystem: merged });
+      // Re-hydrate caches so League page and Settings stay aligned
+      await syncActiveLeagueFromSupabase({ leagueId: stableLeagueId, withRounds: false });
+      setLeagueState(getLeagueSafe({}));
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
   }
 
   function saveSeasonDates() {
     if (!canEdit) return;
 
+    // UI-only until DB columns exist
     const startISO = fromISODateInput(seasonStart) || league?.seasonStartISO;
     const endISO = seasonEnd ? fromISODateInput(seasonEnd) : null;
 
@@ -688,19 +646,37 @@ export default function LeagueSettings() {
     setLeagueState(next);
   }
 
-  function toggleCoHost(userId, makeCoHost) {
+  async function toggleCoHost(userId, makeCoHost) {
     if (!canEdit) return;
     if (!userId) return;
 
-    setLeagueRole(userId, makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member);
-    setLeagueState(getLeagueSafe({}));
+    try {
+      await setMemberRoleSupabase({
+        leagueId: stableLeagueId,
+        userId,
+        role: makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member,
+      });
+
+      // ✅ Re-sync from Supabase (truth), then refresh UI
+      await syncActiveLeagueFromSupabase({ leagueId: stableLeagueId, withRounds: false });
+      setLeagueState(getLeagueSafe({}));
+      setUsersState(ensureArr(getUsers([])));
+
+      // If you toggled yourself, refresh role
+      if (authUserId && userId === authUserId) {
+        const r = await getMyLeagueRoleSupabase(stableLeagueId);
+        setMyRoleLive(r);
+      }
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
   }
 
   async function sendInviteToFriend(friendProfile) {
     if (!canEdit) return;
 
-    const leagueId = cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
-    if (!leagueId) return;
+    const lid = stableLeagueId;
+    if (!lid) return;
 
     if (!myId) {
       setInviteStatus({ type: "error", message: "You must be signed in to invite." });
@@ -721,7 +697,7 @@ export default function LeagueSettings() {
 
     try {
       const { error: invErr } = await supabase.from("league_invites").insert({
-        league_id: leagueId,
+        league_id: lid,
         inviter_user_id: myId,
         invitee_user_id: inviteeUserId,
         status: "pending",
@@ -735,7 +711,7 @@ export default function LeagueSettings() {
         throw invErr;
       }
 
-      await loadPendingInvites({ leagueId });
+      await loadPendingInvites({ leagueId: lid });
 
       setInviteStatus({
         type: "success",
@@ -752,31 +728,25 @@ export default function LeagueSettings() {
     if (!canEdit) return;
     if (!inviteId) return;
 
-    const leagueId = cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
-    if (!leagueId) return;
+    const lid = stableLeagueId;
+    if (!lid) return;
 
     try {
       const { error } = await supabase.from("league_invites").delete().eq("id", inviteId);
       if (error) throw error;
 
-      await loadPendingInvites({ leagueId });
+      await loadPendingInvites({ leagueId: lid });
       setInviteStatus({ type: "info", message: "Invite cancelled." });
     } catch (e) {
       setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
     }
   }
 
-  const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
-
   return (
     <div className="space-y-6">
       <PageHeader
         title="League Settings"
-        subtitle={
-          canEdit
-            ? "Manage points, season, and admins."
-            : "You can view settings. Only host/co-host can edit."
-        }
+        subtitle={canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."}
         right={
           <button
             type="button"
@@ -801,7 +771,16 @@ export default function LeagueSettings() {
 
             <button
               type="button"
-              onClick={refreshMyProfileAndRole}
+              onClick={async () => {
+                if (!stableLeagueId) return;
+                setRoleLoading(true);
+                try {
+                  const r = await getMyLeagueRoleSupabase(stableLeagueId);
+                  setMyRoleLive(r);
+                } finally {
+                  setRoleLoading(false);
+                }
+              }}
               disabled={!authUserId || roleLoading}
               className={[
                 "mt-3 rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
@@ -817,20 +796,16 @@ export default function LeagueSettings() {
           <span
             className={[
               "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
-              canEdit
-                ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
-                : "bg-slate-50 text-slate-700 ring-slate-200",
+              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
             ].join(" ")}
           >
             {canEdit ? "Editing enabled" : "View only"}
           </span>
         </div>
 
-        {myRoleLive == null ? (
-          <div className="mt-3 text-[11px] font-semibold text-slate-500">
-            If role lookup is slow/blocked, we fall back to cached host/co-host so you can keep working.
-          </div>
-        ) : null}
+        <div className="mt-3 text-[11px] font-semibold text-slate-500">
+          Permissions are based only on Supabase <span className="font-mono">league_members.role</span>.
+        </div>
       </Card>
 
       {/* Invite friends */}
@@ -850,9 +825,7 @@ export default function LeagueSettings() {
 
         <div className="mt-4">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Friends not in this league
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Friends not in this league</div>
 
             <button
               type="button"
@@ -871,9 +844,7 @@ export default function LeagueSettings() {
 
           <div className="mt-2 space-y-2">
             {!canEdit ? (
-              <div className="text-sm font-semibold text-slate-600">
-                Only host/co-host can invite friends to the league.
-              </div>
+              <div className="text-sm font-semibold text-slate-600">Only host/co-host can invite friends to the league.</div>
             ) : friendsLoading ? (
               <div className="text-sm font-semibold text-slate-600">Loading friends…</div>
             ) : friendsNotInLeague.length === 0 ? (
@@ -888,10 +859,7 @@ export default function LeagueSettings() {
                 const busy = inviteActionId === pid;
 
                 return (
-                  <div
-                    key={pid}
-                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
-                  >
+                  <div key={pid} className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
                     </div>
@@ -907,9 +875,7 @@ export default function LeagueSettings() {
                         onClick={() => sendInviteToFriend(p)}
                         className={[
                           "rounded-xl px-3 py-2 text-xs font-extrabold",
-                          busy
-                            ? "bg-slate-200 text-slate-500 cursor-not-allowed"
-                            : "bg-slate-900 text-white hover:bg-slate-800",
+                          busy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-slate-900 text-white hover:bg-slate-800",
                         ].join(" ")}
                       >
                         {busy ? "Inviting…" : "Invite"}
@@ -925,9 +891,7 @@ export default function LeagueSettings() {
         {/* Pending invites */}
         <div className="mt-6">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
-              Pending invites
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Pending invites</div>
 
             <button
               type="button"
@@ -946,9 +910,7 @@ export default function LeagueSettings() {
 
           <div className="mt-2 space-y-2">
             {!canEdit ? (
-              <div className="text-sm font-semibold text-slate-600">
-                Only host/co-host can view and manage league invites.
-              </div>
+              <div className="text-sm font-semibold text-slate-600">Only host/co-host can view and manage league invites.</div>
             ) : invitesLoading ? (
               <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
             ) : pendingInvites.length === 0 ? (
@@ -956,15 +918,11 @@ export default function LeagueSettings() {
             ) : (
               pendingInvites.map((inv) => {
                 const invitee = inv?.invitee || null;
-                const display =
-                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                const display = invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
                 return (
-                  <div
-                    key={inv.id}
-                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
-                  >
+                  <div key={inv.id} className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
                       <div className="mt-0.5 text-xs font-semibold text-slate-600">
@@ -1012,12 +970,279 @@ export default function LeagueSettings() {
 
       {/* Points System */}
       <Card className="p-5">
-        {/* (rest of your JSX unchanged from here down) */}
-        {/* KEEP your remaining JSX exactly as you pasted it */}
-        {/* ... */}
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Points system</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">Configure how points are awarded in this league.</div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("default")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="1st=3, 2nd=2, 3rd=0"
+            >
+              Default (3/2/0)
+            </button>
+
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("yourLeague")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="1st=3, 2nd=1, 3rd=0"
+            >
+              Your League (3/1/0)
+            </button>
+
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => setPreset("winnerOnly")}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+              ].join(" ")}
+              title="Winner only"
+            >
+              Winner only
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-4">
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Placement points</div>
+
+            <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
+              <div className="grid grid-cols-[70px_1fr_54px] items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
+                <div>Place</div>
+                <div>Points</div>
+                <div className="text-right">Del</div>
+              </div>
+
+              <div className="divide-y divide-slate-200 bg-white">
+                {placementRows.length === 0 ? (
+                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">No placement rules set yet.</div>
+                ) : (
+                  placementRows.map((p) => (
+                    <div key={p} className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2">
+                      <div className="text-sm font-extrabold text-slate-900">
+                        {p}
+                        {p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}
+                      </div>
+
+                      <input
+                        value={String(pointsDraft.placementPoints?.[p] ?? 0)}
+                        onChange={(e) => updatePlacement(p, e.target.value)}
+                        inputMode="numeric"
+                        disabled={!canEdit}
+                        className={[
+                          "w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                          canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                        ].join(" ")}
+                        aria-label={`Points for place ${p}`}
+                      />
+
+                      <div className="text-right">
+                        <button
+                          type="button"
+                          disabled={!canEdit}
+                          onClick={() => removePlacement(p)}
+                          className={[
+                            "rounded-xl px-3 py-2 text-xs font-extrabold",
+                            canEdit ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-slate-100 text-slate-400 cursor-not-allowed",
+                          ].join(" ")}
+                          title="Remove this place"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="border-t border-slate-200 bg-white px-4 py-3">
+                <button
+                  type="button"
+                  disabled={!canEdit}
+                  onClick={addPlacementRow}
+                  className={[
+                    "rounded-xl px-4 py-2 text-xs font-extrabold",
+                    canEdit ? "bg-slate-100 text-slate-900 hover:bg-slate-200" : "bg-slate-50 text-slate-400 cursor-not-allowed",
+                  ].join(" ")}
+                >
+                  + Add place
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-2 text-xs font-semibold text-slate-500">
+              Anyone outside these places gets <span className="font-extrabold">0</span> points.
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={savePointsSystem}
+              className={[
+                "rounded-xl px-4 py-2 text-sm font-extrabold",
+                canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              ].join(" ")}
+            >
+              Save points system
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigate("/leagues")}
+              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </Card>
+
+      {/* Season dates */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Season dates</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Used for standings, trophies, and archiving. Example: April → April.
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Season start</div>
+            <input
+              type="date"
+              value={seasonStart}
+              onChange={(e) => setSeasonStart(e.target.value)}
+              disabled={!canEdit}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+              ].join(" ")}
+            />
+          </div>
+
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Season end (optional)</div>
+            <input
+              type="date"
+              value={seasonEnd}
+              onChange={(e) => setSeasonEnd(e.target.value)}
+              disabled={!canEdit}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
+                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+              ].join(" ")}
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={!canEdit}
+            onClick={saveSeasonDates}
+            className={[
+              "rounded-xl px-4 py-2 text-sm font-extrabold",
+              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+            ].join(" ")}
+          >
+            Save season dates
+          </button>
+        </div>
+      </Card>
+
+      {/* Admins */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Admins</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Host and co-hosts can manage points and league settings.
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          {memberUsers.length === 0 ? (
+            <div className="text-sm font-semibold text-slate-600">No members found.</div>
+          ) : (
+            memberUsers.map((u) => {
+              const uid = getUserId(u);
+
+              // NOTE: display only (cached). Real permissions are based on myRoleLive only.
+              const cachedRole = ensureObj(league?.memberRoles || {})[uid] || LEAGUE_ROLES.member;
+              const role = cachedRole;
+              const isHost = role === LEAGUE_ROLES.host;
+              const isCoHost = role === LEAGUE_ROLES.co_host;
+
+              return (
+                <div key={uid} className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-extrabold text-slate-900">{getUserName(u)}</div>
+                    <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                      {roleLabel(role)}
+                      {uid === myId ? " · You" : ""}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {isHost ? (
+                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">Host</span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!canEdit}
+                        onClick={() => toggleCoHost(uid, !isCoHost)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                          !canEdit
+                            ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                            : isCoHost
+                            ? "bg-emerald-600 text-white ring-emerald-600 hover:bg-emerald-500"
+                            : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+                        ].join(" ")}
+                        title={isCoHost ? "Remove co-host" : "Make co-host"}
+                      >
+                        {isCoHost ? "Co-host ✓" : "Make co-host"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div className="mt-3 text-[11px] font-semibold text-slate-500">
+          Admin actions update Supabase and then re-sync the league cache.
+        </div>
       </Card>
     </div>
   );
 }
+
+
+
+
 
 

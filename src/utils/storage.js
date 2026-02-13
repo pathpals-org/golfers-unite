@@ -1,707 +1,125 @@
-// src/utils/storage.js
-import { seedData } from "../data/seed";
+// src/pages/LeagueSettings.jsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import Card from "../components/ui/Card";
+import EmptyState from "../components/ui/EmptyState";
+import PageHeader from "../components/ui/PageHeader";
+
 import { supabase } from "../lib/supabaseClient";
 
-/**
- * ✅ MIGRATION NOTE (Golfers Unite)
- * Supabase is the SOURCE OF TRUTH going forward.
- * localStorage is ONLY a safe UI cache / offline demo fallback during migration.
- *
- * Critical rules:
- * - Permissions must be based ONLY on Supabase league_members.role (never cached roles).
- * - League settings must be able to resolve a leagueId even if router state is missing.
- * - Fail-soft: if Supabase is unavailable, do NOT wipe caches.
- */
+import {
+  getLeagueSafe,
+  setLeagueSafe,
+  setLeagueSeasonDates,
+  getUsers,
+  getPointsSystem,
+  setPointsSystem,
 
-/* ---------------------------------------------
-   KEYS (base keys before scoping)
----------------------------------------------- */
+  // ⚠️ Legacy cached role helpers are imported in your file.
+  // We will NOT use them for permissions anymore (Supabase-only).
+  // getLeagueRole,
+  // setLeagueRole,
+  LEAGUE_ROLES,
+} from "../utils/storage";
 
-export const KEYS = {
-  users: "users", // UI cache
-  league: "league", // UI cache (active league summary)
-  rounds: "rounds", // UI cache (active league rounds)
-  trophies: "trophies",
-  badges: "badges",
-  listings: "listings",
-  listingMessages: "listingMessages",
-  watchlist: "watchlist",
-  playPosts: "playPosts",
-  playRequests: "playRequests",
-  seasonArchives: "seasonArchives",
-  seededFlag: "__golfers_unite_seeded__",
-
-  // Active league selection (stored in Supabase if possible, local fallback)
-  activeLeagueId: "__golfers_unite_active_league_id__",
-};
-
-// identifies which signed-in user the offline/local cache belongs to
-export const STORAGE_USER_KEY = "__golfers_unite_storage_user_id__";
-
-export function getStorageUserId() {
-  try {
-    return localStorage.getItem(STORAGE_USER_KEY) || null;
-  } catch {
-    return null;
-  }
+function ensureArr(v) {
+  return Array.isArray(v) ? v : [];
 }
-
-/**
- * ✅ Call this from Auth on login/logout to scope local cache.
- * - When user logs in: setStorageUserId(user.id)
- * - When user logs out: setStorageUserId(null)
- */
-export function setStorageUserId(userId) {
-  try {
-    if (!userId) localStorage.removeItem(STORAGE_USER_KEY);
-    else localStorage.setItem(STORAGE_USER_KEY, String(userId));
-  } catch {
-    // ignore
-  }
-}
-
-/* ---------------------------------------------
-   KEY SCOPING (prevents cross-account bleed)
----------------------------------------------- */
-
-function scopedKey(baseKey) {
-  // Keep Supabase auth tokens untouched (sb-...-auth-token)
-  // Only scope OUR app keys.
-  const uid = getStorageUserId();
-  if (!uid) return baseKey;
-  return `${uid}::${baseKey}`;
-}
-
-/* ---------------------------------------------
-   Generic localStorage helpers (scoped)
----------------------------------------------- */
-
-export function get(key, fallback = null) {
-  try {
-    const raw = localStorage.getItem(scopedKey(key));
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-export function set(key, value) {
-  try {
-    localStorage.setItem(scopedKey(key), JSON.stringify(value));
-  } catch {
-    // ignore
-  }
-}
-
-export function remove(key) {
-  try {
-    localStorage.removeItem(scopedKey(key));
-  } catch {
-    // ignore
-  }
-}
-
-/* ---------------------------------------------
-   Seed (scoped demo/offline cache)
----------------------------------------------- */
-
-const STORAGE_KEYS = [
-  KEYS.users,
-  KEYS.league,
-  KEYS.rounds,
-  KEYS.trophies,
-  KEYS.badges,
-  KEYS.listings,
-  KEYS.listingMessages,
-  KEYS.watchlist,
-  KEYS.playPosts,
-  KEYS.playRequests,
-  KEYS.seasonArchives,
-];
-
-export function seedIfNeeded() {
-  // Seed is per-user (scoped). If no user id is set, it seeds the unscoped demo cache.
-  const hasSeed = localStorage.getItem(scopedKey(KEYS.seededFlag));
-  if (hasSeed) return;
-
-  const data = seedData();
-
-  STORAGE_KEYS.forEach((k) => {
-    if (data[k] !== undefined) set(k, data[k]);
-  });
-
-  localStorage.setItem(scopedKey(KEYS.seededFlag), "true");
-}
-
-/* ---------------------------------------------
-   Safe normalizers
----------------------------------------------- */
 
 function ensureObj(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
-function ensureArr(v) {
-  return Array.isArray(v) ? v : [];
-}
-function isNum(n) {
-  return typeof n === "number" && Number.isFinite(n);
-}
-function toInt(n, fallback = 0) {
+
+function safeNum(n, fallback = 0) {
   const x = typeof n === "string" ? Number(n) : n;
-  return Number.isFinite(x) ? Math.trunc(x) : fallback;
-}
-function isISODateString(v) {
-  return typeof v === "string" && v.length >= 10;
-}
-function toISODateOrNull(v) {
-  if (!v) return null;
-  if (v instanceof Date) return v.toISOString();
-  if (typeof v === "string") return v;
-  return null;
+  return Number.isFinite(x) ? x : fallback;
 }
 
-/* ---------------------------------------------
-   Supabase auth helper
----------------------------------------------- */
-
-async function getAuthedUserId() {
-  const { data: auth } = await supabase.auth.getUser();
-  return auth?.user?.id || null;
-}
-
-/* ---------------------------------------------
-   ACTIVE LEAGUE (Supabase source of truth + local fallback)
-
-   We TRY to store activeLeagueId in profiles.active_league_id (if that column exists).
-   If the column doesn't exist yet, this will fail-soft and use localStorage only.
----------------------------------------------- */
-
-export function getActiveLeagueId() {
+function toISODateInput(iso) {
+  if (!iso) return "";
   try {
-    return localStorage.getItem(scopedKey(KEYS.activeLeagueId)) || null;
+    return new Date(iso).toISOString().slice(0, 10);
   } catch {
-    return null;
+    return "";
   }
 }
 
-function setActiveLeagueIdLocal(leagueId) {
-  try {
-    if (!leagueId) localStorage.removeItem(scopedKey(KEYS.activeLeagueId));
-    else localStorage.setItem(scopedKey(KEYS.activeLeagueId), String(leagueId));
-  } catch {
-    // ignore
-  }
+function fromISODateInput(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toISOString();
 }
 
-/**
- * Writes active league preference to Supabase (profiles.active_league_id) if available,
- * and ALWAYS updates local fallback cache.
- */
-export async function setActiveLeagueId(leagueId) {
-  setActiveLeagueIdLocal(leagueId);
-
-  try {
-    const uid = await getAuthedUserId();
-    if (!uid) return leagueId || null;
-
-    // Fail-soft if column doesn't exist or RLS blocks it.
-    await supabase.from("profiles").update({ active_league_id: leagueId || null }).eq("id", uid);
-
-    return leagueId || null;
-  } catch {
-    return leagueId || null;
-  }
+function getUserId(u) {
+  return u?.id || u?._id || null;
 }
 
-/**
- * Reads active league preference from Supabase first (profiles.active_league_id),
- * falling back to local.
- */
-export async function getActiveLeagueIdSupabaseFirst() {
-  const local = getActiveLeagueId();
-
-  try {
-    const uid = await getAuthedUserId();
-    if (!uid) return local;
-
-    const { data, error } = await supabase.from("profiles").select("active_league_id").eq("id", uid).single();
-
-    if (error) return local;
-
-    const fromDb = data?.active_league_id || null;
-    if (fromDb && fromDb !== local) setActiveLeagueIdLocal(fromDb);
-    return fromDb || local;
-  } catch {
-    return local;
-  }
+function getUserName(u) {
+  return (
+    u?.name ||
+    u?.fullName ||
+    u?.displayName ||
+    u?.username ||
+    u?.display_name ||
+    "Golfer"
+  );
 }
 
-/* ---------------------------------------------
-   Supabase helpers (source of truth reads)
----------------------------------------------- */
-
-async function fetchMyLeagueMemberships() {
-  const uid = await getAuthedUserId();
-  if (!uid) return [];
-
-  const { data, error } = await supabase.from("league_members").select("league_id,role,created_at").eq("user_id", uid);
-
-  if (error) throw error;
-  return ensureArr(data).filter((r) => r?.league_id);
-}
-
-async function fetchMyLeagueIds() {
-  const rows = await fetchMyLeagueMemberships();
-  return rows.map((r) => r.league_id).filter(Boolean);
-}
-
-/**
- * IMPORTANT:
- * Only select columns we know exist.
- */
-async function fetchLeagueById(leagueId) {
-  const { data, error } = await supabase
-    .from("leagues")
-    .select("id,name,host_user_id,points_system,created_at")
-    .eq("id", leagueId)
-    .single();
-
-  if (error) throw error;
-  return data || null;
-}
-
-async function fetchLeagueMembers(leagueId) {
-  const { data, error } = await supabase.from("league_members").select("user_id,role").eq("league_id", leagueId);
-
-  if (error) throw error;
-  return ensureArr(data);
-}
-
-async function fetchProfilesByIds(userIds) {
-  const ids = ensureArr(userIds).filter(Boolean);
-  if (!ids.length) return [];
-
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id,email,display_name,created_at")
-    .in("id", ids);
-
-  if (error) throw error;
-  return ensureArr(data);
-}
-
-/**
- * ROUNDS (Supabase) — minimal assumptions:
- * - table: rounds
- * - has: id, league_id, user_id, created_at
- * - and other fields your app uses (score, playerId, etc.)
- *
- * We select * to avoid breaking if you store extra fields.
- */
-async function fetchRoundsByLeagueId(leagueId) {
-  const { data, error } = await supabase
-    .from("rounds")
-    .select("*")
-    .eq("league_id", leagueId)
-    .order("created_at", { ascending: false });
-
-  if (error) throw error;
-  return ensureArr(data);
-}
-
-/* ---------------------------------------------
-   LEAGUE ROLES (Supabase truth)
----------------------------------------------- */
-
-export const LEAGUE_ROLES = {
-  host: "host",
-  co_host: "co_host",
-  member: "member",
-};
-
-function normalizeRole(role) {
-  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host || role === LEAGUE_ROLES.member
-    ? role
-    : LEAGUE_ROLES.member;
-}
-
-/**
- * ✅ Source-of-truth permission check.
- * NEVER use cached roles for permissions.
- */
-export async function getMyLeagueRoleSupabase(leagueId) {
-  if (!leagueId) return LEAGUE_ROLES.member;
-
-  const uid = await getAuthedUserId();
-  if (!uid) return LEAGUE_ROLES.member;
-
-  const { data, error } = await supabase
-    .from("league_members")
-    .select("role")
-    .eq("league_id", leagueId)
-    .eq("user_id", uid)
-    .maybeSingle();
-
-  if (error) {
-    // fail-soft: default to member (view-only)
-    return LEAGUE_ROLES.member;
-  }
-
-  return normalizeRole(data?.role);
-}
-
-export async function isMyLeagueAdminSupabase(leagueId) {
-  const role = await getMyLeagueRoleSupabase(leagueId);
-  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host;
-}
-
-/**
- * Toggle co-host in Supabase. Only a host/co_host should be allowed by RLS.
- * After calling this, the UI should call syncActiveLeagueFromSupabase({ leagueId }).
- */
-export async function setMemberRoleSupabase({ leagueId, userId, role }) {
-  if (!leagueId || !userId) throw new Error("Missing leagueId/userId");
-  const nextRole = normalizeRole(role);
-
-  const { error } = await supabase
-    .from("league_members")
-    .update({ role: nextRole })
-    .eq("league_id", leagueId)
-    .eq("user_id", userId);
-
-  if (error) throw error;
-  return { leagueId, userId, role: nextRole };
-}
-
-/* ---------------------------------------------
-   LEAGUE + USERS (UI caches)
----------------------------------------------- */
-
-export function getUsers(fallback = []) {
-  return get(KEYS.users, fallback) || fallback;
-}
-
-export function setUsers(users) {
-  set(KEYS.users, ensureArr(users));
-}
-
-export function getLeague(fallback = {}) {
-  return get(KEYS.league, fallback) || fallback;
-}
-
-export function setLeague(leagueObj) {
-  set(KEYS.league, leagueObj || {});
-}
-
-/* ---------------------------------------------
-   League cache normalizers (UI-only)
----------------------------------------------- */
-
-function normalizeMemberRoles(league) {
-  const l = ensureObj(league);
-  const members = ensureArr(l.members);
-
-  const existing = ensureObj(l.memberRoles);
-  const next = {};
-
-  members.forEach((id) => {
-    if (!id) return;
-    next[id] = normalizeRole(existing[id] || LEAGUE_ROLES.member);
-  });
-
-  return next;
-}
-
-function normalizeLeague(league) {
-  const l = ensureObj(league);
-
-  const members = ensureArr(l.members);
-  const memberRoles = normalizeMemberRoles({ ...l, members });
-
-  const seasonStartISO = isISODateString(l.seasonStartISO) ? l.seasonStartISO : new Date().toISOString();
-  const seasonEndISO = isISODateString(l.seasonEndISO) ? l.seasonEndISO : null;
-
-  return {
-    ...l,
-    members,
-    memberRoles,
-    seasonStartISO,
-    seasonEndISO,
-  };
-}
-
-export function getLeagueSafe(fallback = {}) {
-  const raw = getLeague(fallback);
-  if (!raw || typeof raw !== "object") return ensureObj(fallback);
-  return normalizeLeague(raw);
-}
-
-export function setLeagueSafe(leagueObj) {
-  const next = normalizeLeague(leagueObj || {});
-  setLeague(next);
-  return next;
-}
-
-/* ---------------------------------------------
-   POINTS SYSTEM (Supabase truth via leagues.points_system)
----------------------------------------------- */
-
-export const DEFAULT_POINTS_SYSTEM = {
-  mode: "medal",
-  placementPoints: { 1: 3, 2: 2, 3: 0 },
-  participation: { enabled: false, points: 1 },
-  bonuses: {
-    enabled: false,
-    birdie: { enabled: false, points: 1 },
-    eagle: { enabled: false, points: 2 },
-    hio: { enabled: false, points: 5 },
-  },
-  extras: { enabled: false },
-};
-
-function normalizePlacementPoints(v) {
-  const raw = ensureObj(v);
+function normalizePlacement(v) {
+  const raw = v && typeof v === "object" && !Array.isArray(v) ? v : {};
   const next = {};
   Object.keys(raw).forEach((k) => {
-    const place = toInt(k, NaN);
-    const pts = toInt(raw[k], 0);
-    if (Number.isFinite(place) && place > 0) next[place] = pts;
+    const place = Math.trunc(Number(k));
+    if (!Number.isFinite(place) || place <= 0) return;
+    next[place] = Math.trunc(safeNum(raw[k], 0));
   });
-
-  const keys = Object.keys(next);
-  if (!keys.length) return { ...DEFAULT_POINTS_SYSTEM.placementPoints };
   return next;
 }
 
-function normalizePointsSystem(ps) {
-  const raw = ensureObj(ps);
-
-  const mode = raw.mode === "stableford" || raw.mode === "handicap" || raw.mode === "medal" ? raw.mode : DEFAULT_POINTS_SYSTEM.mode;
-
-  const placementPoints = normalizePlacementPoints(raw.placementPoints ?? raw.placement ?? raw.pointsTable);
-
-  const participationRaw = ensureObj(raw.participation);
-  const participation = {
-    enabled: Boolean(participationRaw.enabled ?? DEFAULT_POINTS_SYSTEM.participation.enabled),
-    points: toInt(participationRaw.points ?? DEFAULT_POINTS_SYSTEM.participation.points, DEFAULT_POINTS_SYSTEM.participation.points),
-  };
-
-  const bonusesRaw = ensureObj(raw.bonuses);
-  const birdieRaw = ensureObj(bonusesRaw.birdie);
-  const eagleRaw = ensureObj(bonusesRaw.eagle);
-  const hioRaw = ensureObj(bonusesRaw.hio);
-
-  const bonuses = {
-    enabled: Boolean(bonusesRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.enabled),
-    birdie: {
-      enabled: Boolean(birdieRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.birdie.enabled),
-      points: toInt(birdieRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.birdie.points, DEFAULT_POINTS_SYSTEM.bonuses.birdie.points),
-    },
-    eagle: {
-      enabled: Boolean(eagleRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.eagle.enabled),
-      points: toInt(eagleRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.eagle.points, DEFAULT_POINTS_SYSTEM.bonuses.eagle.points),
-    },
-    hio: {
-      enabled: Boolean(hioRaw.enabled ?? DEFAULT_POINTS_SYSTEM.bonuses.hio.enabled),
-      points: toInt(hioRaw.points ?? DEFAULT_POINTS_SYSTEM.bonuses.hio.points, DEFAULT_POINTS_SYSTEM.bonuses.hio.points),
-    },
-  };
-
-  const extrasRaw = ensureObj(raw.extras);
-
-  return {
-    ...DEFAULT_POINTS_SYSTEM,
-    ...raw,
-    mode,
-    placementPoints,
-    participation,
-    bonuses,
-    extras: {
-      enabled: Boolean(extrasRaw.enabled ?? DEFAULT_POINTS_SYSTEM.extras.enabled),
-      ...extrasRaw,
-    },
-  };
+function placementRowsFromMap(map) {
+  return Object.keys(normalizePlacement(map))
+    .map((k) => Number(k))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
 }
 
-/**
- * Returns points system from cached league object (UI cache),
- * but the SOURCE OF TRUTH update happens via setPointsSystemSupabase.
- */
-export function getPointsSystem(fallback = null) {
-  const league = getLeagueSafe({});
-  const stored = league?.pointsSystem;
-
-  if (!stored && fallback) return normalizePointsSystem(fallback);
-  if (!stored) return normalizePointsSystem(DEFAULT_POINTS_SYSTEM);
-  return normalizePointsSystem(stored);
+function roleLabel(role) {
+  if (role === LEAGUE_ROLES.host) return "Host";
+  if (role === LEAGUE_ROLES.co_host) return "Co-host";
+  return "Member";
 }
 
-/**
- * ✅ Back-compat: old callers expect a sync function named setPointsSystem().
- * During migration we keep this, but it only updates the UI cache.
- * Supabase truth update must be done with setPointsSystemSupabase().
- */
-export function setPointsSystem(pointsSystem) {
-  const league = getLeagueSafe({});
-  const current = getPointsSystem(DEFAULT_POINTS_SYSTEM);
-  const merged = normalizePointsSystem({ ...current, ...ensureObj(pointsSystem) });
-  setLeagueSafe({ ...league, pointsSystem: merged });
-  return merged;
+function humanizeSupabaseError(err) {
+  const msg = err?.message || String(err || "");
+  if (!msg) return "Something went wrong.";
+  return msg;
 }
 
-/**
- * ✅ Supabase truth update for leagues.points_system.
- * Also updates local UI cache.
- */
-export async function setPointsSystemSupabase({ leagueId, pointsSystem }) {
-  if (!leagueId) throw new Error("Missing leagueId");
-
-  const merged = normalizePointsSystem(pointsSystem || DEFAULT_POINTS_SYSTEM);
-
-  const { error } = await supabase.from("leagues").update({ points_system: merged }).eq("id", leagueId);
-
-  if (error) throw error;
-
-  // Update UI cache
-  const league = getLeagueSafe({});
-  if (league?.id && String(league.id) === String(leagueId)) {
-    setLeagueSafe({ ...league, pointsSystem: merged });
-  }
-
-  return merged;
+function isUniqueViolation(err) {
+  return String(err?.code || "") === "23505";
 }
 
-/* ---------------------------------------------
-   ROUNDS (Supabase truth + UI cache)
----------------------------------------------- */
-
-export function getRounds(fallback = []) {
-  // UI cache read (sync)
-  return get(KEYS.rounds, fallback) || fallback;
+/** ✅ Reject null/undefined/"undefined"/"null"/"" */
+function cleanLeagueId(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  if (low === "undefined" || low === "null") return null;
+  return s;
 }
 
-export function setRounds(rounds) {
-  // UI cache write (sync)
-  set(KEYS.rounds, ensureArr(rounds));
-}
-
-/**
- * ✅ Supabase truth read for rounds (and hydrates UI cache).
- */
-export async function syncRoundsFromSupabase({ leagueId }) {
-  const cached = getRounds([]);
+function getLeagueIdFromLocation(location) {
+  // Priority: navigation state, then query string
+  const stateId = location?.state?.leagueId || location?.state?.id || null;
+  const cleanState = cleanLeagueId(stateId);
+  if (cleanState) return cleanState;
 
   try {
-    if (!leagueId) return cached;
-    const rows = await fetchRoundsByLeagueId(leagueId);
-    setRounds(rows);
-    return rows;
-  } catch {
-    // fail-soft
-    return cached;
-  }
-}
-
-/**
- * ✅ Supabase truth create for rounds (and updates UI cache).
- * NOTE: we keep this async to avoid breaking older sync callers.
- */
-export async function addRoundSupabase({ leagueId, round }) {
-  if (!leagueId) throw new Error("Missing leagueId");
-
-  const uid = await getAuthedUserId();
-
-  const payload = {
-    ...ensureObj(round),
-    league_id: leagueId,
-    user_id: uid || ensureObj(round)?.user_id || null,
-  };
-
-  const { data, error } = await supabase.from("rounds").insert(payload).select("*").single();
-
-  if (error) throw error;
-
-  // Update UI cache
-  const current = getRounds([]);
-  setRounds([data, ...current]);
-
-  return data;
-}
-
-export async function updateRoundSupabase({ roundId, patch }) {
-  if (!roundId) throw new Error("Missing roundId");
-
-  const { data, error } = await supabase.from("rounds").update(ensureObj(patch)).eq("id", roundId).select("*").single();
-
-  if (error) throw error;
-
-  // Update UI cache
-  const current = getRounds([]);
-  const next = current.map((r) => (r?.id === roundId ? data : r));
-  setRounds(next);
-
-  return data;
-}
-
-export async function deleteRoundSupabase({ roundId }) {
-  if (!roundId) throw new Error("Missing roundId");
-
-  const { error } = await supabase.from("rounds").delete().eq("id", roundId);
-  if (error) throw error;
-
-  // Update UI cache
-  const current = getRounds([]);
-  setRounds(current.filter((r) => r?.id !== roundId));
-
-  return true;
-}
-
-/**
- * Backwards compat helpers (LOCAL ONLY) — keep during migration,
- * but your League pages should use the Supabase async versions.
- */
-export function addRound(round) {
-  const rounds = getRounds([]);
-  const next = [round, ...rounds];
-  setRounds(next);
-  return round;
-}
-
-export function getRoundsByPlayer(playerId) {
-  const rounds = getRounds([]);
-  return rounds.filter((r) => r?.playerId === playerId);
-}
-
-/* ---------------------------------------------
-   ✅ MAIN SYNC: Supabase -> UI cache hydration
-
-   This is the function your League/LeagueSettings pages should call.
-   It resolves a leagueId, fetches league + members + profiles,
-   caches league/users, and optionally hydrates rounds.
-
-   IMPORTANT:
-   - Permission checks must not use cached roles.
----------------------------------------------- */
-
-export async function resolveLeagueIdSupabaseFirst({ preferredLeagueId = null } = {}) {
-  // 1) preferred input
-  if (preferredLeagueId) return String(preferredLeagueId);
-
-  // 2) supabase profile active_league_id (if exists) else local
-  const fromPref = await getActiveLeagueIdSupabaseFirst();
-  if (fromPref) return String(fromPref);
-
-  // 3) membership fallback (most recent membership)
-  try {
-    const memberships = await fetchMyLeagueMemberships();
-    if (memberships.length) {
-      // prefer latest created_at (already selected), but be safe
-      const pick = memberships[0]?.league_id || null;
-      if (pick) {
-        await setActiveLeagueId(pick);
-        return String(pick);
-      }
-    }
+    const sp = new URLSearchParams(location?.search || "");
+    const q = sp.get("leagueId") || sp.get("league_id");
+    const cleanQ = cleanLeagueId(q);
+    if (cleanQ) return cleanQ;
   } catch {
     // ignore
   }
@@ -709,297 +127,896 @@ export async function resolveLeagueIdSupabaseFirst({ preferredLeagueId = null } 
   return null;
 }
 
-/**
- * ✅ Hydrate all required UI cached data for an active league.
- * - Supabase is truth
- * - caches are safe UI only
- *
- * Returns:
- *  { league, users, rounds }
- */
-export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds = true } = {}) {
-  const cachedLeague = getLeagueSafe({});
-  const cachedUsers = ensureArr(getUsers([]));
-  const cachedRounds = ensureArr(getRounds([]));
+/** ✅ Normalize any incoming role string from Supabase/constants to canonical values. */
+function normalizeRoleLoose(v) {
+  const r = String(v ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
 
-  try {
-    // 1) Resolve league id (supabase preference -> local -> membership fallback)
-    const activeId = await resolveLeagueIdSupabaseFirst({ preferredLeagueId: leagueId });
+  if (r === "host") return LEAGUE_ROLES.host;
+  if (r === "co_host" || r === "cohost") return LEAGUE_ROLES.co_host;
+  if (r === "member") return LEAGUE_ROLES.member;
 
-    // No membership / no league chosen
-    if (!activeId) {
-      return {
-        league: cachedLeague?.id ? cachedLeague : null,
-        users: cachedUsers,
-        rounds: cachedRounds,
-      };
-    }
+  // Default safe
+  return LEAGUE_ROLES.member;
+}
 
-    // ensure preference stored (fail-soft)
-    await setActiveLeagueId(activeId);
+export default function LeagueSettings() {
+  const navigate = useNavigate();
+  const location = useLocation();
 
-    // 2) Fetch league + members + profiles
-    const leagueRow = await fetchLeagueById(activeId);
-    const members = await fetchLeagueMembers(activeId);
+  const [league, setLeagueState] = useState(() => getLeagueSafe({}));
+  const [users, setUsersState] = useState(() => ensureArr(getUsers([])));
 
-    const memberIds = ensureArr(members).map((m) => m.user_id).filter(Boolean);
-    const profiles = await fetchProfilesByIds(memberIds);
+  // Supabase auth user
+  const [authUserId, setAuthUserId] = useState(null);
 
-    // 3) Build users list for UI
-    const users = profiles.map((p) => ({
-      id: p.id,
-      name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
-      email: p.email || null,
-    }));
+  // Supabase profile + role (SOURCE OF TRUTH)
+  const [myProfile, setMyProfile] = useState(null);
+  const [myRoleLive, setMyRoleLive] = useState(null);
+  const [roleLoading, setRoleLoading] = useState(false);
 
-    // 4) Roles map (UI cache only — DO NOT use for permissions)
-    const memberRoles = {};
-    members.forEach((m) => {
-      if (!m?.user_id) return;
-      memberRoles[m.user_id] = normalizeRole(m.role);
-    });
+  // Stable league context for this page
+  const stableLeagueIdRef = useRef(null);
+  const initDoneRef = useRef(false);
 
-    // 5) Build league object in normalized format (UI cache)
-    const nextLeague = normalizeLeague({
-      id: leagueRow?.id,
-      name: leagueRow?.name || "League",
-      host_user_id: leagueRow?.host_user_id || null,
-      members: memberIds,
-      memberRoles,
-      pointsSystem: leagueRow?.points_system || null,
+  // Prevent stale async responses overwriting
+  const roleReqIdRef = useRef(0);
+  const leagueReqIdRef = useRef(0);
 
-      // Season fields are UI-only unless you add DB columns later.
-      seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
-      seasonEndISO: cachedLeague?.seasonEndISO || null,
-    });
+  // Invite status UI
+  const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
 
-    setLeagueSafe(nextLeague);
-    setUsers(users);
+  // Friends for invite list (Supabase source)
+  const [friends, setFriends] = useState([]);
+  const [friendsLoading, setFriendsLoading] = useState(false);
 
-    // 6) Optionally hydrate rounds (supabase truth -> cache)
-    let rounds = cachedRounds;
-    if (withRounds) {
-      rounds = await syncRoundsFromSupabase({ leagueId: activeId });
-    }
+  // Pending invites UI
+  const [pendingInvites, setPendingInvites] = useState([]);
+  const [invitesLoading, setInvitesLoading] = useState(false);
+  const [inviteActionId, setInviteActionId] = useState(null);
 
-    return { league: nextLeague, users, rounds };
-  } catch {
-    // FAIL-SOFT: keep cached fallback
+  // points draft
+  const [pointsDraft, setPointsDraft] = useState(() => {
+    const ps = getPointsSystem(null);
     return {
-      league: cachedLeague?.id ? cachedLeague : null,
-      users: cachedUsers,
-      rounds: cachedRounds,
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
+
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
     };
-  }
-}
-
-/**
- * ✅ Alias requested in your spec:
- * syncActiveLeagueFromSupabase({ leagueId }) should hydrate all required cached UI data.
- * (Already does, but we export a named alias to match the brief exactly.)
- */
-export const syncActiveLeagueFromSupabaseHydrate = syncActiveLeagueFromSupabase;
-
-/* ---------------------------------------------
-   POINTS CALC HELPERS (pure)
----------------------------------------------- */
-
-export function calculateLeaguePoints({ place = null, bonusFlags = {}, played = true, pointsSystem = null } = {}) {
-  const ps = normalizePointsSystem(pointsSystem || getPointsSystem(DEFAULT_POINTS_SYSTEM));
-
-  const p = toInt(place, NaN);
-  const placementPoints = Number.isFinite(p) && p > 0 ? toInt(ps.placementPoints[p], 0) : 0;
-
-  const participationPoints = played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
-
-  let bonusPoints = 0;
-  const flags = ensureObj(bonusFlags);
-
-  if (ps.bonuses?.enabled) {
-    if (ps.bonuses.birdie?.enabled && Boolean(flags.birdie)) {
-      bonusPoints += toInt(ps.bonuses.birdie.points, 0);
-    }
-    if (ps.bonuses.eagle?.enabled && Boolean(flags.eagle)) {
-      bonusPoints += toInt(ps.bonuses.eagle.points, 0);
-    }
-    if (ps.bonuses.hio?.enabled && Boolean(flags.hio)) {
-      bonusPoints += toInt(ps.bonuses.hio.points, 0);
-    }
-  }
-
-  const totalPoints = placementPoints + participationPoints + bonusPoints;
-
-  return { placementPoints, participationPoints, bonusPoints, totalPoints };
-}
-
-export function sortRoundsForRanking(rounds, pointsSystem = null) {
-  const ps = normalizePointsSystem(pointsSystem || getPointsSystem(DEFAULT_POINTS_SYSTEM));
-  const list = ensureArr(rounds).slice();
-
-  if (ps.mode === "stableford") {
-    return list.sort((a, b) => {
-      const av = isNum(a?.stablefordPoints) ? a.stablefordPoints : -999999;
-      const bv = isNum(b?.stablefordPoints) ? b.stablefordPoints : -999999;
-      return bv - av;
-    });
-  }
-
-  if (ps.mode === "handicap") {
-    return list.sort((a, b) => {
-      const av = isNum(a?.vsHandicap) ? a.vsHandicap : -999999;
-      const bv = isNum(b?.vsHandicap) ? b.vsHandicap : -999999;
-      return bv - av;
-    });
-  }
-
-  return list.sort((a, b) => {
-    const av = isNum(a?.score) ? a.score : 999999;
-    const bv = isNum(b?.score) ? b.score : 999999;
-    return av - bv;
   });
-}
 
-/* ---------------------------------------------
-   BADGES
----------------------------------------------- */
+  // season dates draft
+  const [seasonStart, setSeasonStart] = useState(() =>
+    toISODateInput(league?.seasonStartISO)
+  );
+  const [seasonEnd, setSeasonEnd] = useState(() =>
+    toISODateInput(league?.seasonEndISO)
+  );
 
-export function getBadges(fallback = {}) {
-  return ensureObj(get(KEYS.badges, fallback));
-}
+  const members = useMemo(() => ensureArr(league?.members), [league?.members]);
 
-export function setBadges(map) {
-  set(KEYS.badges, ensureObj(map));
-}
+  const memberUsers = useMemo(() => {
+    const setIds = new Set(members);
+    return users.filter((u) => setIds.has(getUserId(u)));
+  }, [users, members]);
 
-/* ---------------------------------------------
-   TROPHIES (compat safe)
----------------------------------------------- */
+  // display fallback "me"
+  const me = useMemo(() => {
+    if (authUserId) return users.find((u) => getUserId(u) === authUserId) || null;
+    return users?.[0] || null;
+  }, [authUserId, users]);
 
-export function getTrophies(fallback = []) {
-  const raw = get(KEYS.trophies, fallback);
-  return raw ?? fallback;
-}
+  const myId = authUserId || getUserId(me);
+  const myDisplayName = myProfile?.display_name || getUserName(me);
 
-export function setTrophies(value) {
-  if (Array.isArray(value)) {
-    set(KEYS.trophies, value);
-    return;
+  /** ✅ PERMISSIONS MUST BE SUPABASE ROLE ONLY */
+  const effectiveRole = myRoleLive || LEAGUE_ROLES.member;
+  const canEdit = effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.co_host;
+
+  // ✅ IMPORTANT: compute this BEFORE any early return
+  const stableLeagueId =
+    cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
+
+  // ✅ These hooks MUST be before any early return (fixes React #310)
+  const memberSet = useMemo(() => new Set(ensureArr(members)), [members]);
+
+  const pendingInviteeSet = useMemo(
+    () => new Set(ensureArr(pendingInvites).map((x) => x?.invitee_user_id).filter(Boolean)),
+    [pendingInvites]
+  );
+
+  const friendsNotInLeague = useMemo(() => {
+    return ensureArr(friends).filter((p) => {
+      const id = p?.id;
+      if (!id) return false;
+      if (memberSet.has(id)) return false;
+      return true;
+    });
+  }, [friends, memberSet]);
+
+  // Auth bootstrap (Netlify-safe)
+  useEffect(() => {
+    let alive = true;
+
+    async function boot() {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!alive) return;
+        setAuthUserId(data?.session?.user?.id || null);
+      } catch {
+        if (!alive) return;
+        setAuthUserId(null);
+      }
+    }
+
+    boot();
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!alive) return;
+      setAuthUserId(session?.user?.id || null);
+    });
+
+    return () => {
+      alive = false;
+      try {
+        sub?.subscription?.unsubscribe?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  // Freeze leagueId ASAP (SANITISED)
+  useEffect(() => {
+    const navLeagueId = getLeagueIdFromLocation(location);
+    if (navLeagueId) stableLeagueIdRef.current = navLeagueId;
+  }, [location]);
+
+  // One-time init: cache UI state
+  useEffect(() => {
+    if (initDoneRef.current) return;
+    initDoneRef.current = true;
+
+    const cachedLeague = getLeagueSafe({});
+    const cachedUsers = ensureArr(getUsers([]));
+
+    const navLeagueId = getLeagueIdFromLocation(location);
+    const cachedLeagueId = cleanLeagueId(cachedLeague?.id);
+
+    stableLeagueIdRef.current = navLeagueId || cachedLeagueId || null;
+
+    setLeagueState(cachedLeague);
+    setUsersState(cachedUsers);
+
+    setSeasonStart(toISODateInput(cachedLeague?.seasonStartISO));
+    setSeasonEnd(toISODateInput(cachedLeague?.seasonEndISO));
+
+    const ps = getPointsSystem(null);
+    setPointsDraft({
+      placementPoints: normalizePlacement(ps?.placementPoints || { 1: 3, 2: 2, 3: 0 }),
+
+      participationEnabled: Boolean(ps?.participation?.enabled),
+      participationPoints: safeNum(ps?.participation?.points, 1),
+
+      bonusesEnabled: Boolean(ps?.bonuses?.enabled),
+      birdieEnabled: Boolean(ps?.bonuses?.birdie?.enabled),
+      birdiePoints: safeNum(ps?.bonuses?.birdie?.points, 1),
+      eagleEnabled: Boolean(ps?.bonuses?.eagle?.enabled),
+      eaglePoints: safeNum(ps?.bonuses?.eagle?.points, 2),
+      hioEnabled: Boolean(ps?.bonuses?.hio?.enabled),
+      hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
+    });
+
+    setInviteStatus({ type: "", message: "" });
+    setPendingInvites([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function refreshLeagueFromSupabase(leagueId) {
+    const lid = cleanLeagueId(leagueId);
+    if (!lid) return;
+
+    const reqId = ++leagueReqIdRef.current;
+
+    try {
+      const { data, error } = await supabase.from("leagues").select("*").eq("id", lid).single();
+
+      if (reqId !== leagueReqIdRef.current) return;
+      if (error) throw error;
+
+      const merged = { ...getLeagueSafe({}), ...data };
+      setLeagueSafe(merged);
+      setLeagueState(merged);
+
+      if (data?.season_start || data?.seasonStartISO) {
+        const iso = data?.seasonStartISO || data?.season_start;
+        setSeasonStart(toISODateInput(iso));
+      }
+      if (data?.season_end || data?.seasonEndISO) {
+        const iso = data?.seasonEndISO || data?.season_end;
+        setSeasonEnd(toISODateInput(iso));
+      }
+    } catch {
+      // keep cached league for UI
+    }
   }
-  set(KEYS.trophies, ensureObj(value));
-}
 
-export function getTrophiesMap() {
-  const raw = get(KEYS.trophies, {});
-  if (Array.isArray(raw)) {
-    return raw.reduce((acc, t) => {
-      const uid = t?.userId;
-      if (!uid) return acc;
-      if (!acc[uid]) acc[uid] = [];
-      acc[uid].push(t);
-      return acc;
-    }, {});
+  async function ensureStableLeagueIdIsValid() {
+    if (!authUserId) return;
+
+    const current = cleanLeagueId(stableLeagueIdRef.current);
+
+    if (current) {
+      try {
+        const { data, error } = await supabase
+          .from("league_members")
+          .select("league_id, role")
+          .eq("league_id", current)
+          .eq("user_id", authUserId)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (data?.league_id) return;
+      } catch {
+        // attempt recovery
+      }
+    }
+
+    try {
+      const { data: rows, error } = await supabase
+        .from("league_members")
+        .select("league_id, role, created_at")
+        .eq("user_id", authUserId)
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      const list = ensureArr(rows);
+      if (list.length === 0) return;
+
+      // Prefer latest membership; if you want to prefer host/cohost, do it via normalized role:
+      const hostish = list.find((r) => {
+        const canon = normalizeRoleLoose(r?.role);
+        return canon === LEAGUE_ROLES.host || canon === LEAGUE_ROLES.co_host;
+      });
+
+      const pick = cleanLeagueId(hostish?.league_id || list[0]?.league_id || null);
+      if (!pick) return;
+
+      stableLeagueIdRef.current = pick;
+      await refreshLeagueFromSupabase(pick);
+    } catch {
+      // ignore
+    }
   }
-  return ensureObj(raw);
+
+  async function refreshMyProfileAndRole() {
+    const leagueId = cleanLeagueId(stableLeagueIdRef.current);
+    if (!authUserId || !leagueId) return;
+
+    const reqId = ++roleReqIdRef.current;
+    setRoleLoading(true);
+
+    try {
+      const { data: prof, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, display_name")
+        .eq("id", authUserId)
+        .single();
+
+      if (reqId !== roleReqIdRef.current) return;
+      if (!profErr) setMyProfile(prof || null);
+
+      const { data: mem, error: memErr } = await supabase
+        .from("league_members")
+        .select("role")
+        .eq("league_id", leagueId)
+        .eq("user_id", authUserId)
+        .maybeSingle();
+
+      if (reqId !== roleReqIdRef.current) return;
+      if (memErr) throw memErr;
+
+      const role = normalizeRoleLoose(mem?.role);
+      setMyRoleLive(role);
+    } catch {
+      if (reqId !== roleReqIdRef.current) return;
+      setMyRoleLive(LEAGUE_ROLES.member); // fail-soft: view-only
+    } finally {
+      if (reqId !== roleReqIdRef.current) return;
+      setRoleLoading(false);
+    }
+  }
+
+  // ✅ Important: rerun when navigation changes too (prevents stuck “View only”)
+  useEffect(() => {
+    if (!authUserId) {
+      setMyRoleLive(null);
+      setMyProfile(null);
+      return;
+    }
+
+    (async () => {
+      await ensureStableLeagueIdIsValid();
+
+      const leagueId = cleanLeagueId(stableLeagueIdRef.current);
+      if (leagueId) await refreshLeagueFromSupabase(leagueId);
+
+      await refreshMyProfileAndRole();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUserId, location.key]);
+
+  async function loadPendingInvites({ leagueId }) {
+    const lid = cleanLeagueId(leagueId);
+    if (!lid) return;
+
+    setInvitesLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("league_invites")
+        .select(
+          `
+          id,
+          league_id,
+          inviter_user_id,
+          invitee_user_id,
+          status,
+          created_at,
+          invitee:profiles!league_invites_invitee_user_id_fkey (
+            id,
+            display_name
+          )
+        `
+        )
+        .eq("league_id", lid)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setPendingInvites(ensureArr(data));
+    } catch {
+      setPendingInvites([]);
+    } finally {
+      setInvitesLoading(false);
+    }
+  }
+
+  async function loadFriendsForInvites({ userId }) {
+    if (!userId) {
+      setFriends([]);
+      return;
+    }
+
+    setFriendsLoading(true);
+    try {
+      const { data: rows, error } = await supabase
+        .from("friendships")
+        .select("id,user_low,user_high,status")
+        .eq("status", "accepted")
+        .or(`user_low.eq.${userId},user_high.eq.${userId}`);
+
+      if (error) throw error;
+
+      const rels = ensureArr(rows);
+      const friendIds = rels
+        .map((r) => {
+          const low = r?.user_low || null;
+          const high = r?.user_high || null;
+          if (!low || !high) return null;
+          return low === userId ? high : low;
+        })
+        .filter(Boolean);
+
+      const uniq = Array.from(new Set(friendIds));
+
+      if (uniq.length === 0) {
+        setFriends([]);
+        return;
+      }
+
+      const { data: profs, error: profErr } = await supabase
+        .from("profiles")
+        .select("id,display_name")
+        .in("id", uniq);
+
+      if (profErr) throw profErr;
+
+      const next = ensureArr(profs).sort((a, b) => {
+        const an = String(a?.display_name || "").toLowerCase();
+        const bn = String(b?.display_name || "").toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      setFriends(next);
+    } catch (e) {
+      setFriends([]);
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setFriendsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!myId) return;
+    loadFriendsForInvites({ userId: myId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myId]);
+
+  useEffect(() => {
+    const lid = cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
+    if (!lid) return;
+
+    if (!canEdit) {
+      setPendingInvites([]);
+      return;
+    }
+
+    loadPendingInvites({ leagueId: lid });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit]);
+
+  // ✅ NOW it’s safe to early return (NO hooks below this line)
+  if (!stableLeagueId) {
+    return (
+      <div className="pt-2">
+        <EmptyState
+          icon="⚙️"
+          title="No league selected"
+          description="Open League Settings from a specific league."
+          actions={
+            <button
+              onClick={() => navigate("/leagues")}
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
+            >
+              Back to Leagues
+            </button>
+          }
+        />
+      </div>
+    );
+  }
+
+  function setPreset(preset) {
+    if (!canEdit) return;
+
+    if (preset === "default") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3, 2: 2, 3: 0 }),
+      }));
+      return;
+    }
+    if (preset === "yourLeague") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3, 2: 1, 3: 0 }),
+      }));
+      return;
+    }
+    if (preset === "winnerOnly") {
+      setPointsDraft((d) => ({
+        ...d,
+        placementPoints: normalizePlacement({ 1: 3 }),
+      }));
+    }
+  }
+
+  function updatePlacement(place, value) {
+    if (!canEdit) return;
+    const p = Math.trunc(safeNum(place, NaN));
+    if (!Number.isFinite(p) || p <= 0) return;
+    const v = Math.trunc(safeNum(value, 0));
+    setPointsDraft((d) => ({
+      ...d,
+      placementPoints: { ...(d.placementPoints || {}), [p]: v },
+    }));
+  }
+
+  function removePlacement(place) {
+    if (!canEdit) return;
+    const p = Math.trunc(safeNum(place, NaN));
+    if (!Number.isFinite(p) || p <= 0) return;
+    setPointsDraft((d) => {
+      const next = { ...(d.placementPoints || {}) };
+      delete next[p];
+      return { ...d, placementPoints: next };
+    });
+  }
+
+  function addPlacementRow() {
+    if (!canEdit) return;
+    setPointsDraft((d) => {
+      const cur = normalizePlacement(d.placementPoints);
+      const existingPlaces = Object.keys(cur).map((k) => Number(k));
+      const nextPlace = existingPlaces.length ? Math.max(...existingPlaces) + 1 : 4;
+      return { ...d, placementPoints: { ...cur, [nextPlace]: 0 } };
+    });
+  }
+
+  function savePointsSystem() {
+    if (!canEdit) return;
+
+    const placementPoints = normalizePlacement(pointsDraft.placementPoints);
+    const safePlacement = Object.keys(placementPoints).length
+      ? placementPoints
+      : { 1: 3, 2: 2, 3: 0 };
+
+    const merged = {
+      placementPoints: safePlacement,
+      participation: {
+        enabled: Boolean(pointsDraft.participationEnabled),
+        points: Math.trunc(safeNum(pointsDraft.participationPoints, 1)),
+      },
+      bonuses: {
+        enabled: Boolean(pointsDraft.bonusesEnabled),
+        birdie: {
+          enabled: Boolean(pointsDraft.birdieEnabled),
+          points: Math.trunc(safeNum(pointsDraft.birdiePoints, 1)),
+        },
+        eagle: {
+          enabled: Boolean(pointsDraft.eagleEnabled),
+          points: Math.trunc(safeNum(pointsDraft.eaglePoints, 2)),
+        },
+        hio: {
+          enabled: Boolean(pointsDraft.hioEnabled),
+          points: Math.trunc(safeNum(pointsDraft.hioPoints, 5)),
+        },
+      },
+    };
+
+    const next = setPointsSystem(merged);
+    const nextLeague = { ...getLeagueSafe({}), pointsSystem: next };
+    setLeagueSafe(nextLeague);
+    setLeagueState(nextLeague);
+  }
+
+  function saveSeasonDates() {
+    if (!canEdit) return;
+
+    const startISO = fromISODateInput(seasonStart) || league?.seasonStartISO;
+    const endISO = seasonEnd ? fromISODateInput(seasonEnd) : null;
+
+    const next = setLeagueSeasonDates({ startISO, endISO });
+    setLeagueState(next);
+  }
+
+  async function sendInviteToFriend(friendProfile) {
+    if (!canEdit) return;
+
+    const leagueId =
+      cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
+    if (!leagueId) return;
+
+    if (!myId) {
+      setInviteStatus({ type: "error", message: "You must be signed in to invite." });
+      return;
+    }
+
+    const inviteeUserId = friendProfile?.id || null;
+    if (!inviteeUserId) return;
+
+    const memberSetLocal = new Set(ensureArr(members));
+    if (memberSetLocal.has(inviteeUserId)) {
+      setInviteStatus({ type: "info", message: "They’re already in this league." });
+      return;
+    }
+
+    setInviteActionId(inviteeUserId);
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      const { error: invErr } = await supabase.from("league_invites").insert({
+        league_id: leagueId,
+        inviter_user_id: myId,
+        invitee_user_id: inviteeUserId,
+        status: "pending",
+      });
+
+      if (invErr) {
+        if (isUniqueViolation(invErr)) {
+          setInviteStatus({ type: "info", message: "Invite already pending for that golfer." });
+          return;
+        }
+        throw invErr;
+      }
+
+      await loadPendingInvites({ leagueId });
+
+      setInviteStatus({
+        type: "success",
+        message: "Invite sent ✅ They’ll see it in their invites and can accept to join.",
+      });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    } finally {
+      setInviteActionId(null);
+    }
+  }
+
+  async function cancelInvite(inviteId) {
+    if (!canEdit) return;
+    if (!inviteId) return;
+
+    const leagueId =
+      cleanLeagueId(stableLeagueIdRef.current) || cleanLeagueId(league?.id) || null;
+    if (!leagueId) return;
+
+    try {
+      const { error } = await supabase.from("league_invites").delete().eq("id", inviteId);
+      if (error) throw error;
+
+      await loadPendingInvites({ leagueId });
+      setInviteStatus({ type: "info", message: "Invite cancelled." });
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
+  }
+
+  const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="League Settings"
+        subtitle={
+          canEdit
+            ? "Manage points, season, and admins."
+            : "You can view settings. Only host/co-host can edit."
+        }
+        right={
+          <button
+            type="button"
+            onClick={() => navigate("/leagues")}
+            className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
+          >
+            Back
+          </button>
+        }
+      />
+
+      {/* Admin status */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Your access</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
+              <span className="font-extrabold">{roleLabel(effectiveRole)}</span>
+              {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
+            </div>
+
+            <button
+              type="button"
+              onClick={refreshMyProfileAndRole}
+              disabled={!authUserId || roleLoading}
+              className={[
+                "mt-3 rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !authUserId || roleLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {roleLoading ? "Refreshing…" : "Refresh permissions"}
+            </button>
+          </div>
+
+          <span
+            className={[
+              "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
+              canEdit
+                ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
+                : "bg-slate-50 text-slate-700 ring-slate-200",
+            ].join(" ")}
+          >
+            {canEdit ? "Editing enabled" : "View only"}
+          </span>
+        </div>
+
+        {myRoleLive == null ? (
+          <div className="mt-3 text-[11px] font-semibold text-slate-500">
+            Checking Supabase role… if this stays stuck, your RLS policy may be blocking the read.
+          </div>
+        ) : null}
+      </Card>
+
+      {/* Invite friends */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Invite friends</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Host/co-host can invite accepted friends. They join only after they accept.
+            </div>
+          </div>
+
+          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+            League ID: <span className="font-mono">{String(stableLeagueId).slice(0, 8)}…</span>
+          </span>
+        </div>
+
+        <div className="mt-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Friends not in this league
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || friendsLoading}
+              onClick={() => loadFriendsForInvites({ userId: myId })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || friendsLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {friendsLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can invite friends to the league.
+              </div>
+            ) : friendsLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading friends…</div>
+            ) : friendsNotInLeague.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">
+                No inviteable friends found (either none accepted yet, or they’re already in the league).
+              </div>
+            ) : (
+              friendsNotInLeague.map((p) => {
+                const pid = p?.id;
+                const name = p?.display_name || "Friend";
+                const alreadyInvited = pendingInviteeSet.has(pid);
+                const busy = inviteActionId === pid;
+
+                return (
+                  <div
+                    key={pid}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
+                    </div>
+
+                    {alreadyInvited ? (
+                      <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+                        Invited
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => sendInviteToFriend(p)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold",
+                          busy
+                            ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                            : "bg-slate-900 text-white hover:bg-slate-800",
+                        ].join(" ")}
+                      >
+                        {busy ? "Inviting…" : "Invite"}
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* Pending invites */}
+        <div className="mt-6">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Pending invites
+            </div>
+
+            <button
+              type="button"
+              disabled={!canEdit || invitesLoading}
+              onClick={() => loadPendingInvites({ leagueId: stableLeagueId })}
+              className={[
+                "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                !canEdit || invitesLoading
+                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
+                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+              ].join(" ")}
+            >
+              {invitesLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          <div className="mt-2 space-y-2">
+            {!canEdit ? (
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can view and manage league invites.
+              </div>
+            ) : invitesLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
+            ) : pendingInvites.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">No pending invites.</div>
+            ) : (
+              pendingInvites.map((inv) => {
+                const invitee = inv?.invitee || null;
+                const display =
+                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                const created = inv?.created_at ? new Date(inv.created_at) : null;
+
+                return (
+                  <div
+                    key={inv.id}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
+                      <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                        Status: <span className="font-extrabold">Pending</span>
+                        {created ? (
+                          <>
+                            {" "}
+                            · Sent {created.toLocaleDateString()}{" "}
+                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => cancelInvite(inv.id)}
+                      className="rounded-xl bg-rose-600 px-3 py-2 text-xs font-extrabold text-white hover:bg-rose-500"
+                      title="Cancel invite"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {inviteStatus?.message ? (
+          <div
+            className={[
+              "mt-4 rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+              inviteStatus.type === "success"
+                ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
+                : inviteStatus.type === "info"
+                ? "bg-slate-50 text-slate-800 ring-slate-200"
+                : "bg-rose-50 text-rose-900 ring-rose-200",
+            ].join(" ")}
+          >
+            {inviteStatus.message}
+          </div>
+        ) : null}
+      </Card>
+
+      {/* Points System */}
+      <Card className="p-5">
+        {/* (rest of your JSX unchanged from here down) */}
+        {/* KEEP your remaining JSX exactly as you pasted it */}
+        {/* ... */}
+      </Card>
+    </div>
+  );
 }
-
-export function setTrophiesMap(map) {
-  set(KEYS.trophies, ensureObj(map));
-}
-
-export function awardBadge(playerId, badge) {
-  const all = getBadges({});
-  const existing = ensureArr(all[playerId]);
-  const already = existing.some((b) => b?.key === badge?.key);
-  if (already) return false;
-
-  const nextBadge = {
-    ...badge,
-    earnedAt: badge?.earnedAt || new Date().toISOString(),
-  };
-
-  setBadges({ ...all, [playerId]: [nextBadge, ...existing] });
-  return true;
-}
-
-export function awardTrophy(playerId, trophy) {
-  const all = getTrophiesMap();
-  const existing = ensureArr(all[playerId]);
-  const already = existing.some((t) => t?.key === trophy?.key);
-  if (already) return false;
-
-  const nextTrophy = {
-    ...trophy,
-    earnedAt: trophy?.earnedAt || new Date().toISOString(),
-  };
-
-  setTrophiesMap({ ...all, [playerId]: [nextTrophy, ...existing] });
-  return true;
-}
-
-/* ---------------------------------------------
-   SEASON ARCHIVES
----------------------------------------------- */
-
-export function getSeasonArchives(fallback = []) {
-  return get(KEYS.seasonArchives, fallback) || fallback;
-}
-
-export function addSeasonArchive(archiveItem) {
-  const archives = getSeasonArchives([]);
-  const next = [archiveItem, ...archives];
-  set(KEYS.seasonArchives, next);
-  return archiveItem;
-}
-
-/* ---------------------------------------------
-   Legacy cached role helpers (UI only - DO NOT USE FOR PERMISSIONS)
----------------------------------------------- */
-
-export function getLeagueRole(userId) {
-  const league = getLeagueSafe({});
-  const roles = ensureObj(league.memberRoles);
-  if (!userId) return LEAGUE_ROLES.member;
-  return normalizeRole(roles[userId] || LEAGUE_ROLES.member);
-}
-
-export function isLeagueAdmin(userId) {
-  const role = getLeagueRole(userId);
-  return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host;
-}
-
-export function setLeagueRole(userId, role) {
-  if (!userId) return null;
-
-  const league = getLeagueSafe({});
-  const roles = ensureObj(league.memberRoles);
-
-  const nextRoles = {
-    ...roles,
-    [userId]: normalizeRole(role),
-  };
-
-  const nextLeague = {
-    ...league,
-    memberRoles: nextRoles,
-  };
-
-  setLeagueSafe(nextLeague);
-  return nextLeague;
-}
-
-export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
-  const league = getLeagueSafe({});
-  const next = {
-    ...league,
-    seasonStartISO: toISODateOrNull(startISO) || league.seasonStartISO,
-    seasonEndISO: toISODateOrNull(endISO),
-  };
-  setLeagueSafe(next);
-  return next;
-}
-
-
-
 
 
 
