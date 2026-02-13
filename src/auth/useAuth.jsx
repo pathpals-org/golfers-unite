@@ -18,10 +18,13 @@ function withTimeout(promise, ms, label = "Request") {
 async function fetchMyProfile(userId) {
   if (!userId) return null;
 
+  // ✅ IMPORTANT:
+  // Your profiles table does NOT have `updated_at` (Supabase error 42703).
+  // If you later add the column, you can put it back — for now, remove it.
   const { data, error } = await withTimeout(
     supabase
       .from("profiles")
-      .select("id, username, display_name, avatar_url, handicap_index, created_at, updated_at")
+      .select("id, username, display_name, avatar_url, handicap_index, created_at")
       .eq("id", userId)
       .maybeSingle(),
     15000,
@@ -101,11 +104,7 @@ export function AuthProvider({ children }) {
       setLoading(true);
 
       try {
-        const { data, error } = await withTimeout(
-          supabase.auth.getSession(),
-          15000,
-          "Auth session"
-        );
+        const { data, error } = await withTimeout(supabase.auth.getSession(), 15000, "Auth session");
 
         if (!mountedRef.current) return;
 
