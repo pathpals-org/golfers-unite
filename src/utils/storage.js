@@ -70,7 +70,6 @@ function scopedKey(baseKey) {
   // Only scope OUR app keys.
   const uid = getStorageUserId();
   if (!uid) return baseKey;
-  // ✅ FIX: template literal must use backticks
   return `${uid}::${baseKey}`;
 }
 
@@ -219,6 +218,8 @@ export async function setActiveLeagueId(leagueId) {
 /**
  * Reads active league preference from Supabase first (profiles.active_league_id),
  * falling back to local.
+ *
+ * ✅ CHANGE: use maybeSingle() so “no row” doesn’t hard-error and force view-only weirdness.
  */
 export async function getActiveLeagueIdSupabaseFirst() {
   const local = getActiveLeagueId();
@@ -230,7 +231,7 @@ export async function getActiveLeagueIdSupabaseFirst() {
       .from("profiles")
       .select("active_league_id")
       .eq("id", uid)
-      .single();
+      .maybeSingle();
 
     if (error) return local;
 
@@ -248,10 +249,13 @@ export async function getActiveLeagueIdSupabaseFirst() {
 async function fetchMyLeagueMemberships() {
   const uid = await getAuthedUserId();
   if (!uid) return [];
+
+  // ✅ CHANGE: order newest-first so fallback pick is stable
   const { data, error } = await supabase
     .from("league_members")
     .select("league_id,role,created_at")
-    .eq("user_id", uid);
+    .eq("user_id", uid)
+    .order("created_at", { ascending: false });
 
   if (error) throw error;
   return ensureArr(data).filter((r) => r?.league_id);
@@ -323,17 +327,34 @@ export const LEAGUE_ROLES = {
   member: "member",
 };
 
+/**
+ * ✅ CHANGE (fixes “still view only” when DB uses a slightly different role string):
+ * Accept common variants like:
+ * - "cohost", "co-host", "co host", "co_host"
+ * - "HOST", "Host"
+ */
 function normalizeRole(role) {
-  return role === LEAGUE_ROLES.host ||
-    role === LEAGUE_ROLES.co_host ||
-    role === LEAGUE_ROLES.member
-    ? role
-    : LEAGUE_ROLES.member;
+  const raw = String(role || "").trim().toLowerCase();
+  if (!raw) return LEAGUE_ROLES.member;
+
+  if (raw === "host") return LEAGUE_ROLES.host;
+
+  // co-host variants
+  if (raw === "co_host" || raw === "cohost" || raw === "co-host" || raw === "co host") {
+    return LEAGUE_ROLES.co_host;
+  }
+
+  if (raw === "member") return LEAGUE_ROLES.member;
+
+  // default fail-soft
+  return LEAGUE_ROLES.member;
 }
 
 /**
  * ✅ Source-of-truth permission check.
  * NEVER use cached roles for permissions.
+ *
+ * ✅ CHANGE: maybeSingle() so “no row” doesn’t throw; we default to member.
  */
 export async function getMyLeagueRoleSupabase(leagueId) {
   if (!leagueId) return LEAGUE_ROLES.member;
@@ -410,10 +431,7 @@ function normalizeLeague(league) {
   const members = ensureArr(l.members);
   const memberRoles = normalizeMemberRoles({ ...l, members });
 
-  const seasonStartISO = isISODateString(l.seasonStartISO)
-    ? l.seasonStartISO
-    : new Date().toISOString();
-
+  const seasonStartISO = isISODateString(l.seasonStartISO) ? l.seasonStartISO : new Date().toISOString();
   const seasonEndISO = isISODateString(l.seasonEndISO) ? l.seasonEndISO : null;
 
   return { ...l, members, memberRoles, seasonStartISO, seasonEndISO };
@@ -469,9 +487,7 @@ function normalizePointsSystem(ps) {
       ? raw.mode
       : DEFAULT_POINTS_SYSTEM.mode;
 
-  const placementPoints = normalizePlacementPoints(
-    raw.placementPoints ?? raw.placement ?? raw.pointsTable
-  );
+  const placementPoints = normalizePlacementPoints(raw.placementPoints ?? raw.placement ?? raw.pointsTable);
 
   const participationRaw = ensureObj(raw.participation);
   const participation = {
@@ -559,11 +575,7 @@ export async function setPointsSystemSupabase({ leagueId, pointsSystem }) {
   if (!leagueId) throw new Error("Missing leagueId");
   const merged = normalizePointsSystem(pointsSystem || DEFAULT_POINTS_SYSTEM);
 
-  const { error } = await supabase
-    .from("leagues")
-    .update({ points_system: merged })
-    .eq("id", leagueId);
-
+  const { error } = await supabase.from("leagues").update({ points_system: merged }).eq("id", leagueId);
   if (error) throw error;
 
   // Update UI cache
@@ -618,13 +630,7 @@ export async function addRoundSupabase({ leagueId, round }) {
 export async function updateRoundSupabase({ roundId, patch }) {
   if (!roundId) throw new Error("Missing roundId");
 
-  const { data, error } = await supabase
-    .from("rounds")
-    .update(ensureObj(patch))
-    .eq("id", roundId)
-    .select("*")
-    .single();
-
+  const { data, error } = await supabase.from("rounds").update(ensureObj(patch)).eq("id", roundId).select("*").single();
   if (error) throw error;
 
   const current = getRounds([]);
@@ -756,38 +762,23 @@ export const syncActiveLeagueFromSupabaseHydrate = syncActiveLeagueFromSupabase;
 /* ---------------------------------------------
    POINTS CALC HELPERS (pure)
 ---------------------------------------------- */
-export function calculateLeaguePoints({
-  place = null,
-  bonusFlags = {},
-  played = true,
-  pointsSystem = null,
-} = {}) {
+export function calculateLeaguePoints({ place = null, bonusFlags = {}, played = true, pointsSystem = null } = {}) {
   const ps = normalizePointsSystem(pointsSystem || getPointsSystem(DEFAULT_POINTS_SYSTEM));
   const p = toInt(place, NaN);
 
-  const placementPoints =
-    Number.isFinite(p) && p > 0 ? toInt(ps.placementPoints[p], 0) : 0;
-
-  const participationPoints =
-    played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
+  const placementPoints = Number.isFinite(p) && p > 0 ? toInt(ps.placementPoints[p], 0) : 0;
+  const participationPoints = played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
 
   let bonusPoints = 0;
   const flags = ensureObj(bonusFlags);
 
   if (ps.bonuses?.enabled) {
-    if (ps.bonuses.birdie?.enabled && Boolean(flags.birdie)) {
-      bonusPoints += toInt(ps.bonuses.birdie.points, 0);
-    }
-    if (ps.bonuses.eagle?.enabled && Boolean(flags.eagle)) {
-      bonusPoints += toInt(ps.bonuses.eagle.points, 0);
-    }
-    if (ps.bonuses.hio?.enabled && Boolean(flags.hio)) {
-      bonusPoints += toInt(ps.bonuses.hio.points, 0);
-    }
+    if (ps.bonuses.birdie?.enabled && Boolean(flags.birdie)) bonusPoints += toInt(ps.bonuses.birdie.points, 0);
+    if (ps.bonuses.eagle?.enabled && Boolean(flags.eagle)) bonusPoints += toInt(ps.bonuses.eagle.points, 0);
+    if (ps.bonuses.hio?.enabled && Boolean(flags.hio)) bonusPoints += toInt(ps.bonuses.hio.points, 0);
   }
 
   const totalPoints = placementPoints + participationPoints + bonusPoints;
-
   return { placementPoints, participationPoints, bonusPoints, totalPoints };
 }
 
@@ -933,3 +924,4 @@ export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
   setLeagueSafe(next);
   return next;
 }
+
