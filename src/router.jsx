@@ -1,5 +1,11 @@
 // src/router.jsx
-import { createBrowserRouter, Navigate, useRouteError } from "react-router-dom";
+import React from "react";
+import {
+  createBrowserRouter,
+  Navigate,
+  useLocation,
+  useRouteError,
+} from "react-router-dom";
 
 import App from "./App";
 
@@ -17,21 +23,18 @@ import LeagueSettings from "./pages/LeagueSettings";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 
+import { useAuth } from "./auth/useAuth";
+
 function RouteError() {
   const err = useRouteError();
-  const msg =
-    err?.message ||
-    (typeof err === "string" ? err : "") ||
-    "This page crashed.";
+  const msg = err?.message || (typeof err === "string" ? err : "") || "This page crashed.";
 
   return (
     <div className="mx-auto w-full max-w-xl px-4 py-10">
       <div className="rounded-2xl bg-white p-5 ring-1 ring-slate-200">
         <div className="text-sm font-extrabold text-slate-900">Page crashed</div>
-        <div className="mt-2 text-sm font-semibold text-slate-700">
-          {msg}
-        </div>
-        <div className="mt-4 text-xs font-mono text-slate-500 whitespace-pre-wrap">
+        <div className="mt-2 text-sm font-semibold text-slate-700">{msg}</div>
+        <div className="mt-4 whitespace-pre-wrap text-xs font-mono text-slate-500">
           {err?.stack || ""}
         </div>
         <a
@@ -45,6 +48,32 @@ function RouteError() {
   );
 }
 
+function RequireAuth({ children }) {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+
+  // While auth is hydrating, don’t render pages that depend on user id.
+  if (loading) {
+    return (
+      <div className="mx-auto w-full max-w-xl px-4 py-10">
+        <div className="rounded-2xl bg-white p-5 ring-1 ring-slate-200">
+          <div className="text-sm font-extrabold text-slate-900">Loading…</div>
+          <div className="mt-2 text-sm font-semibold text-slate-700">
+            Checking your session.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    const next = encodeURIComponent(location.pathname + location.search);
+    return <Navigate to={`/login?next=${next}`} replace />;
+  }
+
+  return children;
+}
+
 const router = createBrowserRouter([
   { path: "/login", element: <Login />, errorElement: <RouteError /> },
   { path: "/signup", element: <Signup />, errorElement: <RouteError /> },
@@ -54,14 +83,56 @@ const router = createBrowserRouter([
     element: <App />,
     errorElement: <RouteError />,
     children: [
+      // Feed can be public or private depending on your app. Leaving as-is (public).
       { index: true, element: <Feed />, errorElement: <RouteError /> },
 
-      { path: "leagues", element: <League />, errorElement: <RouteError /> },
-      { path: "league-settings", element: <LeagueSettings />, errorElement: <RouteError /> },
+      // ✅ League pages require auth because they depend on user + memberships
+      {
+        path: "leagues",
+        element: (
+          <RequireAuth>
+            <League />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
+      {
+        path: "league-settings",
+        element: (
+          <RequireAuth>
+            <LeagueSettings />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
 
-      { path: "post", element: <SubmitRound />, errorElement: <RouteError /> },
-      { path: "friends", element: <FindGolfers />, errorElement: <RouteError /> },
-      { path: "profile", element: <Profile />, errorElement: <RouteError /> },
+      {
+        path: "post",
+        element: (
+          <RequireAuth>
+            <SubmitRound />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
+      {
+        path: "friends",
+        element: (
+          <RequireAuth>
+            <FindGolfers />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
+      {
+        path: "profile",
+        element: (
+          <RequireAuth>
+            <Profile />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
 
       { path: "rules", element: <Rules />, errorElement: <RouteError /> },
       { path: "majors", element: <Majors />, errorElement: <RouteError /> },
@@ -78,7 +149,6 @@ const router = createBrowserRouter([
 ]);
 
 export default router;
-
 
 
 

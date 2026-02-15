@@ -171,7 +171,8 @@ function mergePointsSystem(raw) {
 
   const placementPoints = normalizePlacement(ps.placementPoints || base.placementPoints);
 
-  const participation = ps.participation && typeof ps.participation === "object" ? ps.participation : {};
+  const participation =
+    ps.participation && typeof ps.participation === "object" ? ps.participation : {};
   const bonuses = ps.bonuses && typeof ps.bonuses === "object" ? ps.bonuses : {};
 
   const birdie = bonuses.birdie && typeof bonuses.birdie === "object" ? bonuses.birdie : {};
@@ -247,9 +248,10 @@ function getLeagueIdFromLocation(location) {
 }
 
 /** ✅ Single source of truth for button actions: always returns the best available leagueId. */
-function resolveBestLeagueId({ league, stableLeagueIdRef }) {
+function resolveBestLeagueId({ league, resolvedLeagueId, stableLeagueIdRef }) {
   return (
     cleanLeagueId(league?.id) ||
+    cleanLeagueId(resolvedLeagueId) ||
     cleanLeagueId(stableLeagueIdRef?.current) ||
     cleanLeagueId(getLeagueSafe(null)?.id) ||
     null
@@ -280,6 +282,11 @@ export default function League() {
   // ✅ Stable league id for this screen (survives refresh/new tab)
   const stableLeagueIdRef = useRef(null);
 
+  // ✅ deterministic resolved league id (prevents “not ready yet”)
+  const [resolvedLeagueId, setResolvedLeagueId] = useState(() =>
+    cleanLeagueId(getLeagueSafe(null)?.id)
+  );
+
   // Freeze leagueId ASAP from nav state / query
   useEffect(() => {
     const navLeagueId = cleanLeagueId(getLeagueIdFromLocation(location));
@@ -295,6 +302,8 @@ export default function League() {
 
     async function syncLeague() {
       if (authLoading) return;
+      if (!user?.id) return; // RequireAuth should ensure, but keep safe.
+
       setLeagueLoading(true);
       setLeagueSyncError("");
 
@@ -311,20 +320,38 @@ export default function League() {
         });
 
         const resolvedClean = cleanLeagueId(resolved);
-        if (resolvedClean) stableLeagueIdRef.current = resolvedClean;
+        if (resolvedClean) {
+          stableLeagueIdRef.current = resolvedClean;
+          setResolvedLeagueId(resolvedClean);
+        }
 
-        await syncActiveLeagueFromSupabase({
+        const result = await syncActiveLeagueFromSupabase({
           leagueId: resolvedClean || null,
           withRounds: true,
         });
+
+        if (!alive) return;
+
+        // ✅ Use returned truth first (reduces cache race conditions)
+        if (result?.league) setLeagueState(result.league);
+        else setLeagueState(getLeagueSafe(null));
+
+        if (Array.isArray(result?.users)) setUsersState(result.users);
+        else setUsersState(getUsers([]));
+
+        if (Array.isArray(result?.rounds)) setRoundsState(result.rounds);
+        else setRoundsState(getRounds([]));
       } catch (e) {
         const msg = String(e?.message || "");
         if (alive && msg) setLeagueSyncError(msg);
-      } finally {
+
+        // fallback to cache
         if (!alive) return;
         setLeagueState(getLeagueSafe(null));
         setUsersState(getUsers([]));
         setRoundsState(getRounds([]));
+      } finally {
+        if (!alive) return;
         setLeagueLoading(false);
       }
     }
@@ -409,12 +436,15 @@ export default function League() {
       if (memErr) throw memErr;
 
       stableLeagueIdRef.current = String(leagueId);
-      await setActiveLeagueId(leagueId);
-      await syncActiveLeagueFromSupabase({ leagueId, withRounds: true });
+      setResolvedLeagueId(String(leagueId));
 
-      setLeagueState(getLeagueSafe(null));
-      setUsersState(getUsers([]));
-      setRoundsState(getRounds([]));
+      await setActiveLeagueId(leagueId);
+
+      const result = await syncActiveLeagueFromSupabase({ leagueId, withRounds: true });
+
+      setLeagueState(result?.league || getLeagueSafe(null));
+      setUsersState(result?.users || getUsers([]));
+      setRoundsState(result?.rounds || getRounds([]));
 
       setShowCreate(false);
       setCreateName("");
@@ -599,7 +629,6 @@ export default function League() {
 
     const nextLeague = { ...league, seasonStartISO: endedAtISO };
 
-    // keep active pinned (ONLY if valid)
     const lidPinned = cleanLeagueId(league?.id);
     if (lidPinned) {
       // eslint-disable-next-line no-void
@@ -663,9 +692,7 @@ export default function League() {
             </div>
 
             {leagueLoading ? (
-              <div className="mt-2 text-[11px] font-semibold text-slate-400">
-                Syncing league…
-              </div>
+              <div className="mt-2 text-[11px] font-semibold text-slate-400">Syncing league…</div>
             ) : null}
           </div>
 
@@ -687,7 +714,7 @@ export default function League() {
 
           <button
             onClick={() => {
-              const lid = resolveBestLeagueId({ league, stableLeagueIdRef });
+              const lid = resolveBestLeagueId({ league, resolvedLeagueId, stableLeagueIdRef });
               if (!lid) {
                 setToast("League not ready yet — try again in a second.");
                 return;
@@ -704,7 +731,7 @@ export default function League() {
 
           <button
             onClick={() => {
-              const lid = resolveBestLeagueId({ league, stableLeagueIdRef });
+              const lid = resolveBestLeagueId({ league, resolvedLeagueId, stableLeagueIdRef });
               if (!lid) {
                 setToast("League not ready yet — try again in a second.");
                 return;
@@ -775,7 +802,9 @@ export default function League() {
 
                     <div className="text-right">
                       <div className="text-base font-extrabold text-slate-900">{row.points}</div>
-                      <div className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500">pts</div>
+                      <div className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500">
+                        pts
+                      </div>
                     </div>
                   </div>
                 </button>
@@ -828,6 +857,7 @@ export default function League() {
     </div>
   );
 }
+
 
 
 

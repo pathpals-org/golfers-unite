@@ -47,11 +47,12 @@ function isInvalidRefreshTokenError(err) {
 
 function clearSupabaseAuthStorageKeys() {
   try {
-    const keys = Object.keys(localStorage);
+    if (typeof window === "undefined") return;
+    const keys = Object.keys(window.localStorage);
     keys.forEach((k) => {
-      if (k.startsWith("sb-") && k.includes("-auth-token")) localStorage.removeItem(k);
+      if (k.startsWith("sb-") && k.includes("-auth-token")) window.localStorage.removeItem(k);
       if (k.toLowerCase().includes("supabase") && k.toLowerCase().includes("auth")) {
-        localStorage.removeItem(k);
+        window.localStorage.removeItem(k);
       }
     });
   } catch {
@@ -211,3 +212,4 @@ export function useAuth() {
   if (!ctx) throw new Error("useAuth must be used inside <AuthProvider />");
   return ctx;
 }
+

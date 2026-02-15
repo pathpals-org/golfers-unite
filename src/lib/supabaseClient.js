@@ -57,20 +57,21 @@ if (typeof window !== "undefined") {
   window.__SUPABASE_ENV__ = {
     hasUrl: Boolean(url),
     hasAnon: Boolean(anon),
-    urlOrigin: url ? (() => {
-      try {
-        return new URL(url).origin;
-      } catch {
-        return "INVALID_URL";
-      }
-    })() : null,
+    urlOrigin: url
+      ? (() => {
+          try {
+            return new URL(url).origin;
+          } catch {
+            return "INVALID_URL";
+          }
+        })()
+      : null,
     anonLen: anon ? anon.length : 0,
     buildMode: import.meta.env.MODE,
   };
 }
 
 // --- If env is missing, don't hard-crash the whole app — log loudly.
-// This prevents “everything looks like localStorage” mystery on production devices.
 if (!url || !anon) {
   // eslint-disable-next-line no-console
   console.error(
@@ -79,14 +80,20 @@ if (!url || !anon) {
   );
 }
 
-// Create the client even if env is missing; calls will fail with clear errors,
-// but your UI won't silently fall back to weird states.
-export const supabase = createClient(url || "http://localhost:54321", anon || "missing-anon-key", {
+// Use a clearly-invalid placeholder when env is missing (prevents accidental localhost confusion)
+const FALLBACK_URL = "https://invalid.supabase.local";
+const FALLBACK_ANON = "missing-anon-key";
+
+// ✅ If you are NOT using magic links / OAuth redirects, keep this false.
+// If you DO use them, set true.
+const DETECT_SESSION_IN_URL = false;
+
+export const supabase = createClient(url || FALLBACK_URL, anon || FALLBACK_ANON, {
   auth: {
     storage: safeStorage,
     persistSession: true,
     autoRefreshToken: true,
-    detectSessionInUrl: true,
+    detectSessionInUrl: DETECT_SESSION_IN_URL,
   },
 });
 

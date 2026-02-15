@@ -6,6 +6,7 @@ import EmptyState from "../components/ui/EmptyState";
 import PageHeader from "../components/ui/PageHeader";
 
 import { supabase } from "../lib/supabaseClient";
+import { useAuth } from "../auth/useAuth";
 
 import {
   // UI cache getters (safe)
@@ -15,7 +16,6 @@ import {
 
   // ✅ Supabase-first storage layer
   syncActiveLeagueFromSupabase,
-  resolveLeagueIdSupabaseFirst,
   getActiveLeagueIdSupabaseFirst,
   setActiveLeagueId,
   getMyLeagueRoleSupabase,
@@ -105,15 +105,27 @@ function isUniqueViolation(err) {
   return String(err?.code || "") === "23505";
 }
 
+/** ✅ Reject null/undefined/"undefined"/"null"/"" */
+function cleanLeagueId(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  if (low === "undefined" || low === "null") return null;
+  return s;
+}
+
+/** state -> query */
 function getLeagueIdFromLocation(location) {
-  // Priority: navigation state, then query string
   const stateId = location?.state?.leagueId || location?.state?.id || null;
-  if (stateId) return stateId;
+  const cleanState = cleanLeagueId(stateId);
+  if (cleanState) return cleanState;
 
   try {
     const sp = new URLSearchParams(location?.search || "");
     const q = sp.get("leagueId") || sp.get("league_id");
-    if (q) return q;
+    const cleanQ = cleanLeagueId(q);
+    if (cleanQ) return cleanQ;
   } catch {
     // ignore
   }
@@ -123,48 +135,42 @@ function getLeagueIdFromLocation(location) {
 
 /**
  * ✅ League Settings rules:
- * - leagueId resolution order: state -> query -> activeLeagueId -> Supabase membership fallback
+ * - leagueId resolution order: state -> query -> activeLeagueId (profile pref) -> membership fallback
  * - permissions based ONLY on Supabase league_members.role
- * - co-host toggle writes Supabase then re-syncs caches
- * - /league route is a redirect in your router, so we navigate to /leagues instead
+ * - writes go Supabase first, then re-sync caches
  */
 export default function LeagueSettings() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user, loading: authLoading } = useAuth();
+
+  const authUserId = user?.id || null;
 
   const [league, setLeagueState] = useState(() => getLeagueSafe({}));
   const [users, setUsersState] = useState(() => ensureArr(getUsers([])));
 
-  // Supabase auth user
-  const [authUserId, setAuthUserId] = useState(null);
+  // Stable leagueId for this page
+  const [leagueId, setLeagueId] = useState(() => getLeagueIdFromLocation(location));
 
   // Live role (source of truth)
   const [myRoleLive, setMyRoleLive] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
-  // Stable leagueId for this page
-  const [leagueId, setLeagueId] = useState(() => {
-    return getLeagueIdFromLocation(location) || null;
-  });
-
   // Prevent stale async overwrites
   const hydrateReqIdRef = useRef(0);
   const roleReqIdRef = useRef(0);
+  const resolveReqIdRef = useRef(0);
 
-  // Invite status UI
+  // Invite status UI (also used for errors)
   const [inviteStatus, setInviteStatus] = useState({ type: "", message: "" });
 
-  // Friends for invite list (Supabase source)
+  // Friends + invites
   const [friends, setFriends] = useState([]);
   const [friendsLoading, setFriendsLoading] = useState(false);
 
-  // Pending invites UI
   const [pendingInvites, setPendingInvites] = useState([]);
   const [invitesLoading, setInvitesLoading] = useState(false);
   const [inviteActionId, setInviteActionId] = useState(null);
-
-  // keep behavior (ensures cache points stays consistent)
-  useMemo(() => getPointsSystem(null), [league?.pointsSystem]);
 
   // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
@@ -204,12 +210,12 @@ export default function LeagueSettings() {
   const myId = authUserId || getUserId(me);
   const myDisplayName = getUserName(me);
 
-  // ✅ Permissions based ONLY on Supabase league_members.role
+  // ✅ Permissions based ONLY on Supabase role
   const effectiveRole = myRoleLive || LEAGUE_ROLES.member;
   const canEdit = effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.co_host;
 
-  // ✅ Stable league id for this page
-  const stableLeagueId = leagueId || league?.id || null;
+  // ✅ final stable id for this render
+  const stableLeagueId = cleanLeagueId(leagueId) || cleanLeagueId(league?.id) || null;
 
   // ✅ MUST be above early return (hooks rule)
   const placementRows = placementRowsFromMap(pointsDraft.placementPoints);
@@ -234,67 +240,58 @@ export default function LeagueSettings() {
     });
   }, [friends, memberSet]);
 
-  // Auth bootstrap (Netlify-safe)
-  useEffect(() => {
-    let alive = true;
-
-    async function boot() {
-      try {
-        const { data } = await supabase.auth.getSession();
-        if (!alive) return;
-        setAuthUserId(data?.session?.user?.id || null);
-      } catch {
-        if (!alive) return;
-        setAuthUserId(null);
-      }
-    }
-
-    boot();
-
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!alive) return;
-      setAuthUserId(session?.user?.id || null);
-    });
-
-    return () => {
-      alive = false;
-      try {
-        sub?.subscription?.unsubscribe?.();
-      } catch {
-        // ignore
-      }
-    };
-  }, []);
-
   /**
-   * ✅ LeagueId resolution (state -> query -> activeLeagueId -> membership fallback)
-   * Runs on location changes and on login.
+   * ✅ Resolve leagueId (state -> query -> activeLeagueId -> membership fallback)
+   * Trigger: navigation changes and login.
    */
   useEffect(() => {
+    if (authLoading) return;
+
     let alive = true;
+    const reqId = ++resolveReqIdRef.current;
 
     async function resolveLeagueId() {
+      // 1) state/query
       const fromNav = getLeagueIdFromLocation(location);
+      if (!alive || reqId !== resolveReqIdRef.current) return;
       if (fromNav) {
-        if (!alive) return;
         setLeagueId(String(fromNav));
         return;
       }
 
-      // Prefer Supabase profile active league, else local
-      const activePref = await getActiveLeagueIdSupabaseFirst();
-      if (!alive) return;
-
-      if (activePref) {
-        setLeagueId(String(activePref));
+      // If not logged in, stop here. (No profile pref, no membership)
+      if (!authUserId) {
+        setLeagueId(null);
         return;
       }
 
-      // membership fallback
-      const fallback = await resolveLeagueIdSupabaseFirst({ preferredLeagueId: null });
-      if (!alive) return;
+      // 2) activeLeagueId pref (Supabase first, local fallback)
+      const pref = await getActiveLeagueIdSupabaseFirst();
+      if (!alive || reqId !== resolveReqIdRef.current) return;
+      const cleanPref = cleanLeagueId(pref);
+      if (cleanPref) {
+        setLeagueId(String(cleanPref));
+        return;
+      }
 
-      if (fallback) setLeagueId(String(fallback));
+      // 3) membership fallback (most recent)
+      try {
+        const { data, error } = await supabase
+          .from("league_members")
+          .select("league_id, created_at")
+          .eq("user_id", authUserId)
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (!alive || reqId !== resolveReqIdRef.current) return;
+        if (error) throw error;
+
+        const first = ensureArr(data)[0]?.league_id || null;
+        const cleanFirst = cleanLeagueId(first);
+        if (cleanFirst) setLeagueId(String(cleanFirst));
+      } catch {
+        // fail-soft
+      }
     }
 
     resolveLeagueId();
@@ -302,17 +299,18 @@ export default function LeagueSettings() {
     return () => {
       alive = false;
     };
-  }, [location, authUserId]);
+  }, [authLoading, authUserId, location.key]);
 
   /**
    * ✅ Hydrate page data for the resolved leagueId.
-   * This uses the single storage layer and caches safe UI data.
+   * Supabase truth -> cache -> state.
    */
   useEffect(() => {
     let alive = true;
 
     async function hydrate() {
-      if (!leagueId) return;
+      const lid = cleanLeagueId(leagueId);
+      if (!lid) return;
 
       const reqId = ++hydrateReqIdRef.current;
 
@@ -321,19 +319,22 @@ export default function LeagueSettings() {
       setUsersState(ensureArr(getUsers([])));
 
       try {
-        const { league: l, users: u } = await syncActiveLeagueFromSupabase({
-          leagueId,
+        const result = await syncActiveLeagueFromSupabase({
+          leagueId: lid,
           withRounds: false,
         });
 
         if (!alive) return;
         if (reqId !== hydrateReqIdRef.current) return;
 
+        const l = result?.league || null;
+        const u = ensureArr(result?.users);
+
         if (l?.id) {
           setLeagueState(l);
-          setUsersState(ensureArr(u));
+          setUsersState(u);
 
-          // Align local drafts to hydrated data
+          // Align drafts to hydrated data
           setSeasonStart(toISODateInput(l?.seasonStartISO));
           setSeasonEnd(toISODateInput(l?.seasonEndISO));
 
@@ -353,8 +354,9 @@ export default function LeagueSettings() {
             hioPoints: safeNum(ps?.bonuses?.hio?.points, 5),
           });
 
-          // Persist as active league preference (Supabase if possible, local fallback always)
-          await setActiveLeagueId(l.id);
+          // Persist preference (Supabase if possible, local fallback always)
+          // eslint-disable-next-line no-void
+          void setActiveLeagueId(l.id);
         }
       } catch {
         // fail-soft: keep cached UI
@@ -375,7 +377,8 @@ export default function LeagueSettings() {
     let alive = true;
 
     async function refreshRole() {
-      if (!authUserId || !leagueId) {
+      const lid = cleanLeagueId(leagueId);
+      if (!authUserId || !lid) {
         setMyRoleLive(null);
         return;
       }
@@ -384,7 +387,7 @@ export default function LeagueSettings() {
       setRoleLoading(true);
 
       try {
-        const role = await getMyLeagueRoleSupabase(leagueId);
+        const role = await getMyLeagueRoleSupabase(lid);
 
         if (!alive) return;
         if (reqId !== roleReqIdRef.current) return;
@@ -393,7 +396,6 @@ export default function LeagueSettings() {
       } catch {
         if (!alive) return;
         if (reqId !== roleReqIdRef.current) return;
-        // Fail-soft: default to member (view-only)
         setMyRoleLive(LEAGUE_ROLES.member);
       } finally {
         if (!alive) return;
@@ -410,7 +412,8 @@ export default function LeagueSettings() {
   }, [authUserId, leagueId]);
 
   async function loadPendingInvites({ leagueId: lid }) {
-    if (!lid) return;
+    const clean = cleanLeagueId(lid);
+    if (!clean) return;
 
     setInvitesLoading(true);
     try {
@@ -430,7 +433,7 @@ export default function LeagueSettings() {
           )
         `
         )
-        .eq("league_id", lid)
+        .eq("league_id", clean)
         .eq("status", "pending")
         .order("created_at", { ascending: false });
 
@@ -505,7 +508,7 @@ export default function LeagueSettings() {
   }, [myId]);
 
   useEffect(() => {
-    const lid = leagueId || league?.id || null;
+    const lid = cleanLeagueId(stableLeagueId);
     if (!lid) return;
 
     if (!canEdit) {
@@ -515,15 +518,19 @@ export default function LeagueSettings() {
 
     loadPendingInvites({ leagueId: lid });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canEdit, leagueId]);
+  }, [canEdit, stableLeagueId]);
 
   if (!stableLeagueId) {
     return (
       <div className="pt-2">
         <EmptyState
           icon="⚙️"
-          title="No league selected"
-          description="Open League Settings from a specific league."
+          title={authLoading ? "Loading…" : "No league selected"}
+          description={
+            authLoading
+              ? "Checking your account…"
+              : "Open League Settings from a specific league."
+          }
           actions={
             <button
               onClick={() => navigate("/leagues")}
@@ -559,7 +566,6 @@ export default function LeagueSettings() {
         ...d,
         placementPoints: normalizePlacement({ 1: 3 }),
       }));
-      return;
     }
   }
 
@@ -627,7 +633,6 @@ export default function LeagueSettings() {
 
     try {
       await setPointsSystemSupabase({ leagueId: stableLeagueId, pointsSystem: merged });
-      // Re-hydrate caches so League page and Settings stay aligned
       await syncActiveLeagueFromSupabase({ leagueId: stableLeagueId, withRounds: false });
       setLeagueState(getLeagueSafe({}));
     } catch (e) {
@@ -657,12 +662,10 @@ export default function LeagueSettings() {
         role: makeCoHost ? LEAGUE_ROLES.co_host : LEAGUE_ROLES.member,
       });
 
-      // ✅ Re-sync from Supabase (truth), then refresh UI
       await syncActiveLeagueFromSupabase({ leagueId: stableLeagueId, withRounds: false });
       setLeagueState(getLeagueSafe({}));
       setUsersState(ensureArr(getUsers([])));
 
-      // If you toggled yourself, refresh role
       if (authUserId && userId === authUserId) {
         const r = await getMyLeagueRoleSupabase(stableLeagueId);
         setMyRoleLive(r);
@@ -746,7 +749,11 @@ export default function LeagueSettings() {
     <div className="space-y-6">
       <PageHeader
         title="League Settings"
-        subtitle={canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."}
+        subtitle={
+          canEdit
+            ? "Manage points, season, and admins."
+            : "You can view settings. Only host/co-host can edit."
+        }
         right={
           <button
             type="button"
@@ -772,7 +779,7 @@ export default function LeagueSettings() {
             <button
               type="button"
               onClick={async () => {
-                if (!stableLeagueId) return;
+                if (!stableLeagueId || !authUserId) return;
                 setRoleLoading(true);
                 try {
                   const r = await getMyLeagueRoleSupabase(stableLeagueId);
@@ -796,7 +803,9 @@ export default function LeagueSettings() {
           <span
             className={[
               "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
-              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
+              canEdit
+                ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
+                : "bg-slate-50 text-slate-700 ring-slate-200",
             ].join(" ")}
           >
             {canEdit ? "Editing enabled" : "View only"}
@@ -804,7 +813,8 @@ export default function LeagueSettings() {
         </div>
 
         <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          Permissions are based only on Supabase <span className="font-mono">league_members.role</span>.
+          Permissions are based only on Supabase{" "}
+          <span className="font-mono">league_members.role</span>.
         </div>
       </Card>
 
@@ -825,7 +835,9 @@ export default function LeagueSettings() {
 
         <div className="mt-4">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Friends not in this league</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Friends not in this league
+            </div>
 
             <button
               type="button"
@@ -844,12 +856,15 @@ export default function LeagueSettings() {
 
           <div className="mt-2 space-y-2">
             {!canEdit ? (
-              <div className="text-sm font-semibold text-slate-600">Only host/co-host can invite friends to the league.</div>
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can invite friends to the league.
+              </div>
             ) : friendsLoading ? (
               <div className="text-sm font-semibold text-slate-600">Loading friends…</div>
             ) : friendsNotInLeague.length === 0 ? (
               <div className="text-sm font-semibold text-slate-600">
-                No inviteable friends found (either none accepted yet, or they’re already in the league).
+                No inviteable friends found (either none accepted yet, or they’re already in the
+                league).
               </div>
             ) : (
               friendsNotInLeague.map((p) => {
@@ -859,7 +874,10 @@ export default function LeagueSettings() {
                 const busy = inviteActionId === pid;
 
                 return (
-                  <div key={pid} className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
+                  <div
+                    key={pid}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{name}</div>
                     </div>
@@ -875,7 +893,9 @@ export default function LeagueSettings() {
                         onClick={() => sendInviteToFriend(p)}
                         className={[
                           "rounded-xl px-3 py-2 text-xs font-extrabold",
-                          busy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-slate-900 text-white hover:bg-slate-800",
+                          busy
+                            ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                            : "bg-slate-900 text-white hover:bg-slate-800",
                         ].join(" ")}
                       >
                         {busy ? "Inviting…" : "Invite"}
@@ -891,7 +911,9 @@ export default function LeagueSettings() {
         {/* Pending invites */}
         <div className="mt-6">
           <div className="flex items-center justify-between gap-3">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Pending invites</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Pending invites
+            </div>
 
             <button
               type="button"
@@ -910,7 +932,9 @@ export default function LeagueSettings() {
 
           <div className="mt-2 space-y-2">
             {!canEdit ? (
-              <div className="text-sm font-semibold text-slate-600">Only host/co-host can view and manage league invites.</div>
+              <div className="text-sm font-semibold text-slate-600">
+                Only host/co-host can view and manage league invites.
+              </div>
             ) : invitesLoading ? (
               <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
             ) : pendingInvites.length === 0 ? (
@@ -918,11 +942,15 @@ export default function LeagueSettings() {
             ) : (
               pendingInvites.map((inv) => {
                 const invitee = inv?.invitee || null;
-                const display = invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                const display =
+                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
                 return (
-                  <div key={inv.id} className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
+                  <div
+                    key={inv.id}
+                    className="flex items-center justify-between gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200"
+                  >
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{display}</div>
                       <div className="mt-0.5 text-xs font-semibold text-slate-600">
@@ -931,7 +959,10 @@ export default function LeagueSettings() {
                           <>
                             {" "}
                             · Sent {created.toLocaleDateString()}{" "}
-                            {created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                            {created.toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
                           </>
                         ) : null}
                       </div>
@@ -973,7 +1004,9 @@ export default function LeagueSettings() {
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-slate-900">Points system</div>
-            <div className="mt-1 text-xs font-semibold text-slate-600">Configure how points are awarded in this league.</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Configure how points are awarded in this league.
+            </div>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -983,7 +1016,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("default")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=2, 3rd=0"
             >
@@ -996,7 +1031,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("yourLeague")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=1, 3rd=0"
             >
@@ -1009,7 +1046,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("winnerOnly")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="Winner only"
             >
@@ -1020,7 +1059,9 @@ export default function LeagueSettings() {
 
         <div className="mt-5 space-y-4">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Placement points</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Placement points
+            </div>
 
             <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
               <div className="grid grid-cols-[70px_1fr_54px] items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] font-extrabold uppercase tracking-wide text-slate-500">
@@ -1031,7 +1072,9 @@ export default function LeagueSettings() {
 
               <div className="divide-y divide-slate-200 bg-white">
                 {placementRows.length === 0 ? (
-                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">No placement rules set yet.</div>
+                  <div className="px-4 py-3 text-sm font-semibold text-slate-600">
+                    No placement rules set yet.
+                  </div>
                 ) : (
                   placementRows.map((p) => (
                     <div key={p} className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2">
@@ -1047,7 +1090,9 @@ export default function LeagueSettings() {
                         disabled={!canEdit}
                         className={[
                           "w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                          canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                          canEdit
+                            ? "border-slate-200 bg-white text-slate-900"
+                            : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
                         ].join(" ")}
                         aria-label={`Points for place ${p}`}
                       />
@@ -1059,7 +1104,9 @@ export default function LeagueSettings() {
                           onClick={() => removePlacement(p)}
                           className={[
                             "rounded-xl px-3 py-2 text-xs font-extrabold",
-                            canEdit ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-slate-100 text-slate-400 cursor-not-allowed",
+                            canEdit
+                              ? "bg-rose-600 text-white hover:bg-rose-500"
+                              : "bg-slate-100 text-slate-400 cursor-not-allowed",
                           ].join(" ")}
                           title="Remove this place"
                         >
@@ -1078,7 +1125,9 @@ export default function LeagueSettings() {
                   onClick={addPlacementRow}
                   className={[
                     "rounded-xl px-4 py-2 text-xs font-extrabold",
-                    canEdit ? "bg-slate-100 text-slate-900 hover:bg-slate-200" : "bg-slate-50 text-slate-400 cursor-not-allowed",
+                    canEdit
+                      ? "bg-slate-100 text-slate-900 hover:bg-slate-200"
+                      : "bg-slate-50 text-slate-400 cursor-not-allowed",
                   ].join(" ")}
                 >
                   + Add place
@@ -1098,7 +1147,9 @@ export default function LeagueSettings() {
               onClick={savePointsSystem}
               className={[
                 "rounded-xl px-4 py-2 text-sm font-extrabold",
-                canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+                canEdit
+                  ? "bg-slate-900 text-white hover:bg-slate-800"
+                  : "bg-slate-200 text-slate-500 cursor-not-allowed",
               ].join(" ")}
             >
               Save points system
@@ -1128,7 +1179,9 @@ export default function LeagueSettings() {
 
         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Season start</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Season start
+            </div>
             <input
               type="date"
               value={seasonStart}
@@ -1136,13 +1189,17 @@ export default function LeagueSettings() {
               disabled={!canEdit}
               className={[
                 "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                canEdit
+                  ? "border-slate-200 bg-white text-slate-900"
+                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
               ].join(" ")}
             />
           </div>
 
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Season end (optional)</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Season end (optional)
+            </div>
             <input
               type="date"
               value={seasonEnd}
@@ -1150,7 +1207,9 @@ export default function LeagueSettings() {
               disabled={!canEdit}
               className={[
                 "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                canEdit
+                  ? "border-slate-200 bg-white text-slate-900"
+                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
               ].join(" ")}
             />
           </div>
@@ -1163,7 +1222,9 @@ export default function LeagueSettings() {
             onClick={saveSeasonDates}
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
-              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              canEdit
+                ? "bg-slate-900 text-white hover:bg-slate-800"
+                : "bg-slate-200 text-slate-500 cursor-not-allowed",
             ].join(" ")}
           >
             Save season dates
@@ -1189,16 +1250,21 @@ export default function LeagueSettings() {
             memberUsers.map((u) => {
               const uid = getUserId(u);
 
-              // NOTE: display only (cached). Real permissions are based on myRoleLive only.
+              // Display only (cached). Real permissions are based on myRoleLive only.
               const cachedRole = ensureObj(league?.memberRoles || {})[uid] || LEAGUE_ROLES.member;
               const role = cachedRole;
               const isHost = role === LEAGUE_ROLES.host;
               const isCoHost = role === LEAGUE_ROLES.co_host;
 
               return (
-                <div key={uid} className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
+                <div
+                  key={uid}
+                  className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
+                >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-slate-900">{getUserName(u)}</div>
+                    <div className="truncate text-sm font-extrabold text-slate-900">
+                      {getUserName(u)}
+                    </div>
                     <div className="mt-0.5 text-xs font-semibold text-slate-600">
                       {roleLabel(role)}
                       {uid === myId ? " · You" : ""}
@@ -1207,7 +1273,9 @@ export default function LeagueSettings() {
 
                   <div className="flex items-center gap-2">
                     {isHost ? (
-                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">Host</span>
+                      <span className="rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white">
+                        Host
+                      </span>
                     ) : (
                       <button
                         type="button"
@@ -1240,6 +1308,7 @@ export default function LeagueSettings() {
     </div>
   );
 }
+
 
 
 
