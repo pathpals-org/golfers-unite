@@ -103,11 +103,17 @@ export const supabase = createClient(url || FALLBACK_URL, anon || FALLBACK_ANON,
   },
 });
 
-// ✅ DEBUG ONLY: expose client in browser console so we can test RLS quickly.
-// You can delete this later once everything is stable.
+// ✅ DEBUG: prove this module actually executed in the production bundle.
+// If this is undefined in prod, the app is not loading this file.
 if (hasWindow) {
   window.supabase = supabase;
+  window.__SUPABASE_DEBUG__ = {
+    attached: true,
+    tag: "SUPABASE_CLIENT_ATTACHED_v2",
+    at: new Date().toISOString(),
+  };
 }
+
 
 
 
