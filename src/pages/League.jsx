@@ -253,9 +253,14 @@ function resolveBestLeagueId({ league, resolvedLeagueId, stableLeagueIdRef }) {
     cleanLeagueId(league?.id) ||
     cleanLeagueId(resolvedLeagueId) ||
     cleanLeagueId(stableLeagueIdRef?.current) ||
-    cleanLeagueId(getLeagueSafe(null)?.id) ||
     null
   );
+}
+
+function normalizeLeagueOrNull(l) {
+  const id = cleanLeagueId(l?.id);
+  if (!id) return null;
+  return l;
 }
 
 export default function League() {
@@ -263,7 +268,8 @@ export default function League() {
   const location = useLocation();
   const { user, loading: authLoading } = useAuth();
 
-  const [league, setLeagueState] = useState(() => getLeagueSafe(null));
+  // ✅ IMPORTANT: treat “league without id” as NO league
+  const [league, setLeagueState] = useState(() => normalizeLeagueOrNull(getLeagueSafe(null)));
   const [users, setUsersState] = useState(() => getUsers([]));
   const [rounds, setRoundsState] = useState(() => getRounds([]));
 
@@ -287,17 +293,6 @@ export default function League() {
     cleanLeagueId(getLeagueSafe(null)?.id)
   );
 
-  // ✅ NEW: allow /leagues?create=1 to open the create modal (nice for deep-links)
-  useEffect(() => {
-    try {
-      const sp = new URLSearchParams(location.search || "");
-      const wants = sp.get("create");
-      if (wants === "1" || wants === "true") setShowCreate(true);
-    } catch {
-      // ignore
-    }
-  }, [location.search]);
-
   // Freeze leagueId ASAP from nav state / query
   useEffect(() => {
     const navLeagueId = cleanLeagueId(getLeagueIdFromLocation(location));
@@ -313,7 +308,7 @@ export default function League() {
 
     async function syncLeague() {
       if (authLoading) return;
-      if (!user?.id) return; // RequireAuth should ensure, but keep safe.
+      if (!user?.id) return;
 
       setLeagueLoading(true);
       setLeagueSyncError("");
@@ -331,9 +326,16 @@ export default function League() {
         });
 
         const resolvedClean = cleanLeagueId(resolved);
+
         if (resolvedClean) {
           stableLeagueIdRef.current = resolvedClean;
           setResolvedLeagueId(resolvedClean);
+        } else {
+          // ✅ If nothing resolves, clear pinned IDs so we don’t keep chasing a deleted league
+          stableLeagueIdRef.current = null;
+          setResolvedLeagueId(null);
+          // eslint-disable-next-line no-void
+          void setActiveLeagueId(null);
         }
 
         const result = await syncActiveLeagueFromSupabase({
@@ -343,9 +345,19 @@ export default function League() {
 
         if (!alive) return;
 
-        // ✅ Use returned truth first (reduces cache race conditions)
-        if (result?.league) setLeagueState(result.league);
-        else setLeagueState(getLeagueSafe(null));
+        const nextLeague = normalizeLeagueOrNull(result?.league);
+
+        // ✅ If Supabase couldn’t hydrate a league, treat as “no league”
+        if (!nextLeague) {
+          setLeagueState(null);
+          setUsersState([]);
+          setRoundsState([]);
+          // eslint-disable-next-line no-void
+          void setActiveLeagueId(null);
+          return;
+        }
+
+        setLeagueState(nextLeague);
 
         if (Array.isArray(result?.users)) setUsersState(result.users);
         else setUsersState(getUsers([]));
@@ -356,9 +368,9 @@ export default function League() {
         const msg = String(e?.message || "");
         if (alive && msg) setLeagueSyncError(msg);
 
-        // fallback to cache
+        // fallback to cache (but still enforce “must have id”)
         if (!alive) return;
-        setLeagueState(getLeagueSafe(null));
+        setLeagueState(normalizeLeagueOrNull(getLeagueSafe(null)));
         setUsersState(getUsers([]));
         setRoundsState(getRounds([]));
       } finally {
@@ -387,7 +399,7 @@ export default function League() {
           await setPointsSystemSupabase({ leagueId: league.id, pointsSystem: merged });
           await syncActiveLeagueFromSupabase({ leagueId: league.id, withRounds: false });
           if (!alive) return;
-          setLeagueState(getLeagueSafe(null));
+          setLeagueState(normalizeLeagueOrNull(getLeagueSafe(null)));
         } catch {
           // fail-soft
         }
@@ -412,7 +424,7 @@ export default function League() {
   }, [league?.id, rounds]);
 
   const standings = useMemo(() => {
-    if (!league) return [];
+    if (!league?.id) return [];
     const members = Array.isArray(league?.members) ? league.members : [];
     const memberUsers = users.filter((u) => members.includes(u.id || u._id));
     return buildStandings(memberUsers, leagueRounds, pointsSystem);
@@ -453,7 +465,7 @@ export default function League() {
 
       const result = await syncActiveLeagueFromSupabase({ leagueId, withRounds: true });
 
-      setLeagueState(result?.league || getLeagueSafe(null));
+      setLeagueState(normalizeLeagueOrNull(result?.league));
       setUsersState(result?.users || getUsers([]));
       setRoundsState(result?.rounds || getRounds([]));
 
@@ -467,7 +479,8 @@ export default function League() {
     }
   }
 
-  if (!league) {
+  // ✅ IMPORTANT: render “No league” state if league is null OR missing id
+  if (!league?.id) {
     return (
       <div className="pt-2 space-y-3">
         <EmptyState
@@ -563,6 +576,8 @@ export default function League() {
             </div>
           </div>
         </Modal>
+
+        <Toast message={toast} onClose={() => setToast("")} />
       </div>
     );
   }
@@ -662,7 +677,7 @@ export default function League() {
       } catch {
         // ignore
       }
-      setLeagueState({ ...getLeagueSafe(null), ...nextLeague });
+      setLeagueState({ ...normalizeLeagueOrNull(getLeagueSafe(null)), ...nextLeague });
     })();
   }
 
@@ -748,7 +763,6 @@ export default function League() {
                 return;
               }
 
-              // Keep it pinned for settings + any other screens.
               // eslint-disable-next-line no-void
               void setActiveLeagueId(lid);
 
@@ -868,8 +882,3 @@ export default function League() {
     </div>
   );
 }
-
-
-
-
-
