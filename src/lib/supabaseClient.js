@@ -18,9 +18,13 @@ const memoryStorage = (() => {
   };
 })();
 
+// ✅ Robust browser check (prevents SSR/build-time surprises)
+const hasWindow = typeof window !== "undefined";
+
 // Safe storage wrapper: tries localStorage, falls back to memory
 const safeStorage = {
   getItem: (key) => {
+    if (!hasWindow) return memoryStorage.getItem(key);
     try {
       return window.localStorage.getItem(key);
     } catch {
@@ -28,6 +32,7 @@ const safeStorage = {
     }
   },
   setItem: (key, value) => {
+    if (!hasWindow) return memoryStorage.setItem(key, value);
     try {
       window.localStorage.setItem(key, value);
     } catch {
@@ -35,6 +40,7 @@ const safeStorage = {
     }
   },
   removeItem: (key) => {
+    if (!hasWindow) return memoryStorage.removeItem(key);
     try {
       window.localStorage.removeItem(key);
     } catch {
@@ -53,7 +59,7 @@ const anon = cleanEnv(supabaseAnonKey);
 
 // --- Debug (safe): lets you confirm what the Netlify build actually received
 // Check on desktop Netlify console: window.__SUPABASE_ENV__
-if (typeof window !== "undefined") {
+if (hasWindow) {
   window.__SUPABASE_ENV__ = {
     hasUrl: Boolean(url),
     hasAnon: Boolean(anon),
@@ -96,6 +102,12 @@ export const supabase = createClient(url || FALLBACK_URL, anon || FALLBACK_ANON,
     detectSessionInUrl: DETECT_SESSION_IN_URL,
   },
 });
+
+// ✅ DEBUG ONLY: expose client in browser console so we can test RLS quickly.
+// You can delete this later once everything is stable.
+if (hasWindow) {
+  window.supabase = supabase;
+}
 
 
 
