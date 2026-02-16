@@ -172,6 +172,10 @@ export default function LeagueSettings() {
   const [invitesLoading, setInvitesLoading] = useState(false);
   const [inviteActionId, setInviteActionId] = useState(null);
 
+  // Delete league
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState("");
+
   // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
     const ps = getPointsSystem(null);
@@ -239,6 +243,19 @@ export default function LeagueSettings() {
       return true;
     });
   }, [friends, memberSet]);
+
+  async function fetchMyRoleDirect({ lid, uid }) {
+    // This is intentionally “dumb” and direct so we can debug if the helper is failing.
+    const { data, error } = await supabase
+      .from("league_members")
+      .select("role")
+      .eq("league_id", lid)
+      .eq("user_id", uid)
+      .maybeSingle();
+
+    if (error) throw error;
+    return data?.role || null;
+  }
 
   /**
    * ✅ Resolve leagueId (state -> query -> activeLeagueId -> membership fallback)
@@ -372,6 +389,7 @@ export default function LeagueSettings() {
 
   /**
    * ✅ Fetch my role from Supabase (source of truth) whenever leagueId/auth changes.
+   * If role fetch is blocked by RLS, we keep you in view-only (safe) BUT we show an explicit error.
    */
   useEffect(() => {
     let alive = true;
@@ -385,18 +403,44 @@ export default function LeagueSettings() {
 
       const reqId = ++roleReqIdRef.current;
       setRoleLoading(true);
+      setInviteStatus((s) => (s?.type === "error" ? { type: "", message: "" } : s));
 
       try {
-        const role = await getMyLeagueRoleSupabase(lid);
+        // Try direct query first (helps debug + avoids any helper mismatch)
+        let role = null;
+
+        try {
+          role = await fetchMyRoleDirect({ lid, uid: authUserId });
+        } catch {
+          // fall back to helper (still fine)
+          role = await getMyLeagueRoleSupabase(lid);
+        }
 
         if (!alive) return;
         if (reqId !== roleReqIdRef.current) return;
+
+        if (!role) {
+          setMyRoleLive(LEAGUE_ROLES.member);
+          setInviteStatus({
+            type: "error",
+            message:
+              "Couldn’t read your league role from Supabase. This is usually an RLS policy issue on league_members. (You’ll be view-only until it’s fixed.)",
+          });
+          return;
+        }
 
         setMyRoleLive(role);
-      } catch {
+      } catch (e) {
         if (!alive) return;
         if (reqId !== roleReqIdRef.current) return;
+
         setMyRoleLive(LEAGUE_ROLES.member);
+        setInviteStatus({
+          type: "error",
+          message:
+            "Role check failed (Supabase blocked it). You’ll be view-only until league_members SELECT policy allows members to read their own role. " +
+            `Error: ${humanizeSupabaseError(e)}`,
+        });
       } finally {
         if (!alive) return;
         if (reqId !== roleReqIdRef.current) return;
@@ -520,6 +564,77 @@ export default function LeagueSettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canEdit, stableLeagueId]);
 
+  async function hardRefreshAll() {
+    const lid = cleanLeagueId(stableLeagueId);
+    if (!lid) return;
+
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      await syncActiveLeagueFromSupabase({ leagueId: lid, withRounds: false });
+      setLeagueState(getLeagueSafe({}));
+      setUsersState(ensureArr(getUsers([])));
+
+      if (authUserId) {
+        const r = await getMyLeagueRoleSupabase(lid);
+        setMyRoleLive(r);
+      }
+    } catch (e) {
+      setInviteStatus({ type: "error", message: humanizeSupabaseError(e) });
+    }
+  }
+
+  async function deleteLeagueNow() {
+    const lid = cleanLeagueId(stableLeagueId);
+    if (!lid) return;
+    if (!canEdit || effectiveRole !== LEAGUE_ROLES.host) {
+      setInviteStatus({ type: "error", message: "Only the Host can delete a league." });
+      return;
+    }
+
+    if (deleteConfirm.trim().toUpperCase() !== "DELETE") {
+      setInviteStatus({ type: "info", message: 'Type "DELETE" to confirm.' });
+      return;
+    }
+
+    setDeleteBusy(true);
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      // Best effort cleanup. If your DB has ON DELETE CASCADE, these may be unnecessary.
+      // If any of these fail due to RLS, we’ll surface the error clearly.
+      const steps = [
+        () => supabase.from("league_invites").delete().eq("league_id", lid),
+        () => supabase.from("league_members").delete().eq("league_id", lid),
+        () => supabase.from("rounds").delete().eq("league_id", lid),
+        () => supabase.from("leagues").delete().eq("id", lid),
+      ];
+
+      for (const run of steps) {
+        // eslint-disable-next-line no-await-in-loop
+        const { error } = await run();
+        if (error) throw error;
+      }
+
+      // Unpin active league
+      // eslint-disable-next-line no-void
+      void setActiveLeagueId(null);
+
+      setInviteStatus({ type: "success", message: "League deleted ✅" });
+      navigate("/leagues");
+    } catch (e) {
+      setInviteStatus({
+        type: "error",
+        message:
+          "Delete failed. This is usually an RLS policy or foreign-key constraint issue. " +
+          humanizeSupabaseError(e),
+      });
+    } finally {
+      setDeleteBusy(false);
+      setDeleteConfirm("");
+    }
+  }
+
   if (!stableLeagueId) {
     return (
       <div className="pt-2">
@@ -529,15 +644,25 @@ export default function LeagueSettings() {
           description={
             authLoading
               ? "Checking your account…"
-              : "Open League Settings from a specific league."
+              : "Open League Settings from a specific league, or create a league first."
           }
           actions={
-            <button
-              onClick={() => navigate("/leagues")}
-              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
-            >
-              Back to Leagues
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => navigate("/leagues")}
+                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
+              >
+                Back to Leagues
+              </button>
+
+              <button
+                onClick={() => navigate("/leagues?create=1")}
+                className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-extrabold text-white hover:bg-emerald-500"
+                title="Opens the create league flow"
+              >
+                + Create League
+              </button>
+            </div>
           }
         />
       </div>
@@ -755,15 +880,59 @@ export default function LeagueSettings() {
             : "You can view settings. Only host/co-host can edit."
         }
         right={
-          <button
-            type="button"
-            onClick={() => navigate("/leagues")}
-            className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
-          >
-            Back
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={hardRefreshAll}
+              className="rounded-xl bg-white px-4 py-2 text-sm font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-50"
+              title="Re-sync league + refresh role"
+            >
+              Refresh
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigate("/leagues")}
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800"
+            >
+              Back
+            </button>
+          </div>
         }
       />
+
+      {/* Quick debug (helps you confirm “mismatch” issues instantly) */}
+      <Card className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Current context</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              LeagueId: <span className="font-mono">{stableLeagueId}</span>
+            </div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Your user id (Supabase auth):{" "}
+              <span className="font-mono">{authUserId || "not signed in"}</span>
+            </div>
+          </div>
+
+          <span
+            className={[
+              "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
+              canEdit
+                ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
+                : "bg-slate-50 text-slate-700 ring-slate-200",
+            ].join(" ")}
+          >
+            {canEdit ? "Editing enabled" : "View only"}
+          </span>
+        </div>
+
+        <div className="mt-3 text-[11px] font-semibold text-slate-500">
+          Permissions are based only on Supabase{" "}
+          <span className="font-mono">league_members.role</span>. If role can’t be read due to RLS,
+          you’ll be view-only (safe default).
+        </div>
+      </Card>
 
       {/* Admin status */}
       <Card className="p-5">
@@ -782,8 +951,21 @@ export default function LeagueSettings() {
                 if (!stableLeagueId || !authUserId) return;
                 setRoleLoading(true);
                 try {
-                  const r = await getMyLeagueRoleSupabase(stableLeagueId);
-                  setMyRoleLive(r);
+                  // try direct first; fall back to helper
+                  let r = null;
+                  try {
+                    r = await fetchMyRoleDirect({ lid: stableLeagueId, uid: authUserId });
+                  } catch {
+                    r = await getMyLeagueRoleSupabase(stableLeagueId);
+                  }
+                  setMyRoleLive(r || LEAGUE_ROLES.member);
+                } catch (e) {
+                  setMyRoleLive(LEAGUE_ROLES.member);
+                  setInviteStatus({
+                    type: "error",
+                    message:
+                      "Refresh permissions failed (likely RLS). " + humanizeSupabaseError(e),
+                  });
                 } finally {
                   setRoleLoading(false);
                 }
@@ -810,11 +992,6 @@ export default function LeagueSettings() {
           >
             {canEdit ? "Editing enabled" : "View only"}
           </span>
-        </div>
-
-        <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          Permissions are based only on Supabase{" "}
-          <span className="font-mono">league_members.role</span>.
         </div>
       </Card>
 
@@ -1303,6 +1480,61 @@ export default function LeagueSettings() {
 
         <div className="mt-3 text-[11px] font-semibold text-slate-500">
           Admin actions update Supabase and then re-sync the league cache.
+        </div>
+      </Card>
+
+      {/* Danger zone */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Danger zone</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              If something is broken, the Host can delete the league and start again.
+            </div>
+          </div>
+
+          <span className="rounded-full bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+            Host only
+          </span>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          <div className="rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
+            Deleting a league removes league members, invites, and rounds (best-effort). This can
+            fail if Supabase policies don’t allow deletes.
+          </div>
+
+          <div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+              Type DELETE to confirm
+            </div>
+            <input
+              value={deleteConfirm}
+              onChange={(e) => setDeleteConfirm(e.target.value)}
+              placeholder="DELETE"
+              disabled={deleteBusy || effectiveRole !== LEAGUE_ROLES.host}
+              className={[
+                "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-rose-200 focus:ring-4",
+                deleteBusy || effectiveRole !== LEAGUE_ROLES.host
+                  ? "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed"
+                  : "border-slate-200 bg-white text-slate-900",
+              ].join(" ")}
+            />
+          </div>
+
+          <button
+            type="button"
+            onClick={deleteLeagueNow}
+            disabled={deleteBusy || effectiveRole !== LEAGUE_ROLES.host}
+            className={[
+              "rounded-xl px-4 py-2 text-sm font-extrabold",
+              deleteBusy || effectiveRole !== LEAGUE_ROLES.host
+                ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                : "bg-rose-600 text-white hover:bg-rose-500",
+            ].join(" ")}
+          >
+            {deleteBusy ? "Deleting…" : "Delete league"}
+          </button>
         </div>
       </Card>
     </div>

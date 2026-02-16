@@ -287,6 +287,17 @@ export default function League() {
     cleanLeagueId(getLeagueSafe(null)?.id)
   );
 
+  // ✅ NEW: allow /leagues?create=1 to open the create modal (nice for deep-links)
+  useEffect(() => {
+    try {
+      const sp = new URLSearchParams(location.search || "");
+      const wants = sp.get("create");
+      if (wants === "1" || wants === "true") setShowCreate(true);
+    } catch {
+      // ignore
+    }
+  }, [location.search]);
+
   // Freeze leagueId ASAP from nav state / query
   useEffect(() => {
     const navLeagueId = cleanLeagueId(getLeagueIdFromLocation(location));
