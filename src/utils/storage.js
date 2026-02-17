@@ -165,6 +165,16 @@ function toISODateOrNull(v) {
   return null;
 }
 
+/** ✅ Reject null/undefined/"undefined"/"null"/"" */
+function cleanLeagueId(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  if (low === "undefined" || low === "null") return null;
+  return s;
+}
+
 /* ---------------------------------------------
    Supabase auth helper
 ---------------------------------------------- */
@@ -190,8 +200,9 @@ export function getActiveLeagueId() {
 function setActiveLeagueIdLocal(leagueId) {
   try {
     if (typeof window === "undefined") return;
-    if (!leagueId) window.localStorage.removeItem(scopedKey(KEYS.activeLeagueId));
-    else window.localStorage.setItem(scopedKey(KEYS.activeLeagueId), String(leagueId));
+    const clean = cleanLeagueId(leagueId);
+    if (!clean) window.localStorage.removeItem(scopedKey(KEYS.activeLeagueId));
+    else window.localStorage.setItem(scopedKey(KEYS.activeLeagueId), String(clean));
   } catch {
     // ignore
   }
@@ -202,27 +213,27 @@ function setActiveLeagueIdLocal(leagueId) {
  * and ALWAYS updates local fallback cache.
  */
 export async function setActiveLeagueId(leagueId) {
-  setActiveLeagueIdLocal(leagueId);
+  const clean = cleanLeagueId(leagueId);
+  setActiveLeagueIdLocal(clean);
+
   try {
     const uid = await getAuthedUserId();
-    if (!uid) return leagueId || null;
+    if (!uid) return clean || null;
 
     // Fail-soft if column doesn't exist or RLS blocks it.
-    await supabase.from("profiles").update({ active_league_id: leagueId || null }).eq("id", uid);
-    return leagueId || null;
+    await supabase.from("profiles").update({ active_league_id: clean || null }).eq("id", uid);
+    return clean || null;
   } catch {
-    return leagueId || null;
+    return clean || null;
   }
 }
 
 /**
  * Reads active league preference from Supabase first (profiles.active_league_id),
  * falling back to local.
- *
- * ✅ CHANGE: use maybeSingle() so “no row” doesn’t hard-error and force view-only weirdness.
  */
 export async function getActiveLeagueIdSupabaseFirst() {
-  const local = getActiveLeagueId();
+  const local = cleanLeagueId(getActiveLeagueId());
   try {
     const uid = await getAuthedUserId();
     if (!uid) return local;
@@ -235,7 +246,7 @@ export async function getActiveLeagueIdSupabaseFirst() {
 
     if (error) return local;
 
-    const fromDb = data?.active_league_id || null;
+    const fromDb = cleanLeagueId(data?.active_league_id || null);
     if (fromDb && fromDb !== local) setActiveLeagueIdLocal(fromDb);
     return fromDb || local;
   } catch {
@@ -250,7 +261,6 @@ async function fetchMyLeagueMemberships() {
   const uid = await getAuthedUserId();
   if (!uid) return [];
 
-  // ✅ CHANGE: order newest-first so fallback pick is stable
   const { data, error } = await supabase
     .from("league_members")
     .select("league_id,role,created_at")
@@ -262,56 +272,78 @@ async function fetchMyLeagueMemberships() {
 }
 
 /**
- * IMPORTANT:
- * Only select columns we know exist.
+ * ✅ Robust league fetch:
+ * - Avoid hard failing on column mismatches.
+ * - Use maybeSingle() to prevent “0 rows” becoming a hard throw.
  */
 async function fetchLeagueById(leagueId) {
-  const { data, error } = await supabase
-    .from("leagues")
-    .select("id,name,host_user_id,points_system,created_at")
-    .eq("id", leagueId)
-    .single();
+  const id = cleanLeagueId(leagueId);
+  if (!id) return null;
 
-  if (error) throw error;
-  return data || null;
+  const attempts = [
+    // common newer schema (created_by)
+    "id,name,created_by,points_system,created_at",
+    // your current selection shape (host_user_id)
+    "id,name,host_user_id,points_system,created_at",
+    // minimal (always should exist)
+    "id,name,created_at",
+  ];
+
+  let lastErr = null;
+
+  for (const cols of attempts) {
+    // eslint-disable-next-line no-await-in-loop
+    const { data, error } = await supabase.from("leagues").select(cols).eq("id", id).maybeSingle();
+    if (!error) return data || null;
+    lastErr = error;
+
+    const msg = String(error?.message || "").toLowerCase();
+    // try next selection if the column doesn't exist
+    if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+    break;
+  }
+
+  throw lastErr || new Error("Failed to fetch league.");
 }
 
 async function fetchLeagueMembers(leagueId) {
+  const id = cleanLeagueId(leagueId);
+  if (!id) return [];
+
   const { data, error } = await supabase
     .from("league_members")
     .select("user_id,role")
-    .eq("league_id", leagueId);
-
-  if (error) throw error;
-  return ensureArr(data);
-}
-
-async function fetchProfilesByIds(userIds) {
-  const ids = ensureArr(userIds).filter(Boolean);
-  if (!ids.length) return [];
-
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id,email,display_name,created_at")
-    .in("id", ids);
+    .eq("league_id", id);
 
   if (error) throw error;
   return ensureArr(data);
 }
 
 /**
- * ROUNDS (Supabase) — minimal assumptions:
- * - table: rounds
- * - has: id, league_id, user_id, created_at
- * - and other fields your app uses (score, playerId, etc.)
- *
- * We select * to avoid breaking if you store extra fields.
+ * ✅ Keep profile fetch LIGHT to avoid RLS stalls / heavy policies.
+ * We only need names for UI.
+ */
+async function fetchProfilesByIds(userIds) {
+  const ids = ensureArr(userIds).filter(Boolean);
+  if (!ids.length) return [];
+
+  const { data, error } = await supabase.from("profiles").select("id,display_name").in("id", ids);
+  if (error) throw error;
+  return ensureArr(data);
+}
+
+/**
+ * ROUNDS (Supabase)
  */
 async function fetchRoundsByLeagueId(leagueId) {
+  const id = cleanLeagueId(leagueId);
+  if (!id) return [];
+
   const { data, error } = await supabase
     .from("rounds")
     .select("*")
-    .eq("league_id", leagueId)
+    .eq("league_id", id)
     .order("created_at", { ascending: false });
 
   if (error) throw error;
@@ -327,48 +359,36 @@ export const LEAGUE_ROLES = {
   member: "member",
 };
 
-/**
- * ✅ CHANGE (fixes “still view only” when DB uses a slightly different role string):
- * Accept common variants like:
- * - "cohost", "co-host", "co host", "co_host"
- * - "HOST", "Host"
- */
 function normalizeRole(role) {
   const raw = String(role || "").trim().toLowerCase();
   if (!raw) return LEAGUE_ROLES.member;
 
   if (raw === "host") return LEAGUE_ROLES.host;
 
-  // co-host variants
   if (raw === "co_host" || raw === "cohost" || raw === "co-host" || raw === "co host") {
     return LEAGUE_ROLES.co_host;
   }
 
   if (raw === "member") return LEAGUE_ROLES.member;
 
-  // default fail-soft
   return LEAGUE_ROLES.member;
 }
 
-/**
- * ✅ Source-of-truth permission check.
- * NEVER use cached roles for permissions.
- *
- * ✅ CHANGE: maybeSingle() so “no row” doesn’t throw; we default to member.
- */
 export async function getMyLeagueRoleSupabase(leagueId) {
-  if (!leagueId) return LEAGUE_ROLES.member;
+  const lid = cleanLeagueId(leagueId);
+  if (!lid) return LEAGUE_ROLES.member;
+
   const uid = await getAuthedUserId();
   if (!uid) return LEAGUE_ROLES.member;
 
   const { data, error } = await supabase
     .from("league_members")
     .select("role")
-    .eq("league_id", leagueId)
+    .eq("league_id", lid)
     .eq("user_id", uid)
     .maybeSingle();
 
-  if (error) return LEAGUE_ROLES.member; // fail-soft: view-only
+  if (error) return LEAGUE_ROLES.member;
   return normalizeRole(data?.role);
 }
 
@@ -377,22 +397,21 @@ export async function isMyLeagueAdminSupabase(leagueId) {
   return role === LEAGUE_ROLES.host || role === LEAGUE_ROLES.co_host;
 }
 
-/**
- * Toggle co-host in Supabase. Only a host/co_host should be allowed by RLS.
- * After calling this, the UI should call syncActiveLeagueFromSupabase({ leagueId }).
- */
 export async function setMemberRoleSupabase({ leagueId, userId, role }) {
-  if (!leagueId || !userId) throw new Error("Missing leagueId/userId");
+  const lid = cleanLeagueId(leagueId);
+  const uid = cleanLeagueId(userId);
+  if (!lid || !uid) throw new Error("Missing leagueId/userId");
+
   const nextRole = normalizeRole(role);
 
   const { error } = await supabase
     .from("league_members")
     .update({ role: nextRole })
-    .eq("league_id", leagueId)
-    .eq("user_id", userId);
+    .eq("league_id", lid)
+    .eq("user_id", uid);
 
   if (error) throw error;
-  return { leagueId, userId, role: nextRole };
+  return { leagueId: lid, userId: uid, role: nextRole };
 }
 
 /* ---------------------------------------------
@@ -431,7 +450,9 @@ function normalizeLeague(league) {
   const members = ensureArr(l.members);
   const memberRoles = normalizeMemberRoles({ ...l, members });
 
-  const seasonStartISO = isISODateString(l.seasonStartISO) ? l.seasonStartISO : new Date().toISOString();
+  const seasonStartISO = isISODateString(l.seasonStartISO)
+    ? l.seasonStartISO
+    : new Date().toISOString();
   const seasonEndISO = isISODateString(l.seasonEndISO) ? l.seasonEndISO : null;
 
   return { ...l, members, memberRoles, seasonStartISO, seasonEndISO };
@@ -487,7 +508,9 @@ function normalizePointsSystem(ps) {
       ? raw.mode
       : DEFAULT_POINTS_SYSTEM.mode;
 
-  const placementPoints = normalizePlacementPoints(raw.placementPoints ?? raw.placement ?? raw.pointsTable);
+  const placementPoints = normalizePlacementPoints(
+    raw.placementPoints ?? raw.placement ?? raw.pointsTable
+  );
 
   const participationRaw = ensureObj(raw.participation);
   const participation = {
@@ -537,14 +560,13 @@ function normalizePointsSystem(ps) {
     placementPoints,
     participation,
     bonuses,
-    extras: { enabled: Boolean(extrasRaw.enabled ?? DEFAULT_POINTS_SYSTEM.extras.enabled), ...extrasRaw },
+    extras: {
+      enabled: Boolean(extrasRaw.enabled ?? DEFAULT_POINTS_SYSTEM.extras.enabled),
+      ...extrasRaw,
+    },
   };
 }
 
-/**
- * Returns points system from cached league object (UI cache),
- * but the SOURCE OF TRUTH update happens via setPointsSystemSupabase.
- */
 export function getPointsSystem(fallback = null) {
   const league = getLeagueSafe({});
   const stored = league?.pointsSystem;
@@ -554,11 +576,6 @@ export function getPointsSystem(fallback = null) {
   return normalizePointsSystem(stored);
 }
 
-/**
- * ✅ Back-compat: old callers expect a sync function named setPointsSystem().
- * During migration we keep this, but it only updates the UI cache.
- * Supabase truth update must be done with setPointsSystemSupabase().
- */
 export function setPointsSystem(pointsSystem) {
   const league = getLeagueSafe({});
   const current = getPointsSystem(DEFAULT_POINTS_SYSTEM);
@@ -567,20 +584,17 @@ export function setPointsSystem(pointsSystem) {
   return merged;
 }
 
-/**
- * ✅ Supabase truth update for leagues.points_system.
- * Also updates local UI cache.
- */
 export async function setPointsSystemSupabase({ leagueId, pointsSystem }) {
-  if (!leagueId) throw new Error("Missing leagueId");
+  const lid = cleanLeagueId(leagueId);
+  if (!lid) throw new Error("Missing leagueId");
+
   const merged = normalizePointsSystem(pointsSystem || DEFAULT_POINTS_SYSTEM);
 
-  const { error } = await supabase.from("leagues").update({ points_system: merged }).eq("id", leagueId);
+  const { error } = await supabase.from("leagues").update({ points_system: merged }).eq("id", lid);
   if (error) throw error;
 
-  // Update UI cache
   const league = getLeagueSafe({});
-  if (league?.id && String(league.id) === String(leagueId)) {
+  if (league?.id && String(league.id) === String(lid)) {
     setLeagueSafe({ ...league, pointsSystem: merged });
   }
 
@@ -600,8 +614,9 @@ export function setRounds(rounds) {
 export async function syncRoundsFromSupabase({ leagueId }) {
   const cached = getRounds([]);
   try {
-    if (!leagueId) return cached;
-    const rows = await fetchRoundsByLeagueId(leagueId);
+    const lid = cleanLeagueId(leagueId);
+    if (!lid) return cached;
+    const rows = await fetchRoundsByLeagueId(lid);
     setRounds(rows);
     return rows;
   } catch {
@@ -610,12 +625,14 @@ export async function syncRoundsFromSupabase({ leagueId }) {
 }
 
 export async function addRoundSupabase({ leagueId, round }) {
-  if (!leagueId) throw new Error("Missing leagueId");
+  const lid = cleanLeagueId(leagueId);
+  if (!lid) throw new Error("Missing leagueId");
+
   const uid = await getAuthedUserId();
 
   const payload = {
     ...ensureObj(round),
-    league_id: leagueId,
+    league_id: lid,
     user_id: uid || ensureObj(round)?.user_id || null,
   };
 
@@ -628,32 +645,36 @@ export async function addRoundSupabase({ leagueId, round }) {
 }
 
 export async function updateRoundSupabase({ roundId, patch }) {
-  if (!roundId) throw new Error("Missing roundId");
+  const rid = cleanLeagueId(roundId);
+  if (!rid) throw new Error("Missing roundId");
 
-  const { data, error } = await supabase.from("rounds").update(ensureObj(patch)).eq("id", roundId).select("*").single();
+  const { data, error } = await supabase
+    .from("rounds")
+    .update(ensureObj(patch))
+    .eq("id", rid)
+    .select("*")
+    .single();
+
   if (error) throw error;
 
   const current = getRounds([]);
-  const next = current.map((r) => (r?.id === roundId ? data : r));
+  const next = current.map((r) => (r?.id === rid ? data : r));
   setRounds(next);
   return data;
 }
 
 export async function deleteRoundSupabase({ roundId }) {
-  if (!roundId) throw new Error("Missing roundId");
+  const rid = cleanLeagueId(roundId);
+  if (!rid) throw new Error("Missing roundId");
 
-  const { error } = await supabase.from("rounds").delete().eq("id", roundId);
+  const { error } = await supabase.from("rounds").delete().eq("id", rid);
   if (error) throw error;
 
   const current = getRounds([]);
-  setRounds(current.filter((r) => r?.id !== roundId));
+  setRounds(current.filter((r) => r?.id !== rid));
   return true;
 }
 
-/**
- * Backwards compat helpers (LOCAL ONLY) — keep during migration,
- * but your League pages should use the Supabase async versions.
- */
 export function addRound(round) {
   const rounds = getRounds([]);
   const next = [round, ...rounds];
@@ -670,18 +691,16 @@ export function getRoundsByPlayer(playerId) {
    ✅ MAIN SYNC: Supabase -> UI cache hydration
 ---------------------------------------------- */
 export async function resolveLeagueIdSupabaseFirst({ preferredLeagueId = null } = {}) {
-  // 1) preferred input
-  if (preferredLeagueId) return String(preferredLeagueId);
+  const preferred = cleanLeagueId(preferredLeagueId);
+  if (preferred) return String(preferred);
 
-  // 2) supabase profile active_league_id (if exists) else local
-  const fromPref = await getActiveLeagueIdSupabaseFirst();
+  const fromPref = cleanLeagueId(await getActiveLeagueIdSupabaseFirst());
   if (fromPref) return String(fromPref);
 
-  // 3) membership fallback (most recent membership)
   try {
     const memberships = await fetchMyLeagueMemberships();
     if (memberships.length) {
-      const pick = memberships[0]?.league_id || null;
+      const pick = cleanLeagueId(memberships[0]?.league_id || null);
       if (pick) {
         await setActiveLeagueId(pick);
         return String(pick);
@@ -699,8 +718,12 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
   const cachedUsers = ensureArr(getUsers([]));
   const cachedRounds = ensureArr(getRounds([]));
 
+  const requested = cleanLeagueId(leagueId);
+
   try {
-    const activeId = await resolveLeagueIdSupabaseFirst({ preferredLeagueId: leagueId });
+    const activeId = cleanLeagueId(
+      await resolveLeagueIdSupabaseFirst({ preferredLeagueId: requested })
+    );
 
     if (!activeId) {
       return {
@@ -710,17 +733,43 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
       };
     }
 
+    // Always pin locally (and try Supabase preference)
     await setActiveLeagueId(activeId);
 
+    // Fetch league (robust)
     const leagueRow = await fetchLeagueById(activeId);
+
+    // If we can’t read the league row (blocked / missing), do NOT return null.
+    // Return a minimal league so the UI doesn’t get stuck on “No league yet”.
+    if (!leagueRow?.id) {
+      const minimal = normalizeLeague({
+        id: activeId,
+        name: cachedLeague?.name || "League",
+        members: ensureArr(cachedLeague?.members),
+        memberRoles: ensureObj(cachedLeague?.memberRoles),
+        pointsSystem: cachedLeague?.pointsSystem || null,
+        seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
+        seasonEndISO: cachedLeague?.seasonEndISO || null,
+      });
+
+      setLeagueSafe(minimal);
+
+      let rounds = cachedRounds;
+      if (withRounds) rounds = await syncRoundsFromSupabase({ leagueId: activeId });
+
+      return { league: minimal, users: cachedUsers, rounds };
+    }
+
+    // Members + profiles (light)
     const members = await fetchLeagueMembers(activeId);
     const memberIds = ensureArr(members).map((m) => m.user_id).filter(Boolean);
+
     const profiles = await fetchProfilesByIds(memberIds);
 
     const users = profiles.map((p) => ({
       id: p.id,
-      name: p.display_name || (p.email ? p.email.split("@")[0] : "Golfer"),
-      email: p.email || null,
+      name: p.display_name || "Golfer",
+      email: null, // keep null to avoid email RLS pain during migration
     }));
 
     // UI cache only — DO NOT use for permissions
@@ -733,10 +782,10 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
     const nextLeague = normalizeLeague({
       id: leagueRow?.id,
       name: leagueRow?.name || "League",
-      host_user_id: leagueRow?.host_user_id || null,
+      host_user_id: leagueRow?.host_user_id || leagueRow?.created_by || null,
       members: memberIds,
       memberRoles,
-      pointsSystem: leagueRow?.points_system || null,
+      pointsSystem: leagueRow?.points_system || leagueRow?.points_system || null,
       seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
       seasonEndISO: cachedLeague?.seasonEndISO || null,
     });
@@ -749,6 +798,22 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
 
     return { league: nextLeague, users, rounds };
   } catch {
+    // If create just happened and we have a leagueId, do NOT return null.
+    // Return minimal shell league to prevent “No league yet” lock.
+    if (requested) {
+      const minimal = normalizeLeague({
+        id: requested,
+        name: cachedLeague?.name || "League",
+        members: ensureArr(cachedLeague?.members),
+        memberRoles: ensureObj(cachedLeague?.memberRoles),
+        pointsSystem: cachedLeague?.pointsSystem || null,
+        seasonStartISO: cachedLeague?.seasonStartISO || new Date().toISOString(),
+        seasonEndISO: cachedLeague?.seasonEndISO || null,
+      });
+      setLeagueSafe(minimal);
+      return { league: minimal, users: cachedUsers, rounds: cachedRounds };
+    }
+
     return {
       league: cachedLeague?.id ? cachedLeague : null,
       users: cachedUsers,
@@ -762,7 +827,12 @@ export const syncActiveLeagueFromSupabaseHydrate = syncActiveLeagueFromSupabase;
 /* ---------------------------------------------
    POINTS CALC HELPERS (pure)
 ---------------------------------------------- */
-export function calculateLeaguePoints({ place = null, bonusFlags = {}, played = true, pointsSystem = null } = {}) {
+export function calculateLeaguePoints({
+  place = null,
+  bonusFlags = {},
+  played = true,
+  pointsSystem = null,
+} = {}) {
   const ps = normalizePointsSystem(pointsSystem || getPointsSystem(DEFAULT_POINTS_SYSTEM));
   const p = toInt(place, NaN);
 
