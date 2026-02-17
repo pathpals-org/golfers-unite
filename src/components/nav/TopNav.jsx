@@ -1,7 +1,7 @@
 // src/components/nav/TopNav.jsx
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../../auth/useAuth";
-import { signOut } from "../../auth/auth";
+import { signOut, hardSignOut } from "../../auth/auth";
 
 const main = [
   { to: "/", label: "Feed" },
@@ -36,20 +36,12 @@ export default function TopNav() {
   const handleLogout = async () => {
     try {
       await signOut();
-
       // Replace so you can’t “Back” into protected pages
       navigate("/login", { replace: true });
-
-      // Hard refresh to kill any stale cached state in memory
-      setTimeout(() => {
-        try {
-          window.location.reload();
-        } catch {
-          // ignore
-        }
-      }, 50);
     } catch (e) {
-      console.error("Logout failed:", e);
+      console.error("Logout failed, forcing hard sign out:", e);
+      // ✅ guaranteed cleanup + redirect
+      await hardSignOut();
     }
   };
 
@@ -148,6 +140,8 @@ export default function TopNav() {
     </header>
   );
 }
+
+
 
 
 

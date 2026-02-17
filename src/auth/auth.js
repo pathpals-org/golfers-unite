@@ -1,13 +1,15 @@
 // src/auth/auth.js
 import { supabase } from "../lib/supabaseClient";
+import { getStorageUserId, setStorageUserId, KEYS } from "../utils/storage";
 
 function clearSupabaseAuthStorageKeys() {
   try {
-    const keys = Object.keys(localStorage);
+    if (typeof window === "undefined") return;
+    const keys = Object.keys(window.localStorage);
     keys.forEach((k) => {
-      if (k.startsWith("sb-") && k.includes("-auth-token")) localStorage.removeItem(k);
+      if (k.startsWith("sb-") && k.includes("-auth-token")) window.localStorage.removeItem(k);
       if (k.toLowerCase().includes("supabase") && k.toLowerCase().includes("auth")) {
-        localStorage.removeItem(k);
+        window.localStorage.removeItem(k);
       }
     });
   } catch {
@@ -15,8 +17,35 @@ function clearSupabaseAuthStorageKeys() {
   }
 }
 
-function clearIdentityCaches() {
+/**
+ * ✅ Clear *scoped* app caches for the current storage user.
+ * Your storage.js scopes keys like: `${uid}::${baseKey}`
+ * So clearing plain "users" etc does NOTHING once scoping exists.
+ */
+function clearScopedAppCachesForUser(userId) {
   try {
+    if (typeof window === "undefined") return;
+    if (!userId) return;
+
+    const prefix = `${String(userId)}::`;
+    const keys = Object.keys(window.localStorage);
+
+    keys.forEach((k) => {
+      if (k.startsWith(prefix)) window.localStorage.removeItem(k);
+    });
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * ✅ Clear any legacy/unscoped caches (best-effort)
+ * (kept because you had these in earlier versions)
+ */
+function clearLegacyIdentityCaches() {
+  try {
+    if (typeof window === "undefined") return;
+
     const keysToRemove = [
       "users",
       "currentUser",
@@ -27,10 +56,14 @@ function clearIdentityCaches() {
       "gu_current_user",
       "golfers_unite_users",
       "golfers_unite_current_user",
+
+      // also clear unscoped active league id if it ever existed
+      KEYS?.activeLeagueId || "__golfers_unite_active_league_id__",
     ];
+
     keysToRemove.forEach((k) => {
       try {
-        localStorage.removeItem(k);
+        window.localStorage.removeItem(k);
       } catch {
         // ignore
       }
@@ -51,21 +84,19 @@ function normUsername(v) {
 /**
  * Signup flow:
  * 1) Create auth user
- * 2) Create/Upsert matching profiles row (so friends search works)
+ * 2) Best-effort create/Upsert matching profiles row
  *
- * IMPORTANT:
- * - We store email in profiles because your Friends page searches profiles.email
- * - We use upsert to avoid “retry creates duplicate” failures
+ * ✅ IMPORTANT:
+ * If email confirmation is enabled, a session may NOT exist yet.
+ * In that case, profile upsert can be blocked by RLS.
+ * So we attempt it, but we NEVER let it break signup success.
  */
 export async function signUp({ email, password, username }) {
   const cleanEmail = normEmail(email);
   const cleanUsername = normUsername(username);
 
-  // Basic client-side safety (don’t rely on this for security)
   if (!cleanEmail.includes("@")) throw new Error("Please enter a valid email.");
-  if (!password || String(password).length < 6) {
-    throw new Error("Password must be at least 6 characters.");
-  }
+  if (!password || String(password).length < 6) throw new Error("Password must be at least 6 characters.");
   if (!cleanUsername) throw new Error("Please enter a username.");
 
   const { data, error } = await supabase.auth.signUp({
@@ -73,18 +104,14 @@ export async function signUp({ email, password, username }) {
     password,
   });
 
-  if (error) {
-    // Throw the REAL supabase message so the UI can show it (no more guessing)
-    throw error;
-  }
+  if (error) throw error;
 
   const user = data?.user ?? null;
   if (!user?.id) throw new Error("No user returned from signUp");
 
-  // ✅ Make sure profiles row exists and has email
-  const { error: profileError } = await supabase
-    .from("profiles")
-    .upsert(
+  // ✅ Best-effort profile row (fail-soft if RLS blocks due to no session)
+  try {
+    await supabase.from("profiles").upsert(
       {
         id: user.id,
         email: user.email ?? cleanEmail,
@@ -93,10 +120,8 @@ export async function signUp({ email, password, username }) {
       },
       { onConflict: "id" }
     );
-
-  if (profileError) {
-    // If this fails, you’ll see the real DB error in the UI/console
-    throw profileError;
+  } catch {
+    // ignore — profile can be created later or via trigger
   }
 
   return user;
@@ -111,17 +136,61 @@ export async function signIn({ email, password }) {
   });
 
   if (error) throw error;
+
+  // ✅ Immediately scope storage to this user to prevent cross-account bleed
+  const uid = data?.user?.id || null;
+  if (uid) setStorageUserId(uid);
+
   return data?.user ?? null;
 }
 
+/**
+ * Normal sign out:
+ * - calls supabase signOut
+ * - clears supabase tokens (best-effort)
+ * - clears scoped app caches for the currently scoped storage user
+ * - clears legacy caches
+ * - unsets storage user id
+ */
 export async function signOut() {
+  // Grab current storage scope BEFORE we clear it
+  const scopedUid = getStorageUserId();
+
   try {
     await supabase.auth.signOut();
   } catch {
     // ignore
   } finally {
     clearSupabaseAuthStorageKeys();
-    clearIdentityCaches();
+
+    if (scopedUid) clearScopedAppCachesForUser(scopedUid);
+
+    clearLegacyIdentityCaches();
+    setStorageUserId(null);
   }
 }
+
+/**
+ * ✅ Hard sign out:
+ * Use this if you ever get stuck in a broken auth state.
+ * It nukes tokens and caches even if supabase.signOut fails.
+ */
+export async function hardSignOut() {
+  const scopedUid = getStorageUserId();
+
+  try {
+    await supabase.auth.signOut();
+  } catch {
+    // ignore
+  } finally {
+    clearSupabaseAuthStorageKeys();
+    if (scopedUid) clearScopedAppCachesForUser(scopedUid);
+    clearLegacyIdentityCaches();
+    setStorageUserId(null);
+
+    // Hard reload guarantees app state is clean
+    if (typeof window !== "undefined") window.location.href = "/login";
+  }
+}
+
 

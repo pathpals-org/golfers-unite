@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, Link } from "react-router-dom";
 import { signUp } from "../auth/auth";
 import { useAuth } from "../auth/useAuth";
+import { supabase } from "../lib/supabaseClient";
 
 function humanAuthError(message) {
   const msg = String(message || "").toLowerCase();
@@ -36,8 +37,12 @@ export default function Signup() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [username, setUsername] = useState("");
+
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // If signup requires email confirmation, Supabase may NOT return a session.
+  const [needsEmailConfirm, setNeedsEmailConfirm] = useState(false);
 
   // Already logged in → go where they intended
   useEffect(() => {
@@ -51,6 +56,7 @@ export default function Signup() {
     if (busy) return;
 
     setError("");
+    setNeedsEmailConfirm(false);
 
     const cleanUsername = username.trim();
     const cleanEmail = email.trim();
@@ -68,7 +74,18 @@ export default function Signup() {
 
     try {
       await signUp({ email: cleanEmail, password, username: cleanUsername });
-      navigate(fromPath, { replace: true });
+
+      // ✅ Sanity check: do we have a session now?
+      const { data } = await supabase.auth.getSession();
+
+      if (data?.session) {
+        // Session exists → proceed normally
+        navigate(fromPath, { replace: true });
+        return;
+      }
+
+      // No session → email confirmation is likely required
+      setNeedsEmailConfirm(true);
     } catch (err) {
       setError(humanAuthError(err?.message));
     } finally {
@@ -88,9 +105,13 @@ export default function Signup() {
   return (
     <div className="mx-auto mt-10 max-w-sm rounded-2xl bg-white p-6 shadow-sm">
       <h1 className="text-xl font-semibold text-slate-900">Join Golfers Unite</h1>
-      <p className="mt-1 text-sm text-slate-600">
-        Leagues, rounds, and proper golf banter.
-      </p>
+      <p className="mt-1 text-sm text-slate-600">Leagues, rounds, and proper golf banter.</p>
+
+      {needsEmailConfirm ? (
+        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">
+          Account created ✅ Now check your email to confirm your address, then come back and log in.
+        </div>
+      ) : null}
 
       <form onSubmit={handleSubmit} className="mt-6 space-y-4">
         <input
@@ -124,7 +145,7 @@ export default function Signup() {
           autoComplete="new-password"
         />
 
-        {error && <p className="text-sm text-red-600">{error}</p>}
+        {error ? <p className="text-sm text-red-600">{error}</p> : null}
 
         <button
           disabled={busy}
@@ -143,4 +164,5 @@ export default function Signup() {
     </div>
   );
 }
+
 

@@ -18,22 +18,24 @@ function withTimeout(promise, ms, label = "Request") {
 async function fetchMyProfile(userId) {
   if (!userId) return null;
 
-  // ✅ IMPORTANT:
-  // Your profiles table does NOT have `updated_at` (Supabase error 42703).
-  // If you later add the column, you can put it back — for now, remove it.
-  const { data, error } = await withTimeout(
-    supabase
-      .from("profiles")
-      .select("id, username, display_name, avatar_url, handicap_index, created_at")
-      .eq("id", userId)
-      .maybeSingle(),
-    15000,
-    "Load profile"
-  );
+  // ✅ Profiles fetch is allowed to time out WITHOUT breaking auth.
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from("profiles")
+        .select("id, username, display_name, avatar_url, handicap_index, created_at")
+        .eq("id", userId)
+        .maybeSingle(),
+      20000,
+      "Load profile"
+    );
 
-  // RLS block or missing row = null (never block UI)
-  if (error) return null;
-  return data ?? null;
+    // RLS block or missing row = null (never block UI)
+    if (error) return null;
+    return data ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function isInvalidRefreshTokenError(err) {
@@ -72,13 +74,9 @@ export function AuthProvider({ children }) {
     const userId = overrideUserId ?? user?.id ?? null;
     if (!userId) return null;
 
-    try {
-      const p = await fetchMyProfile(userId);
-      if (mountedRef.current && p) setProfile(p);
-      return p;
-    } catch {
-      return null;
-    }
+    const p = await fetchMyProfile(userId);
+    if (mountedRef.current && p) setProfile(p);
+    return p;
   };
 
   useEffect(() => {
@@ -86,9 +84,11 @@ export function AuthProvider({ children }) {
 
     const safeClearSession = async (reason) => {
       try {
+        // eslint-disable-next-line no-console
         console.warn("Clearing auth session:", reason);
         await supabase.auth.signOut();
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.warn("supabase.auth.signOut failed, doing local cleanup:", e);
       } finally {
         clearSupabaseAuthStorageKeys();
@@ -105,19 +105,24 @@ export function AuthProvider({ children }) {
       setLoading(true);
 
       try {
-        const { data, error } = await withTimeout(supabase.auth.getSession(), 15000, "Auth session");
+        // ✅ IMPORTANT: DO NOT timeout getSession().
+        // Timeouts here cause “signed in but user null” when Supabase is just slow.
+        const { data, error } = await supabase.auth.getSession();
 
         if (!mountedRef.current) return;
 
         if (error) {
+          // eslint-disable-next-line no-console
           console.error("supabase.auth.getSession error:", error);
+
           if (isInvalidRefreshTokenError(error)) {
             await safeClearSession("Invalid refresh token during getSession()");
           } else {
+            // fail-soft: treat as no session without nuking storage
             setSession(null);
             setUser(null);
-            setProfile(null);
             setStorageUserId(null);
+            // keep profile as-is (don’t force null)
           }
           return;
         }
@@ -128,29 +133,25 @@ export function AuthProvider({ children }) {
         setStorageUserId(s?.user?.id || null);
 
         if (s?.user?.id) {
-          try {
-            const p = await fetchMyProfile(s.user.id);
-            if (!mountedRef.current) return;
-            // ✅ only overwrite profile if we actually got one
-            if (p) setProfile(p);
-          } catch (e) {
-            console.warn("Profile load failed during bootstrap:", e);
-            // ✅ keep whatever profile we had (don’t force null)
-          }
+          const p = await fetchMyProfile(s.user.id);
+          if (!mountedRef.current) return;
+          if (p) setProfile(p);
         } else {
           setProfile(null);
         }
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.error("Auth bootstrap error:", e);
         if (!mountedRef.current) return;
 
         if (isInvalidRefreshTokenError(e)) {
           await safeClearSession("Invalid refresh token thrown during bootstrap");
         } else {
+          // fail-soft: do not wipe local storage unless you KNOW it’s invalid tokens
           setSession(null);
           setUser(null);
-          setProfile(null);
           setStorageUserId(null);
+          // keep profile as-is
         }
       } finally {
         if (mountedRef.current) setLoading(false);
@@ -166,25 +167,16 @@ export function AuthProvider({ children }) {
       setUser(newSession?.user ?? null);
       setStorageUserId(newSession?.user?.id || null);
 
-      // ✅ Don’t flip profile to null just because profile fetch is slow
+      // If signed out
       if (!newSession?.user?.id) {
         setProfile(null);
         return;
       }
 
-      try {
-        const p = await fetchMyProfile(newSession.user.id);
-        if (!mountedRef.current) return;
-        if (p) setProfile(p);
-      } catch (e) {
-        console.error("Profile refresh after auth change failed:", e);
-        if (!mountedRef.current) return;
-
-        if (isInvalidRefreshTokenError(e)) {
-          await safeClearSession("Invalid refresh token during onAuthStateChange");
-        }
-        // ✅ otherwise: keep existing profile as-is
-      }
+      // Profile refresh is fail-soft
+      const p = await fetchMyProfile(newSession.user.id);
+      if (!mountedRef.current) return;
+      if (p) setProfile(p);
     });
 
     return () => {

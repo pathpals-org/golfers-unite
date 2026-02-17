@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, Link } from "react-router-dom";
 import { signIn } from "../auth/auth";
 import { useAuth } from "../auth/useAuth";
+import { supabase } from "../lib/supabaseClient";
 
 function humanAuthError(message) {
   const msg = String(message || "").toLowerCase();
@@ -12,6 +13,9 @@ function humanAuthError(message) {
   if (msg.includes("too many requests")) return "Too many attempts. Try again in a moment.";
   if (msg.includes("network") || msg.includes("failed to fetch")) {
     return "Network issue — check your connection and try again.";
+  }
+  if (msg.includes("no session")) {
+    return "Login didn’t stick (no session created). Refresh and try again — if it keeps happening, we’ll fix the auth storage/redirect.";
   }
   return "Login failed. Please try again.";
 }
@@ -69,10 +73,17 @@ export default function Login() {
     try {
       await signIn({ email: e1, password });
 
-      // ✅ IMPORTANT:
-      // Do NOT navigate immediately.
-      // Let AuthProvider onAuthStateChange / bootstrap set `user`,
-      // then the useEffect above redirects correctly.
+      // ✅ Sanity check: confirm we actually have a Supabase session.
+      // This prevents “sign in succeeded but user stays null forever”.
+      const { data } = await supabase.auth.getSession();
+      if (!data?.session) {
+        throw new Error("No session created after login");
+      }
+
+      // ✅ Do NOT navigate here. AuthProvider will set user, then effect redirects.
+      // However, if AuthProvider is slow, we allow the UI to stay responsive:
+      // busy remains true briefly, then we release after a short delay.
+      setTimeout(() => setBusy(false), 1200);
     } catch (err) {
       setError(humanAuthError(err?.message));
       setBusy(false);
@@ -143,7 +154,6 @@ export default function Login() {
         </Link>
       </p>
 
-      {/* ✅ If login succeeded but context hasn’t updated yet, we show a gentle hint */}
       {busy ? (
         <p className="mt-3 text-xs font-semibold text-slate-500">
           Signing you in… if this takes more than a few seconds, refresh the page.
@@ -152,5 +162,3 @@ export default function Login() {
     </div>
   );
 }
-
-
