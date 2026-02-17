@@ -26,6 +26,10 @@ import {
 
   // cache-only season helpers (UI-only)
   setLeagueSeasonDates,
+
+  // ✅ low-level cache helpers so we can “reset after delete”
+  KEYS,
+  remove,
 } from "../utils/storage";
 
 function ensureArr(v) {
@@ -389,7 +393,6 @@ export default function LeagueSettings() {
 
   /**
    * ✅ Fetch my role from Supabase (source of truth) whenever leagueId/auth changes.
-   * If role fetch is blocked by RLS, we keep you in view-only (safe) BUT we show an explicit error.
    */
   useEffect(() => {
     let alive = true;
@@ -406,13 +409,11 @@ export default function LeagueSettings() {
       setInviteStatus((s) => (s?.type === "error" ? { type: "", message: "" } : s));
 
       try {
-        // Try direct query first (helps debug + avoids any helper mismatch)
         let role = null;
 
         try {
           role = await fetchMyRoleDirect({ lid, uid: authUserId });
         } catch {
-          // fall back to helper (still fine)
           role = await getMyLeagueRoleSupabase(lid);
         }
 
@@ -584,6 +585,18 @@ export default function LeagueSettings() {
     }
   }
 
+  // ✅ Central reset used after delete so you DON'T have to log out/in
+  function clearLeagueUiCachesNow() {
+    try {
+      remove(KEYS.league);
+      remove(KEYS.users);
+      remove(KEYS.rounds);
+      remove(KEYS.activeLeagueId);
+    } catch {
+      // ignore
+    }
+  }
+
   async function deleteLeagueNow() {
     const lid = cleanLeagueId(stableLeagueId);
     if (!lid) return;
@@ -602,7 +615,6 @@ export default function LeagueSettings() {
 
     try {
       // Best effort cleanup. If your DB has ON DELETE CASCADE, these may be unnecessary.
-      // If any of these fail due to RLS, we’ll surface the error clearly.
       const steps = [
         () => supabase.from("league_invites").delete().eq("league_id", lid),
         () => supabase.from("league_members").delete().eq("league_id", lid),
@@ -616,12 +628,22 @@ export default function LeagueSettings() {
         if (error) throw error;
       }
 
-      // Unpin active league
-      // eslint-disable-next-line no-void
-      void setActiveLeagueId(null);
+      // ✅ HARD RESET after delete:
+      // - unpin active league in Supabase + local
+      // - clear cached league/users/rounds so UI doesn't chase a dead leagueId
+      await setActiveLeagueId(null);
+      clearLeagueUiCachesNow();
+
+      // Reset in-memory state too
+      setLeagueId(null);
+      setLeagueState(getLeagueSafe({}));
+      setUsersState(ensureArr(getUsers([])));
+      setMyRoleLive(null);
 
       setInviteStatus({ type: "success", message: "League deleted ✅" });
-      navigate("/leagues");
+
+      // ✅ go back cleanly (replace avoids “back into deleted league settings”)
+      navigate("/leagues", { replace: true, state: { justDeleted: true } });
     } catch (e) {
       setInviteStatus({
         type: "error",
@@ -963,8 +985,7 @@ export default function LeagueSettings() {
                   setMyRoleLive(LEAGUE_ROLES.member);
                   setInviteStatus({
                     type: "error",
-                    message:
-                      "Refresh permissions failed (likely RLS). " + humanizeSupabaseError(e),
+                    message: "Refresh permissions failed (likely RLS). " + humanizeSupabaseError(e),
                   });
                 } finally {
                   setRoleLoading(false);
@@ -1254,7 +1275,10 @@ export default function LeagueSettings() {
                   </div>
                 ) : (
                   placementRows.map((p) => (
-                    <div key={p} className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2">
+                    <div
+                      key={p}
+                      className="grid grid-cols-[70px_1fr_54px] items-center gap-2 px-4 py-2"
+                    >
                       <div className="text-sm font-extrabold text-slate-900">
                         {p}
                         {p === 1 ? "st" : p === 2 ? "nd" : p === 3 ? "rd" : "th"}
