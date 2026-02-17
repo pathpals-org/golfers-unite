@@ -89,7 +89,11 @@ export default function FindGolfers() {
       }
 
       const meRes = await withTimeout(
-        supabase.from("profiles").select("id,email,display_name,created_at").eq("id", uid).maybeSingle(),
+        supabase
+          .from("profiles")
+          .select("id,email,display_name,created_at")
+          .eq("id", uid)
+          .maybeSingle(),
         8000,
         "Load profile"
       );
@@ -145,6 +149,17 @@ export default function FindGolfers() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function copyMyEmail() {
+    const myEmail = meProfile?.email || "";
+    if (!myEmail) return;
+    try {
+      await navigator.clipboard.writeText(myEmail);
+      setStatus({ type: "success", message: "Your email copied ✅ Send it to your mate." });
+    } catch {
+      setStatus({ type: "info", message: "Couldn’t copy automatically. Just type it to them." });
+    }
+  }
+
   async function sendFriendRequest() {
     const targetEmail = normEmail(email);
 
@@ -166,7 +181,11 @@ export default function FindGolfers() {
 
     try {
       const profRes = await withTimeout(
-        supabase.from("profiles").select("id,email,display_name").eq("email", targetEmail).maybeSingle(),
+        supabase
+          .from("profiles")
+          .select("id,email,display_name")
+          .eq("email", targetEmail)
+          .maybeSingle(),
         8000,
         "Find profile by email"
       );
@@ -177,7 +196,7 @@ export default function FindGolfers() {
       if (!prof?.id) {
         setStatus({
           type: "info",
-          message: "That golfer hasn’t signed up yet. Ask them to create an account first.",
+          message: "That golfer hasn’t signed up yet. Tell them to create an account first.",
         });
         return;
       }
@@ -225,7 +244,11 @@ export default function FindGolfers() {
 
     try {
       const upRes = await withTimeout(
-        supabase.from("friendships").update({ status: "accepted" }).eq("id", rowId).eq("addressee_id", authId),
+        supabase
+          .from("friendships")
+          .update({ status: "accepted" })
+          .eq("id", rowId)
+          .eq("addressee_id", authId),
         8000,
         "Accept request"
       );
@@ -264,15 +287,30 @@ export default function FindGolfers() {
     }
   }
 
+  const StatusBanner = status?.message ? (
+    <div
+      className={[
+        "rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+        status.type === "success"
+          ? "bg-emerald-500/15 text-emerald-100 ring-emerald-500/30"
+          : status.type === "info"
+          ? "bg-white/10 text-slate-100 ring-white/15"
+          : "bg-rose-500/15 text-rose-100 ring-rose-500/30",
+      ].join(" ")}
+    >
+      {status.message}
+    </div>
+  ) : null;
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="Friends"
-        subtitle="Add mates by email and keep banter in your circle."
+        subtitle="Add mates by email, accept requests, and build your circle."
         right={
           <button
             onClick={loadMeAndFriends}
-            className="rounded-xl bg-white/10 px-4 py-2 text-sm hover:bg-white/15"
+            className="rounded-xl bg-white/15 px-4 py-2 text-sm font-extrabold text-white hover:bg-white/20 disabled:opacity-60"
             disabled={actionLoading}
           >
             Refresh
@@ -280,23 +318,37 @@ export default function FindGolfers() {
         }
       />
 
-      <Card className="p-5 space-y-3">
-        <div className="flex items-start justify-between gap-3">
+      {/* Add friend */}
+      <Card className="p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <div className="text-sm font-extrabold text-white">Add a friend</div>
-            <div className="mt-1 text-xs font-semibold text-slate-300">They must already have an account.</div>
+            <div className="text-base font-extrabold text-white">Add a friend</div>
+            <div className="mt-1 text-sm font-semibold text-slate-200">
+              Type their email (they must already have an account).
+            </div>
           </div>
 
           {meProfile?.email ? (
-            <span className="rounded-full bg-white/10 px-3 py-2 text-[11px] font-extrabold text-slate-200 ring-1 ring-white/10">
-              You: {meProfile.email}
-            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-full bg-white/10 px-3 py-2 text-xs font-extrabold text-slate-100 ring-1 ring-white/15">
+                You: {meProfile.email}
+              </span>
+              <button
+                type="button"
+                onClick={copyMyEmail}
+                className="rounded-xl bg-white/15 px-3 py-2 text-xs font-extrabold text-white hover:bg-white/20"
+              >
+                Copy my email
+              </button>
+            </div>
           ) : null}
         </div>
 
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-300">Email</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-200">
+              Friend’s email
+            </div>
             <input
               type="email"
               value={email}
@@ -307,7 +359,7 @@ export default function FindGolfers() {
               autoCorrect="off"
               spellCheck={false}
               disabled={actionLoading}
-              className="mt-2 w-full rounded-xl border border-white/10 bg-slate-950/40 px-3 py-2 text-sm font-extrabold text-white caret-white placeholder:text-slate-400 outline-none ring-emerald-200 focus:ring-4"
+              className="mt-2 w-full rounded-xl border border-white/15 bg-slate-950/40 px-3 py-2 text-sm font-extrabold text-white caret-white placeholder:text-slate-300 outline-none ring-emerald-200 focus:ring-4"
             />
           </div>
 
@@ -317,7 +369,7 @@ export default function FindGolfers() {
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
               actionLoading || !isValidEmail(email)
-                ? "bg-white/10 text-slate-400 cursor-not-allowed"
+                ? "bg-white/10 text-slate-300 cursor-not-allowed"
                 : "bg-emerald-600 text-white hover:bg-emerald-500",
             ].join(" ")}
           >
@@ -325,30 +377,17 @@ export default function FindGolfers() {
           </button>
         </div>
 
-        {status?.message ? (
-          <div
-            className={[
-              "rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
-              status.type === "success"
-                ? "bg-emerald-500/10 text-emerald-100 ring-emerald-500/20"
-                : status.type === "info"
-                ? "bg-white/5 text-slate-200 ring-white/10"
-                : "bg-rose-500/10 text-rose-100 ring-rose-500/20",
-            ].join(" ")}
-          >
-            {status.message}
-          </div>
-        ) : null}
+        {StatusBanner}
       </Card>
 
-      {/* rest of your file unchanged */}
+      {/* Incoming */}
       <Card className="p-5 space-y-3">
-        <div className="text-sm font-extrabold text-white">Incoming requests</div>
+        <div className="text-base font-extrabold text-white">Incoming requests</div>
 
         {loading ? (
-          <div className="text-sm font-semibold text-slate-300">Loading…</div>
+          <div className="text-sm font-semibold text-slate-200">Loading…</div>
         ) : incoming.length === 0 ? (
-          <div className="text-sm font-semibold text-slate-300">No incoming requests.</div>
+          <div className="text-sm font-semibold text-slate-200">No incoming requests.</div>
         ) : (
           <div className="space-y-2">
             {incoming.map((r) => {
@@ -356,11 +395,15 @@ export default function FindGolfers() {
               return (
                 <div
                   key={r.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
+                  className="flex items-center justify-between gap-3 rounded-2xl border border-white/15 bg-white/10 px-4 py-3"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-white">{shortName(other)}</div>
-                    <div className="truncate text-xs font-semibold text-slate-300">{other?.email || "—"}</div>
+                    <div className="truncate text-sm font-extrabold text-white">
+                      {shortName(other)}
+                    </div>
+                    <div className="truncate text-xs font-semibold text-slate-200">
+                      {other?.email || "—"}
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -374,7 +417,7 @@ export default function FindGolfers() {
                     <button
                       onClick={() => removeFriendship(r.id)}
                       disabled={actionLoading}
-                      className="rounded-xl bg-white/10 px-3 py-2 text-xs font-extrabold text-slate-200 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-60"
+                      className="rounded-xl bg-white/15 px-3 py-2 text-xs font-extrabold text-white hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-60"
                       title="Decline"
                     >
                       Decline
@@ -387,13 +430,14 @@ export default function FindGolfers() {
         )}
       </Card>
 
+      {/* Outgoing */}
       <Card className="p-5 space-y-3">
-        <div className="text-sm font-extrabold text-white">Pending you sent</div>
+        <div className="text-base font-extrabold text-white">Pending you sent</div>
 
         {loading ? (
-          <div className="text-sm font-semibold text-slate-300">Loading…</div>
+          <div className="text-sm font-semibold text-slate-200">Loading…</div>
         ) : outgoing.length === 0 ? (
-          <div className="text-sm font-semibold text-slate-300">No pending requests.</div>
+          <div className="text-sm font-semibold text-slate-200">No pending requests.</div>
         ) : (
           <div className="space-y-2">
             {outgoing.map((r) => {
@@ -401,17 +445,21 @@ export default function FindGolfers() {
               return (
                 <div
                   key={r.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
+                  className="flex items-center justify-between gap-3 rounded-2xl border border-white/15 bg-white/10 px-4 py-3"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-white">{shortName(other)}</div>
-                    <div className="truncate text-xs font-semibold text-slate-300">{other?.email || "—"}</div>
+                    <div className="truncate text-sm font-extrabold text-white">
+                      {shortName(other)}
+                    </div>
+                    <div className="truncate text-xs font-semibold text-slate-200">
+                      {other?.email || "—"}
+                    </div>
                   </div>
 
                   <button
                     onClick={() => removeFriendship(r.id)}
                     disabled={actionLoading}
-                    className="rounded-xl bg-white/10 px-3 py-2 text-xs font-extrabold text-slate-200 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="rounded-xl bg-white/15 px-3 py-2 text-xs font-extrabold text-white hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-60"
                     title="Cancel request"
                   >
                     Cancel
@@ -423,13 +471,18 @@ export default function FindGolfers() {
         )}
       </Card>
 
+      {/* Friends */}
       <Card className="p-5 space-y-3">
-        <div className="text-sm font-extrabold text-white">Your friends</div>
+        <div className="text-base font-extrabold text-white">Your friends</div>
 
         {loading ? (
-          <div className="text-sm font-semibold text-slate-300">Loading…</div>
+          <div className="text-sm font-semibold text-slate-200">Loading…</div>
         ) : friends.length === 0 ? (
-          <EmptyState icon="👥" title="No friends yet" description="Add your mates by email to start a proper league circle." />
+          <EmptyState
+            icon="👥"
+            title="No friends yet"
+            description="Add your mates by email so you can invite them into leagues."
+          />
         ) : (
           <div className="space-y-2">
             {friends.map((r) => {
@@ -437,11 +490,15 @@ export default function FindGolfers() {
               return (
                 <div
                   key={r.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
+                  className="flex items-center justify-between gap-3 rounded-2xl border border-white/15 bg-white/10 px-4 py-3"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-white">{shortName(other)}</div>
-                    <div className="truncate text-xs font-semibold text-slate-300">{other?.email || "—"}</div>
+                    <div className="truncate text-sm font-extrabold text-white">
+                      {shortName(other)}
+                    </div>
+                    <div className="truncate text-xs font-semibold text-slate-200">
+                      {other?.email || "—"}
+                    </div>
                   </div>
 
                   <button
@@ -461,6 +518,3 @@ export default function FindGolfers() {
     </div>
   );
 }
-
-
-
