@@ -185,8 +185,6 @@ async function getAuthedUserId() {
 
 /* ---------------------------------------------
    ACTIVE LEAGUE (Supabase source of truth + local fallback)
-   We TRY to store activeLeagueId in profiles.active_league_id (if that column exists).
-   If the column doesn't exist yet, this will fail-soft and use localStorage only.
 ---------------------------------------------- */
 export function getActiveLeagueId() {
   try {
@@ -208,10 +206,6 @@ function setActiveLeagueIdLocal(leagueId) {
   }
 }
 
-/**
- * Writes active league preference to Supabase (profiles.active_league_id) if available,
- * and ALWAYS updates local fallback cache.
- */
 export async function setActiveLeagueId(leagueId) {
   const clean = cleanLeagueId(leagueId);
   setActiveLeagueIdLocal(clean);
@@ -228,10 +222,6 @@ export async function setActiveLeagueId(leagueId) {
   }
 }
 
-/**
- * Reads active league preference from Supabase first (profiles.active_league_id),
- * falling back to local.
- */
 export async function getActiveLeagueIdSupabaseFirst() {
   const local = cleanLeagueId(getActiveLeagueId());
   try {
@@ -257,15 +247,21 @@ export async function getActiveLeagueIdSupabaseFirst() {
 /* ---------------------------------------------
    Supabase helpers (source of truth reads)
 ---------------------------------------------- */
+
+/**
+ * ✅ FIXED: league_members.created_at does NOT exist in your DB.
+ * So we never select/order by it.
+ *
+ * We simply return memberships, then the resolver decides which to pick.
+ */
 async function fetchMyLeagueMemberships() {
   const uid = await getAuthedUserId();
   if (!uid) return [];
 
   const { data, error } = await supabase
     .from("league_members")
-    .select("league_id,role,created_at")
-    .eq("user_id", uid)
-    .order("created_at", { ascending: false });
+    .select("league_id,role")
+    .eq("user_id", uid);
 
   if (error) throw error;
   return ensureArr(data).filter((r) => r?.league_id);
@@ -298,7 +294,6 @@ async function fetchLeagueById(leagueId) {
     lastErr = error;
 
     const msg = String(error?.message || "").toLowerCase();
-    // try next selection if the column doesn't exist
     if (msg.includes("column") && msg.includes("does not exist")) continue;
 
     break;
@@ -322,7 +317,6 @@ async function fetchLeagueMembers(leagueId) {
 
 /**
  * ✅ Keep profile fetch LIGHT to avoid RLS stalls / heavy policies.
- * We only need names for UI.
  */
 async function fetchProfilesByIds(userIds) {
   const ids = ensureArr(userIds).filter(Boolean);
@@ -700,7 +694,13 @@ export async function resolveLeagueIdSupabaseFirst({ preferredLeagueId = null } 
   try {
     const memberships = await fetchMyLeagueMemberships();
     if (memberships.length) {
-      const pick = cleanLeagueId(memberships[0]?.league_id || null);
+      // Prefer a membership that matches local active league id (if it exists)
+      const localPref = cleanLeagueId(getActiveLeagueId());
+      const match =
+        localPref && memberships.find((m) => String(m.league_id) === String(localPref));
+
+      const pick = cleanLeagueId((match || memberships[0])?.league_id || null);
+
       if (pick) {
         await setActiveLeagueId(pick);
         return String(pick);
@@ -740,7 +740,6 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
     const leagueRow = await fetchLeagueById(activeId);
 
     // If we can’t read the league row (blocked / missing), do NOT return null.
-    // Return a minimal league so the UI doesn’t get stuck on “No league yet”.
     if (!leagueRow?.id) {
       const minimal = normalizeLeague({
         id: activeId,
@@ -769,7 +768,7 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
     const users = profiles.map((p) => ({
       id: p.id,
       name: p.display_name || "Golfer",
-      email: null, // keep null to avoid email RLS pain during migration
+      email: null,
     }));
 
     // UI cache only — DO NOT use for permissions
@@ -798,8 +797,6 @@ export async function syncActiveLeagueFromSupabase({ leagueId = null, withRounds
 
     return { league: nextLeague, users, rounds };
   } catch {
-    // If create just happened and we have a leagueId, do NOT return null.
-    // Return minimal shell league to prevent “No league yet” lock.
     if (requested) {
       const minimal = normalizeLeague({
         id: requested,
@@ -837,15 +834,19 @@ export function calculateLeaguePoints({
   const p = toInt(place, NaN);
 
   const placementPoints = Number.isFinite(p) && p > 0 ? toInt(ps.placementPoints[p], 0) : 0;
-  const participationPoints = played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
+  const participationPoints =
+    played && ps.participation?.enabled ? toInt(ps.participation.points, 0) : 0;
 
   let bonusPoints = 0;
   const flags = ensureObj(bonusFlags);
 
   if (ps.bonuses?.enabled) {
-    if (ps.bonuses.birdie?.enabled && Boolean(flags.birdie)) bonusPoints += toInt(ps.bonuses.birdie.points, 0);
-    if (ps.bonuses.eagle?.enabled && Boolean(flags.eagle)) bonusPoints += toInt(ps.bonuses.eagle.points, 0);
-    if (ps.bonuses.hio?.enabled && Boolean(flags.hio)) bonusPoints += toInt(ps.bonuses.hio.points, 0);
+    if (ps.bonuses.birdie?.enabled && Boolean(flags.birdie))
+      bonusPoints += toInt(ps.bonuses.birdie.points, 0);
+    if (ps.bonuses.eagle?.enabled && Boolean(flags.eagle))
+      bonusPoints += toInt(ps.bonuses.eagle.points, 0);
+    if (ps.bonuses.hio?.enabled && Boolean(flags.hio))
+      bonusPoints += toInt(ps.bonuses.hio.points, 0);
   }
 
   const totalPoints = placementPoints + participationPoints + bonusPoints;
@@ -994,4 +995,5 @@ export function setLeagueSeasonDates({ startISO, endISO = null } = {}) {
   setLeagueSafe(next);
   return next;
 }
+
 
