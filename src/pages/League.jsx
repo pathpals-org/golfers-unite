@@ -38,6 +38,10 @@ const DEFAULT_POINTS_SYSTEM = {
   },
 };
 
+function ensureArr(v) {
+  return Array.isArray(v) ? v : [];
+}
+
 function cleanLeagueId(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
@@ -279,6 +283,12 @@ export default function League() {
   const [leagueLoading, setLeagueLoading] = useState(false);
   const [leagueSyncError, setLeagueSyncError] = useState("");
 
+  // ✅ NEW: league invites inbox for users with no league
+  const [pendingInvites, setPendingInvites] = useState([]);
+  const [invitesLoading, setInvitesLoading] = useState(false);
+  const [inviteActionId, setInviteActionId] = useState(null);
+  const [inviteErr, setInviteErr] = useState("");
+
   // Create League modal
   const [showCreate, setShowCreate] = useState(false);
   const [createName, setCreateName] = useState("");
@@ -302,6 +312,129 @@ export default function League() {
   const pointsSystem = useMemo(() => {
     return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
   }, [league?.pointsSystem]);
+
+  // ✅ NEW: load pending invites for this user
+  async function loadMyInvites(userId) {
+    if (!userId) {
+      setPendingInvites([]);
+      return;
+    }
+
+    setInvitesLoading(true);
+    setInviteErr("");
+
+    try {
+      const { data, error } = await supabase
+        .from("league_invites")
+        .select(
+          `
+          id,
+          league_id,
+          inviter_user_id,
+          invitee_user_id,
+          status,
+          created_at,
+          league:leagues!league_invites_league_id_fkey (
+            id,
+            name
+          )
+        `
+        )
+        .eq("invitee_user_id", userId)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setPendingInvites(ensureArr(data));
+    } catch (e) {
+      setPendingInvites([]);
+      setInviteErr(humanizeSupabaseError(e));
+    } finally {
+      setInvitesLoading(false);
+    }
+  }
+
+  async function acceptLeagueInvite(invite) {
+    const invId = invite?.id;
+    const lid = cleanLeagueId(invite?.league_id || invite?.league?.id);
+    if (!user?.id || !invId || !lid) return;
+
+    setInviteActionId(invId);
+    setInviteErr("");
+
+    try {
+      // 1) add membership (member)
+      const { error: memErr } = await supabase.from("league_members").insert({
+        league_id: lid,
+        user_id: user.id,
+        role: "member",
+      });
+      // If already a member, we still want to mark invite accepted + continue
+      if (memErr && String(memErr?.code || "") !== "23505") throw memErr;
+
+      // 2) mark invite accepted
+      const { error: upErr } = await supabase
+        .from("league_invites")
+        .update({ status: "accepted" })
+        .eq("id", invId)
+        .eq("invitee_user_id", user.id);
+
+      if (upErr) throw upErr;
+
+      // 3) set active league + hydrate
+      await setActiveLeagueId(lid);
+
+      stableLeagueIdRef.current = String(lid);
+      setResolvedLeagueId(String(lid));
+
+      const result = await syncActiveLeagueFromSupabase({ leagueId: lid, withRounds: true });
+
+      setLeagueState(normalizeLeagueOrNull(result?.league));
+      setUsersState(result?.users || getUsers([]));
+      setRoundsState(result?.rounds || getRounds([]));
+
+      setToast("Invite accepted ✅ Welcome to the league.");
+      setPendingInvites((xs) => xs.filter((x) => x?.id !== invId));
+    } catch (e) {
+      setInviteErr(humanizeSupabaseError(e));
+    } finally {
+      setInviteActionId(null);
+    }
+  }
+
+  async function declineLeagueInvite(invite) {
+    const invId = invite?.id;
+    if (!user?.id || !invId) return;
+
+    setInviteActionId(invId);
+    setInviteErr("");
+
+    try {
+      const { error } = await supabase
+        .from("league_invites")
+        .update({ status: "declined" })
+        .eq("id", invId)
+        .eq("invitee_user_id", user.id);
+
+      if (error) throw error;
+
+      setPendingInvites((xs) => xs.filter((x) => x?.id !== invId));
+      setToast("Invite declined.");
+    } catch (e) {
+      setInviteErr(humanizeSupabaseError(e));
+    } finally {
+      setInviteActionId(null);
+    }
+  }
+
+  // keep invites fresh while user has no league
+  useEffect(() => {
+    if (authLoading) return;
+    if (!user?.id) return;
+    if (league?.id) return; // only needed for “no league” screen
+    loadMyInvites(user.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authLoading, user?.id, league?.id]);
 
   useEffect(() => {
     let alive = true;
@@ -483,6 +616,99 @@ export default function League() {
   if (!league?.id) {
     return (
       <div className="pt-2 space-y-3">
+        {/* ✅ NEW: Pending invites inbox */}
+        {user?.id ? (
+          <Card className="p-5 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-extrabold text-slate-900">League invites</div>
+                <div className="mt-1 text-xs font-semibold text-slate-600">
+                  If someone invited you, accept it here. Don’t create a league by accident.
+                </div>
+              </div>
+
+              <button
+                onClick={() => loadMyInvites(user.id)}
+                disabled={invitesLoading}
+                className={[
+                  "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                  invitesLoading
+                    ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
+                    : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+                ].join(" ")}
+              >
+                {invitesLoading ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
+
+            {inviteErr ? (
+              <div className="rounded-2xl bg-rose-50 p-3 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
+                {inviteErr}
+              </div>
+            ) : null}
+
+            {invitesLoading ? (
+              <div className="text-sm font-semibold text-slate-600">Loading invites…</div>
+            ) : pendingInvites.length === 0 ? (
+              <div className="text-sm font-semibold text-slate-600">No pending invites.</div>
+            ) : (
+              <div className="space-y-2">
+                {pendingInvites.map((inv) => {
+                  const lid = cleanLeagueId(inv?.league_id || inv?.league?.id);
+                  const leagueName = inv?.league?.name || (lid ? `League ${String(lid).slice(0, 8)}…` : "League");
+                  const busy = inviteActionId === inv?.id;
+
+                  return (
+                    <div
+                      key={inv.id}
+                      className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-extrabold text-slate-900">
+                          {leagueName}
+                        </div>
+                        <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                          Invite pending
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => acceptLeagueInvite(inv)}
+                          className={[
+                            "rounded-xl px-3 py-2 text-xs font-extrabold",
+                            busy
+                              ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                              : "bg-emerald-600 text-white hover:bg-emerald-500",
+                          ].join(" ")}
+                        >
+                          {busy ? "Accepting…" : "Accept"}
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => declineLeagueInvite(inv)}
+                          className={[
+                            "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                            busy
+                              ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
+                              : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
+                          ].join(" ")}
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        ) : null}
+
         <EmptyState
           icon="🏌️"
           title={leagueLoading ? "Loading your league…" : "No league yet"}
@@ -698,8 +924,7 @@ export default function League() {
             <div className="mt-1 text-sm font-semibold text-slate-600">{seasonRange}</div>
 
             <div className="mt-2 text-xs font-semibold text-slate-500">
-              Points:{" "}
-              <span className="font-extrabold text-slate-700">{placementSummary}</span>
+              Points: <span className="font-extrabold text-slate-700">{placementSummary}</span>
               {pointsSystem?.participation?.enabled ? (
                 <span className="ml-2 rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-extrabold text-slate-700 ring-1 ring-slate-200">
                   +{pointsSystem.participation.points} play
@@ -724,9 +949,7 @@ export default function League() {
 
           <div className="ml-auto text-right">
             <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Week</div>
-            <div className="text-2xl font-extrabold text-emerald-700">
-              {String(week).padStart(2, "0")}
-            </div>
+            <div className="text-2xl font-extrabold text-emerald-700">{String(week).padStart(2, "0")}</div>
           </div>
         </div>
 
@@ -791,11 +1014,7 @@ export default function League() {
 
         {standings.length === 0 ? (
           <div className="p-4">
-            <EmptyState
-              icon="📋"
-              title="No rounds yet"
-              description="Submit the first round to populate the league table."
-            />
+            <EmptyState icon="📋" title="No rounds yet" description="Submit the first round to populate the league table." />
           </div>
         ) : (
           <div className="divide-y divide-slate-200">
@@ -815,9 +1034,7 @@ export default function League() {
 
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{row.name}</div>
-                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">
-                        ⭐ {row.majors} majors
-                      </div>
+                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">⭐ {row.majors} majors</div>
                     </div>
 
                     <div className="text-center text-sm font-extrabold text-slate-900">{row.rounds}</div>
@@ -827,9 +1044,7 @@ export default function League() {
 
                     <div className="text-right">
                       <div className="text-base font-extrabold text-slate-900">{row.points}</div>
-                      <div className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500">
-                        pts
-                      </div>
+                      <div className="text-[10px] font-extrabold uppercase tracking-wide text-slate-500">pts</div>
                     </div>
                   </div>
                 </button>
@@ -882,3 +1097,4 @@ export default function League() {
     </div>
   );
 }
+
