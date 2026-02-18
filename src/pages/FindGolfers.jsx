@@ -22,8 +22,15 @@ function humanErr(e) {
   return e?.message || String(e || "Something went wrong.");
 }
 
+function shortId(id) {
+  const s = String(id || "");
+  if (!s) return "unknown";
+  if (s.length <= 12) return s;
+  return `${s.slice(0, 6)}…${s.slice(-4)}`;
+}
+
 function shortName(p) {
-  return p?.display_name || (p?.email ? p.email.split("@")[0] : "Golfer");
+  return p?.display_name || p?.username || (p?.email ? p.email.split("@")[0] : null);
 }
 
 function pairLowHigh(a, b) {
@@ -53,8 +60,9 @@ export default function FindGolfers() {
   const [email, setEmail] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
 
+  // NOTE: your DB column is addresse_id (not addressee_id)
   const incoming = useMemo(() => {
-    return friendships.filter((f) => f.status === "pending" && f.addressee_id === authId);
+    return friendships.filter((f) => f.status === "pending" && f.addresse_id === authId);
   }, [friendships, authId]);
 
   const outgoing = useMemo(() => {
@@ -62,12 +70,33 @@ export default function FindGolfers() {
   }, [friendships, authId]);
 
   const friends = useMemo(() => {
-    return friendships.filter((f) => f.status === "accepted");
-  }, [friendships]);
+    // Only accepted rows involving me
+    return friendships.filter(
+      (f) => f.status === "accepted" && (f.user_low === authId || f.user_high === authId)
+    );
+  }, [friendships, authId]);
 
+  // Canonical "other user" (use user_low/user_high, not requester/addressee direction)
   function otherId(row) {
     if (!row || !authId) return null;
-    return row.requester_id === authId ? row.addressee_id : row.requester_id;
+    if (row.user_low === authId) return row.user_high;
+    if (row.user_high === authId) return row.user_low;
+
+    // Fallback (shouldn't happen if query filters correctly)
+    if (row.requester_id === authId) return row.addresse_id;
+    if (row.addresse_id === authId) return row.requester_id;
+    return null;
+  }
+
+  function displayLineFromUserId(uid, prefix = "") {
+    const p = profilesById[uid] || null;
+    const name = shortName(p);
+    const mail = p?.email ? String(p.email) : "";
+
+    // Always render something useful even if profiles/email are blocked.
+    if (name && mail) return `${prefix}${name} (${mail})`;
+    if (name) return `${prefix}${name}`;
+    return `${prefix}User ${shortId(uid)}`;
   }
 
   async function loadMeAndFriends() {
@@ -88,10 +117,11 @@ export default function FindGolfers() {
         return;
       }
 
+      // Load my profile (email may be blocked by RLS — that's okay)
       const meRes = await withTimeout(
         supabase
           .from("profiles")
-          .select("id,email,display_name,created_at")
+          .select("id,email,display_name,username,created_at")
           .eq("id", uid)
           .maybeSingle(),
         8000,
@@ -101,11 +131,13 @@ export default function FindGolfers() {
       if (meRes.error) throw meRes.error;
       setMeProfile(meRes.data || null);
 
+      // Load friendships involving me
       const frRes = await withTimeout(
         supabase
           .from("friendships")
-          .select("id,user_low,user_high,requester_id,addressee_id,status,created_at,updated_at")
-          .or(`requester_id.eq.${uid},addressee_id.eq.${uid}`)
+          .select("id,user_low,user_high,requester_id,addresse_id,status,created_at,updated_at")
+          // Use canonical pair columns for involvement (more reliable than requester/addressee)
+          .or(`user_low.eq.${uid},user_high.eq.${uid}`)
           .order("updated_at", { ascending: false }),
         8000,
         "Load friendships"
@@ -116,6 +148,7 @@ export default function FindGolfers() {
       const rows = ensureArr(frRes.data);
       setFriendships(rows);
 
+      // Get all the "other user ids" we need profiles for
       const ids = Array.from(new Set(rows.map((r) => otherId(r)).filter(Boolean)));
 
       if (!ids.length) {
@@ -123,8 +156,9 @@ export default function FindGolfers() {
         return;
       }
 
+      // Load friend profiles (email may be private; still fine)
       const profRes = await withTimeout(
-        supabase.from("profiles").select("id,email,display_name,created_at").in("id", ids),
+        supabase.from("profiles").select("id,email,display_name,username,created_at").in("id", ids),
         8000,
         "Load friend profiles"
       );
@@ -181,11 +215,7 @@ export default function FindGolfers() {
 
     try {
       const profRes = await withTimeout(
-        supabase
-          .from("profiles")
-          .select("id,email,display_name")
-          .eq("email", targetEmail)
-          .maybeSingle(),
+        supabase.from("profiles").select("id,email,display_name,username").eq("email", targetEmail).maybeSingle(),
         8000,
         "Find profile by email"
       );
@@ -209,7 +239,7 @@ export default function FindGolfers() {
           user_low,
           user_high,
           requester_id: authId,
-          addressee_id: other,
+          addresse_id: other, // correct column name
           status: "pending",
         }),
         8000,
@@ -248,7 +278,7 @@ export default function FindGolfers() {
           .from("friendships")
           .update({ status: "accepted" })
           .eq("id", rowId)
-          .eq("addressee_id", authId),
+          .eq("addresse_id", authId), // correct column name
         8000,
         "Accept request"
       );
@@ -270,11 +300,7 @@ export default function FindGolfers() {
     setStatus({ type: "", message: "" });
 
     try {
-      const delRes = await withTimeout(
-        supabase.from("friendships").delete().eq("id", rowId),
-        8000,
-        "Remove friendship"
-      );
+      const delRes = await withTimeout(supabase.from("friendships").delete().eq("id", rowId), 8000, "Remove friendship");
 
       if (delRes.error) throw delRes.error;
 
@@ -323,7 +349,7 @@ export default function FindGolfers() {
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="text-base font-extrabold text-white">Add a friend</div>
-            <div className="mt-1 text-sm font-semibold text-slate-200">
+            <div className="mt-1 text-sm font-semibold text-slate-100">
               Type their email (they must already have an account).
             </div>
           </div>
@@ -346,7 +372,7 @@ export default function FindGolfers() {
 
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-200">
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-100">
               Friend’s email
             </div>
             <input
@@ -359,7 +385,7 @@ export default function FindGolfers() {
               autoCorrect="off"
               spellCheck={false}
               disabled={actionLoading}
-              className="mt-2 w-full rounded-xl border border-white/15 bg-slate-950/40 px-3 py-2 text-sm font-extrabold text-white caret-white placeholder:text-slate-300 outline-none ring-emerald-200 focus:ring-4"
+              className="mt-2 w-full rounded-xl border border-white/15 bg-slate-950/40 px-3 py-2 text-sm font-extrabold text-white caret-white placeholder:text-slate-200 outline-none ring-emerald-200 focus:ring-4"
             />
           </div>
 
@@ -369,7 +395,7 @@ export default function FindGolfers() {
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
               actionLoading || !isValidEmail(email)
-                ? "bg-white/10 text-slate-300 cursor-not-allowed"
+                ? "bg-white/10 text-slate-200 cursor-not-allowed"
                 : "bg-emerald-600 text-white hover:bg-emerald-500",
             ].join(" ")}
           >
@@ -385,13 +411,13 @@ export default function FindGolfers() {
         <div className="text-base font-extrabold text-white">Incoming requests</div>
 
         {loading ? (
-          <div className="text-sm font-semibold text-slate-200">Loading…</div>
+          <div className="text-sm font-semibold text-slate-100">Loading…</div>
         ) : incoming.length === 0 ? (
-          <div className="text-sm font-semibold text-slate-200">No incoming requests.</div>
+          <div className="text-sm font-semibold text-slate-100">No incoming requests.</div>
         ) : (
           <div className="space-y-2">
             {incoming.map((r) => {
-              const other = profilesById[otherId(r)] || null;
+              const fromId = r.requester_id;
               return (
                 <div
                   key={r.id}
@@ -399,10 +425,10 @@ export default function FindGolfers() {
                 >
                   <div className="min-w-0">
                     <div className="truncate text-sm font-extrabold text-white">
-                      {shortName(other)}
+                      {displayLineFromUserId(fromId, "From: ")}
                     </div>
-                    <div className="truncate text-xs font-semibold text-slate-200">
-                      {other?.email || "—"}
+                    <div className="truncate text-xs font-semibold text-slate-100">
+                      Request • {new Date(r.created_at).toLocaleString()}
                     </div>
                   </div>
 
@@ -435,13 +461,13 @@ export default function FindGolfers() {
         <div className="text-base font-extrabold text-white">Pending you sent</div>
 
         {loading ? (
-          <div className="text-sm font-semibold text-slate-200">Loading…</div>
+          <div className="text-sm font-semibold text-slate-100">Loading…</div>
         ) : outgoing.length === 0 ? (
-          <div className="text-sm font-semibold text-slate-200">No pending requests.</div>
+          <div className="text-sm font-semibold text-slate-100">No pending requests.</div>
         ) : (
           <div className="space-y-2">
             {outgoing.map((r) => {
-              const other = profilesById[otherId(r)] || null;
+              const toId = r.addresse_id;
               return (
                 <div
                   key={r.id}
@@ -449,10 +475,10 @@ export default function FindGolfers() {
                 >
                   <div className="min-w-0">
                     <div className="truncate text-sm font-extrabold text-white">
-                      {shortName(other)}
+                      {displayLineFromUserId(toId, "To: ")}
                     </div>
-                    <div className="truncate text-xs font-semibold text-slate-200">
-                      {other?.email || "—"}
+                    <div className="truncate text-xs font-semibold text-slate-100">
+                      Pending • {new Date(r.created_at).toLocaleString()}
                     </div>
                   </div>
 
@@ -476,7 +502,7 @@ export default function FindGolfers() {
         <div className="text-base font-extrabold text-white">Your friends</div>
 
         {loading ? (
-          <div className="text-sm font-semibold text-slate-200">Loading…</div>
+          <div className="text-sm font-semibold text-slate-100">Loading…</div>
         ) : friends.length === 0 ? (
           <EmptyState
             icon="👥"
@@ -486,7 +512,7 @@ export default function FindGolfers() {
         ) : (
           <div className="space-y-2">
             {friends.map((r) => {
-              const other = profilesById[otherId(r)] || null;
+              const oid = otherId(r);
               return (
                 <div
                   key={r.id}
@@ -494,10 +520,10 @@ export default function FindGolfers() {
                 >
                   <div className="min-w-0">
                     <div className="truncate text-sm font-extrabold text-white">
-                      {shortName(other)}
+                      {displayLineFromUserId(oid)}
                     </div>
-                    <div className="truncate text-xs font-semibold text-slate-200">
-                      {other?.email || "—"}
+                    <div className="truncate text-xs font-semibold text-slate-100">
+                      Friends • {new Date(r.created_at).toLocaleDateString()}
                     </div>
                   </div>
 
@@ -518,3 +544,4 @@ export default function FindGolfers() {
     </div>
   );
 }
+
