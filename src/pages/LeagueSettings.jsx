@@ -27,7 +27,7 @@ import {
   // cache-only season helpers (UI-only)
   setLeagueSeasonDates,
 
-  // ✅ low-level cache helpers so we can “reset after delete”
+  // ✅ low-level cache helpers so we can “reset after delete/leave”
   KEYS,
   remove,
 } from "../utils/storage";
@@ -137,12 +137,6 @@ function getLeagueIdFromLocation(location) {
   return null;
 }
 
-/**
- * ✅ League Settings rules:
- * - leagueId resolution order: state -> query -> activeLeagueId (profile pref) -> membership fallback
- * - permissions based ONLY on Supabase league_members.role
- * - writes go Supabase first, then re-sync caches
- */
 export default function LeagueSettings() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -179,6 +173,9 @@ export default function LeagueSettings() {
   // Delete league
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState("");
+
+  // ✅ Member actions
+  const [memberActionBusyId, setMemberActionBusyId] = useState(null);
 
   // points draft
   const [pointsDraft, setPointsDraft] = useState(() => {
@@ -251,12 +248,13 @@ export default function LeagueSettings() {
   async function fetchMyRoleDirect({ lid, uid }) {
     const { data, error } = await supabase
       .from("league_members")
-      .select("role")
+      .select("role,status")
       .eq("league_id", lid)
       .eq("user_id", uid)
       .maybeSingle();
 
     if (error) throw error;
+    if (data?.status && String(data.status) !== "active") return null;
     return data?.role || null;
   }
 
@@ -295,11 +293,12 @@ export default function LeagueSettings() {
 
       // 3) membership fallback (most recent)
       try {
+        // ✅ FIX: league_members has joined_at, NOT created_at
         const { data, error } = await supabase
           .from("league_members")
-          .select("league_id, created_at")
+          .select("league_id, joined_at")
           .eq("user_id", authUserId)
-          .order("created_at", { ascending: false })
+          .order("joined_at", { ascending: false })
           .limit(1);
 
         if (!alive || reqId !== resolveReqIdRef.current) return;
@@ -469,7 +468,8 @@ export default function LeagueSettings() {
           created_at,
           invitee:profiles!league_invites_invitee_user_id_fkey (
             id,
-            display_name
+            display_name,
+            username
           )
         `
         )
@@ -486,8 +486,7 @@ export default function LeagueSettings() {
     }
   }
 
-  // ✅ FIXED: read friendships using requester_id / addressee_id (same as FindGolfers.jsx)
-  // (plus a safe fallback for old user_low/user_high schema if it exists)
+  // ✅ FIXED: read friendships using requester_id / addressee_id
   async function loadFriendsForInvites({ userId }) {
     if (!userId) {
       setFriends([]);
@@ -496,7 +495,6 @@ export default function LeagueSettings() {
 
     setFriendsLoading(true);
     try {
-      // Try modern schema first
       let rows = [];
       {
         const res = await supabase
@@ -509,8 +507,6 @@ export default function LeagueSettings() {
           rows = ensureArr(res.data);
         } else {
           const msg = String(res.error?.message || "").toLowerCase();
-
-          // Fallback to old schema if columns don't exist
           if (msg.includes("column") && msg.includes("does not exist")) {
             const fallback = await supabase
               .from("friendships")
@@ -528,11 +524,9 @@ export default function LeagueSettings() {
 
       const friendIds = rows
         .map((r) => {
-          // modern schema
           if (r?.requester_id && r?.addressee_id) {
             return r.requester_id === userId ? r.addressee_id : r.requester_id;
           }
-          // fallback schema
           if (r?.user_low && r?.user_high) {
             return r.user_low === userId ? r.user_high : r.user_low;
           }
@@ -549,14 +543,14 @@ export default function LeagueSettings() {
 
       const { data: profs, error: profErr } = await supabase
         .from("profiles")
-        .select("id,display_name")
+        .select("id,display_name,username")
         .in("id", uniq);
 
       if (profErr) throw profErr;
 
       const next = ensureArr(profs).sort((a, b) => {
-        const an = String(a?.display_name || "").toLowerCase();
-        const bn = String(b?.display_name || "").toLowerCase();
+        const an = String(a?.display_name || a?.username || "").toLowerCase();
+        const bn = String(b?.display_name || b?.username || "").toLowerCase();
         return an.localeCompare(bn);
       });
 
@@ -604,7 +598,6 @@ export default function LeagueSettings() {
         setMyRoleLive(r);
       }
 
-      // ✅ refresh friends too
       if (myId) await loadFriendsForInvites({ userId: myId });
       await loadPendingInvites({ leagueId: lid });
     } catch (e) {
@@ -612,7 +605,7 @@ export default function LeagueSettings() {
     }
   }
 
-  // ✅ Central reset used after delete so you DON'T have to log out/in
+  // ✅ Central reset used after delete/leave so you DON'T have to log out/in
   function clearLeagueUiCachesNow() {
     try {
       remove(KEYS.league);
@@ -675,6 +668,98 @@ export default function LeagueSettings() {
     } finally {
       setDeleteBusy(false);
       setDeleteConfirm("");
+    }
+  }
+
+  // ✅ NEW: Remove member / Leave league
+  async function removeMember(userId) {
+    const lid = cleanLeagueId(stableLeagueId);
+    if (!lid || !userId) return;
+
+    // only admin can remove; and keep it simple: host can't remove self here
+    if (!canEdit) {
+      setInviteStatus({ type: "error", message: "Only host/co-host can remove members." });
+      return;
+    }
+    if (effectiveRole === LEAGUE_ROLES.host && userId === myId) {
+      setInviteStatus({
+        type: "info",
+        message: "Host can’t remove themselves here. (Delete league, or transfer host in a future step.)",
+      });
+      return;
+    }
+
+    setMemberActionBusyId(userId);
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      const { error } = await supabase
+        .from("league_members")
+        .delete()
+        .eq("league_id", lid)
+        .eq("user_id", userId);
+
+      if (error) throw error;
+
+      await syncActiveLeagueFromSupabase({ leagueId: lid, withRounds: false });
+      setLeagueState(getLeagueSafe({}));
+      setUsersState(ensureArr(getUsers([])));
+
+      setInviteStatus({ type: "success", message: "Member removed ✅" });
+    } catch (e) {
+      setInviteStatus({
+        type: "error",
+        message:
+          "Remove failed (usually RLS). " +
+          "Your league_members DELETE policy must allow host/co-host to delete member rows. " +
+          humanizeSupabaseError(e),
+      });
+    } finally {
+      setMemberActionBusyId(null);
+    }
+  }
+
+  async function leaveLeague() {
+    const lid = cleanLeagueId(stableLeagueId);
+    if (!lid || !myId) return;
+
+    // host leaving is dangerous (league becomes orphaned). Keep it simple and block for now.
+    if (effectiveRole === LEAGUE_ROLES.host) {
+      setInviteStatus({
+        type: "info",
+        message: "Host can’t leave right now. (Transfer host or delete league — we can add transfer next.)",
+      });
+      return;
+    }
+
+    setMemberActionBusyId(myId);
+    setInviteStatus({ type: "", message: "" });
+
+    try {
+      const { error } = await supabase
+        .from("league_members")
+        .delete()
+        .eq("league_id", lid)
+        .eq("user_id", myId);
+
+      if (error) throw error;
+
+      // Clear active league + UI caches
+      await setActiveLeagueId(null);
+      clearLeagueUiCachesNow();
+
+      setInviteStatus({ type: "success", message: "You left the league." });
+      navigate("/leagues", { replace: true });
+    } catch (e) {
+      setInviteStatus({
+        type: "error",
+        message:
+          "Leave failed (usually RLS). " +
+          "Your league_members DELETE policy must allow users to delete their own membership row. " +
+          humanizeSupabaseError(e),
+      });
+    } finally {
+      setMemberActionBusyId(null);
     }
   }
 
@@ -912,12 +997,18 @@ export default function LeagueSettings() {
     }
   }
 
+  // ✅ helper for member role display
+  function roleForUser(uid) {
+    const cachedRole = ensureObj(league?.memberRoles || {})[uid] || LEAGUE_ROLES.member;
+    return cachedRole;
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="League Settings"
         subtitle={
-          canEdit ? "Manage points, season, and admins." : "You can view settings. Only host/co-host can edit."
+          canEdit ? "Manage points, members, and admins." : "You can view settings. Only host/co-host can edit."
         }
         right={
           <div className="flex flex-wrap gap-2">
@@ -941,7 +1032,25 @@ export default function LeagueSettings() {
         }
       />
 
-      {/* Quick debug */}
+      {/* Status */}
+      {inviteStatus?.message ? (
+        <Card className="p-4">
+          <div
+            className={[
+              "rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
+              inviteStatus.type === "success"
+                ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
+                : inviteStatus.type === "info"
+                ? "bg-slate-50 text-slate-800 ring-slate-200"
+                : "bg-rose-50 text-rose-900 ring-rose-200",
+            ].join(" ")}
+          >
+            {inviteStatus.message}
+          </div>
+        </Card>
+      ) : null}
+
+      {/* Current context */}
       <Card className="p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -950,7 +1059,8 @@ export default function LeagueSettings() {
               LeagueId: <span className="font-mono">{stableLeagueId}</span>
             </div>
             <div className="mt-1 text-xs font-semibold text-slate-600">
-              Your user id (Supabase auth): <span className="font-mono">{authUserId || "not signed in"}</span>
+              Your user id (Supabase auth):{" "}
+              <span className="font-mono">{authUserId || "not signed in"}</span>
             </div>
           </div>
 
@@ -969,60 +1079,89 @@ export default function LeagueSettings() {
         </div>
       </Card>
 
-      {/* Admin status */}
+      {/* Members (NEW + IMPORTANT) */}
       <Card className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-sm font-extrabold text-slate-900">Your access</div>
+            <div className="text-sm font-extrabold text-slate-900">Members</div>
             <div className="mt-1 text-xs font-semibold text-slate-600">
-              Logged in as <span className="font-extrabold">{myDisplayName}</span> ·{" "}
-              <span className="font-extrabold">{roleLabel(effectiveRole)}</span>
-              {roleLoading ? <span className="ml-2 text-slate-400">(checking…)</span> : null}
+              Host/co-host can remove members. Members can leave.
             </div>
-
-            <button
-              type="button"
-              onClick={async () => {
-                if (!stableLeagueId || !authUserId) return;
-                setRoleLoading(true);
-                try {
-                  let r = null;
-                  try {
-                    r = await fetchMyRoleDirect({ lid: stableLeagueId, uid: authUserId });
-                  } catch {
-                    r = await getMyLeagueRoleSupabase(stableLeagueId);
-                  }
-                  setMyRoleLive(r || LEAGUE_ROLES.member);
-                } catch (e) {
-                  setMyRoleLive(LEAGUE_ROLES.member);
-                  setInviteStatus({
-                    type: "error",
-                    message: "Refresh permissions failed (likely RLS). " + humanizeSupabaseError(e),
-                  });
-                } finally {
-                  setRoleLoading(false);
-                }
-              }}
-              disabled={!authUserId || roleLoading}
-              className={[
-                "mt-3 rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                !authUserId || roleLoading
-                  ? "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed"
-                  : "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50",
-              ].join(" ")}
-            >
-              {roleLoading ? "Refreshing…" : "Refresh permissions"}
-            </button>
           </div>
 
-          <span
+          <button
+            type="button"
+            disabled={memberActionBusyId === myId}
+            onClick={leaveLeague}
             className={[
-              "rounded-full px-3 py-2 text-xs font-extrabold ring-1",
-              canEdit ? "bg-emerald-50 text-emerald-800 ring-emerald-200" : "bg-slate-50 text-slate-700 ring-slate-200",
+              "rounded-xl px-3 py-2 text-xs font-extrabold",
+              effectiveRole === LEAGUE_ROLES.host
+                ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                : "bg-rose-600 text-white hover:bg-rose-500",
             ].join(" ")}
+            title={effectiveRole === LEAGUE_ROLES.host ? "Host can’t leave (transfer host or delete league)" : "Leave this league"}
           >
-            {canEdit ? "Editing enabled" : "View only"}
-          </span>
+            Leave league
+          </button>
+        </div>
+
+        <div className="mt-4 space-y-2">
+          {memberUsers.length === 0 ? (
+            <div className="text-sm font-semibold text-slate-600">No members found.</div>
+          ) : (
+            memberUsers.map((u) => {
+              const uid = getUserId(u);
+              const name = getUserName(u);
+              const role = roleForUser(uid);
+              const isHost = role === LEAGUE_ROLES.host;
+
+              const canRemoveThis =
+                canEdit &&
+                uid !== myId && // don't remove yourself here
+                !isHost; // keep it simple: don't remove host
+
+              const busy = memberActionBusyId === uid;
+
+              return (
+                <div
+                  key={uid}
+                  className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-extrabold text-slate-900">
+                      {name} {uid === myId ? <span className="text-slate-500">(You)</span> : null}
+                    </div>
+                    <div className="mt-0.5 text-xs font-semibold text-slate-600">
+                      {roleLabel(role)}
+                    </div>
+                  </div>
+
+                  {canRemoveThis ? (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => removeMember(uid)}
+                      className={[
+                        "rounded-xl px-3 py-2 text-xs font-extrabold",
+                        busy ? "bg-slate-200 text-slate-500 cursor-not-allowed" : "bg-rose-600 text-white hover:bg-rose-500",
+                      ].join(" ")}
+                      title="Remove member"
+                    >
+                      {busy ? "Removing…" : "Remove"}
+                    </button>
+                  ) : (
+                    <span className="rounded-full bg-white px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+                      {isHost ? "Host" : "—"}
+                    </span>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div className="mt-3 text-[11px] font-semibold text-slate-500">
+          If Remove/Leave fails, it’s almost always a <span className="font-mono">league_members</span> DELETE RLS policy issue.
         </div>
       </Card>
 
@@ -1090,7 +1229,7 @@ export default function LeagueSettings() {
             ) : (
               friendsNotInLeague.map((p) => {
                 const pid = p?.id;
-                const name = p?.display_name || "Friend";
+                const name = p?.display_name || p?.username || "Friend";
                 const alreadyInvited = pendingInviteeSet.has(pid);
                 const busy = inviteActionId === pid;
 
@@ -1162,7 +1301,9 @@ export default function LeagueSettings() {
               pendingInvites.map((inv) => {
                 const invitee = inv?.invitee || null;
                 const display =
-                  invitee?.display_name || String(inv?.invitee_user_id || "").slice(0, 8) + "…";
+                  invitee?.display_name ||
+                  invitee?.username ||
+                  String(inv?.invitee_user_id || "").slice(0, 8) + "…";
                 const created = inv?.created_at ? new Date(inv.created_at) : null;
 
                 return (
@@ -1198,21 +1339,6 @@ export default function LeagueSettings() {
             )}
           </div>
         </div>
-
-        {inviteStatus?.message ? (
-          <div
-            className={[
-              "mt-4 rounded-2xl px-4 py-3 text-sm font-semibold ring-1",
-              inviteStatus.type === "success"
-                ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
-                : inviteStatus.type === "info"
-                ? "bg-slate-50 text-slate-800 ring-slate-200"
-                : "bg-rose-50 text-rose-900 ring-rose-200",
-            ].join(" ")}
-          >
-            {inviteStatus.message}
-          </div>
-        ) : null}
       </Card>
 
       {/* Points System */}
@@ -1232,7 +1358,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("default")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=2, 3rd=0"
             >
@@ -1245,7 +1373,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("yourLeague")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="1st=3, 2nd=1, 3rd=0"
             >
@@ -1258,7 +1388,9 @@ export default function LeagueSettings() {
               onClick={() => setPreset("winnerOnly")}
               className={[
                 "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
-                canEdit ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50" : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
+                canEdit
+                  ? "bg-white text-slate-900 ring-slate-200 hover:bg-slate-50"
+                  : "bg-slate-50 text-slate-400 ring-slate-200 cursor-not-allowed",
               ].join(" ")}
               title="Winner only"
             >
@@ -1303,7 +1435,9 @@ export default function LeagueSettings() {
                         disabled={!canEdit}
                         className={[
                           "w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                          canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                          canEdit
+                            ? "border-slate-200 bg-white text-slate-900"
+                            : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
                         ].join(" ")}
                         aria-label={`Points for place ${p}`}
                       />
@@ -1315,7 +1449,9 @@ export default function LeagueSettings() {
                           onClick={() => removePlacement(p)}
                           className={[
                             "rounded-xl px-3 py-2 text-xs font-extrabold",
-                            canEdit ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-slate-100 text-slate-400 cursor-not-allowed",
+                            canEdit
+                              ? "bg-rose-600 text-white hover:bg-rose-500"
+                              : "bg-slate-100 text-slate-400 cursor-not-allowed",
                           ].join(" ")}
                           title="Remove this place"
                         >
@@ -1334,7 +1470,9 @@ export default function LeagueSettings() {
                   onClick={addPlacementRow}
                   className={[
                     "rounded-xl px-4 py-2 text-xs font-extrabold",
-                    canEdit ? "bg-slate-100 text-slate-900 hover:bg-slate-200" : "bg-slate-50 text-slate-400 cursor-not-allowed",
+                    canEdit
+                      ? "bg-slate-100 text-slate-900 hover:bg-slate-200"
+                      : "bg-slate-50 text-slate-400 cursor-not-allowed",
                   ].join(" ")}
                 >
                   + Add place
@@ -1354,7 +1492,9 @@ export default function LeagueSettings() {
               onClick={savePointsSystem}
               className={[
                 "rounded-xl px-4 py-2 text-sm font-extrabold",
-                canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+                canEdit
+                  ? "bg-slate-900 text-white hover:bg-slate-800"
+                  : "bg-slate-200 text-slate-500 cursor-not-allowed",
               ].join(" ")}
             >
               Save points system
@@ -1392,7 +1532,9 @@ export default function LeagueSettings() {
               disabled={!canEdit}
               className={[
                 "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                canEdit
+                  ? "border-slate-200 bg-white text-slate-900"
+                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
               ].join(" ")}
             />
           </div>
@@ -1406,7 +1548,9 @@ export default function LeagueSettings() {
               disabled={!canEdit}
               className={[
                 "mt-2 w-full rounded-xl border px-3 py-2 text-sm font-extrabold outline-none ring-emerald-200 focus:ring-4",
-                canEdit ? "border-slate-200 bg-white text-slate-900" : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
+                canEdit
+                  ? "border-slate-200 bg-white text-slate-900"
+                  : "border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed",
               ].join(" ")}
             />
           </div>
@@ -1419,7 +1563,9 @@ export default function LeagueSettings() {
             onClick={saveSeasonDates}
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
-              canEdit ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed",
+              canEdit
+                ? "bg-slate-900 text-white hover:bg-slate-800"
+                : "bg-slate-200 text-slate-500 cursor-not-allowed",
             ].join(" ")}
           >
             Save season dates
@@ -1444,9 +1590,7 @@ export default function LeagueSettings() {
           ) : (
             memberUsers.map((u) => {
               const uid = getUserId(u);
-
-              const cachedRole = ensureObj(league?.memberRoles || {})[uid] || LEAGUE_ROLES.member;
-              const role = cachedRole;
+              const role = roleForUser(uid);
               const isHost = role === LEAGUE_ROLES.host;
               const isCoHost = role === LEAGUE_ROLES.co_host;
 
@@ -1491,10 +1635,6 @@ export default function LeagueSettings() {
               );
             })
           )}
-        </div>
-
-        <div className="mt-3 text-[11px] font-semibold text-slate-500">
-          Admin actions update Supabase and then re-sync the league cache.
         </div>
       </Card>
 

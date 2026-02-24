@@ -2,7 +2,8 @@
 import { NavLink, useLocation } from "react-router-dom";
 
 const tabs = [
-  { to: "/", label: "Feed", icon: "🏌️" },
+  // Feed removed for now — send users to leagues instead
+  { to: "/leagues", label: "Home", icon: "🏌️" },
   { to: "/leagues", label: "Leagues", icon: "🏆" },
   { to: "/post", label: "Post", icon: "➕", primary: true },
   { to: "/friends", label: "Friends", icon: "👥" },
@@ -10,7 +11,8 @@ const tabs = [
 ];
 
 function isActivePath(pathname, to) {
-  if (to === "/") return pathname === "/";
+  // Treat leagues as active for both "Home" + "Leagues"
+  if (to === "/leagues") return pathname === "/leagues" || pathname.startsWith("/league/");
   return pathname.startsWith(to);
 }
 
@@ -76,7 +78,7 @@ export default function BottomTabs() {
 
               return (
                 <NavLink
-                  key={t.to}
+                  key={t.to + t.label}
                   to={t.to}
                   className={[
                     "relative flex h-12 flex-col items-center justify-center gap-0.5 rounded-xl px-2 transition",

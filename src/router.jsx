@@ -10,7 +10,6 @@ import {
 import App from "./App";
 
 // Pages
-import Feed from "./pages/Feed";
 import League from "./pages/League";
 import SubmitRound from "./pages/SubmitRound";
 import FindGolfers from "./pages/FindGolfers";
@@ -18,6 +17,7 @@ import Profile from "./pages/Profile";
 import Rules from "./pages/Rules";
 import Majors from "./pages/Majors";
 import LeagueSettings from "./pages/LeagueSettings";
+import BanterPage from "./pages/BanterPage";
 
 // Auth
 import Login from "./pages/Login";
@@ -27,7 +27,8 @@ import { useAuth } from "./auth/useAuth";
 
 function RouteError() {
   const err = useRouteError();
-  const msg = err?.message || (typeof err === "string" ? err : "") || "This page crashed.";
+  const msg =
+    err?.message || (typeof err === "string" ? err : "") || "This page crashed.";
 
   return (
     <div className="mx-auto w-full max-w-xl px-4 py-10">
@@ -83,8 +84,17 @@ const router = createBrowserRouter([
     element: <App />,
     errorElement: <RouteError />,
     children: [
-      // Feed can be public or private depending on your app. Leaving as-is (public).
-      { index: true, element: <Feed />, errorElement: <RouteError /> },
+      // ✅ Feed removed for now (prevents localStorage public bleed).
+      // Land on leagues instead.
+      {
+        index: true,
+        element: (
+          <RequireAuth>
+            <Navigate to="/leagues" replace />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
 
       // ✅ League pages require auth because they depend on user + memberships
       {
@@ -101,6 +111,17 @@ const router = createBrowserRouter([
         element: (
           <RequireAuth>
             <LeagueSettings />
+          </RequireAuth>
+        ),
+        errorElement: <RouteError />,
+      },
+
+      // ✅ Per-league banter (auth + league membership enforced by RLS)
+      {
+        path: "league/:leagueId/banter",
+        element: (
+          <RequireAuth>
+            <BanterPage />
           </RequireAuth>
         ),
         errorElement: <RouteError />,
@@ -141,9 +162,10 @@ const router = createBrowserRouter([
       { path: "submit", element: <Navigate to="/post" replace /> },
       { path: "find", element: <Navigate to="/friends" replace /> },
 
-      { path: "marketplace", element: <Navigate to="/" replace /> },
+      // Keep old link target harmless
+      { path: "marketplace", element: <Navigate to="/leagues" replace /> },
 
-      { path: "*", element: <Navigate to="/" replace /> },
+      { path: "*", element: <Navigate to="/leagues" replace /> },
     ],
   },
 ]);

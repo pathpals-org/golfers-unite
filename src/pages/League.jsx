@@ -283,6 +283,12 @@ export default function League() {
   const [leagueLoading, setLeagueLoading] = useState(false);
   const [leagueSyncError, setLeagueSyncError] = useState("");
 
+  // ✅ NEW: lock actions by role (host/cohost only)
+  const [myRole, setMyRole] = useState(null);
+  const [roleLoading, setRoleLoading] = useState(false);
+
+  const isAdmin = myRole === "host" || myRole === "cohost";
+
   // ✅ NEW: league invites inbox for users with no league
   const [pendingInvites, setPendingInvites] = useState([]);
   const [invitesLoading, setInvitesLoading] = useState(false);
@@ -312,6 +318,38 @@ export default function League() {
   const pointsSystem = useMemo(() => {
     return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
   }, [league?.pointsSystem]);
+
+  // ✅ Load my role for this league (host/cohost gating)
+  async function loadMyRole({ leagueId, userId }) {
+    if (!leagueId || !userId) {
+      setMyRole(null);
+      return;
+    }
+
+    setRoleLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from("league_members")
+        .select("role,status")
+        .eq("league_id", leagueId)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      if (data?.status && String(data.status) !== "active") {
+        setMyRole(null);
+        return;
+      }
+
+      setMyRole(data?.role || null);
+    } catch {
+      // fail-soft: no role means no admin actions
+      setMyRole(null);
+    } finally {
+      setRoleLoading(false);
+    }
+  }
 
   // ✅ NEW: load pending invites for this user
   async function loadMyInvites(userId) {
@@ -368,6 +406,8 @@ export default function League() {
         league_id: lid,
         user_id: user.id,
         role: "member",
+        status: "active",
+        joined_at: new Date().toISOString(),
       });
       // If already a member, we still want to mark invite accepted + continue
       if (memErr && String(memErr?.code || "") !== "23505") throw memErr;
@@ -392,6 +432,9 @@ export default function League() {
       setLeagueState(normalizeLeagueOrNull(result?.league));
       setUsersState(result?.users || getUsers([]));
       setRoundsState(result?.rounds || getRounds([]));
+
+      // ✅ Refresh role
+      await loadMyRole({ leagueId: lid, userId: user.id });
 
       setToast("Invite accepted ✅ Welcome to the league.");
       setPendingInvites((xs) => xs.filter((x) => x?.id !== invId));
@@ -485,6 +528,7 @@ export default function League() {
           setLeagueState(null);
           setUsersState([]);
           setRoundsState([]);
+          setMyRole(null);
           // eslint-disable-next-line no-void
           void setActiveLeagueId(null);
           return;
@@ -497,15 +541,24 @@ export default function League() {
 
         if (Array.isArray(result?.rounds)) setRoundsState(result.rounds);
         else setRoundsState(getRounds([]));
+
+        // ✅ Load role for this league
+        await loadMyRole({ leagueId: nextLeague.id, userId: user.id });
       } catch (e) {
         const msg = String(e?.message || "");
         if (alive && msg) setLeagueSyncError(msg);
 
         // fallback to cache (but still enforce “must have id”)
         if (!alive) return;
-        setLeagueState(normalizeLeagueOrNull(getLeagueSafe(null)));
+        const cached = normalizeLeagueOrNull(getLeagueSafe(null));
+        setLeagueState(cached);
         setUsersState(getUsers([]));
         setRoundsState(getRounds([]));
+        if (cached?.id && user?.id) {
+          await loadMyRole({ leagueId: cached.id, userId: user.id });
+        } else {
+          setMyRole(null);
+        }
       } finally {
         if (!alive) return;
         setLeagueLoading(false);
@@ -588,6 +641,8 @@ export default function League() {
         league_id: leagueId,
         user_id: user.id,
         role: "host",
+        status: "active",
+        joined_at: new Date().toISOString(),
       });
       if (memErr) throw memErr;
 
@@ -601,6 +656,8 @@ export default function League() {
       setLeagueState(normalizeLeagueOrNull(result?.league));
       setUsersState(result?.users || getUsers([]));
       setRoundsState(result?.rounds || getRounds([]));
+
+      await loadMyRole({ leagueId, userId: user.id });
 
       setShowCreate(false);
       setCreateName("");
@@ -655,7 +712,8 @@ export default function League() {
               <div className="space-y-2">
                 {pendingInvites.map((inv) => {
                   const lid = cleanLeagueId(inv?.league_id || inv?.league?.id);
-                  const leagueName = inv?.league?.name || (lid ? `League ${String(lid).slice(0, 8)}…` : "League");
+                  const leagueName =
+                    inv?.league?.name || (lid ? `League ${String(lid).slice(0, 8)}…` : "League");
                   const busy = inviteActionId === inv?.id;
 
                   return (
@@ -664,12 +722,8 @@ export default function League() {
                       className="flex items-center justify-between gap-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200"
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-extrabold text-slate-900">
-                          {leagueName}
-                        </div>
-                        <div className="mt-0.5 text-xs font-semibold text-slate-600">
-                          Invite pending
-                        </div>
+                        <div className="truncate text-sm font-extrabold text-slate-900">{leagueName}</div>
+                        <div className="mt-0.5 text-xs font-semibold text-slate-600">Invite pending</div>
                       </div>
 
                       <div className="flex items-center gap-2">
@@ -813,6 +867,13 @@ export default function League() {
   }
 
   function endSeasonConfirm() {
+    // ✅ HARD BLOCK: only host/cohost
+    if (!isAdmin) {
+      setToast("Only the Host / Co-host can end the season.");
+      setShowEndSeason(false);
+      return;
+    }
+
     const trophies = getTrophies([]);
 
     const champion = standings[0];
@@ -896,8 +957,19 @@ export default function League() {
     setShowEndSeason(false);
     setToast("Season ended — trophies awarded + standings archived 🏆");
 
+    // ✅ ALSO attempt to mark the season ended in Supabase (enforced by RLS later)
+    // This will fail safely if policy blocks it.
     // eslint-disable-next-line no-void
     void (async () => {
+      try {
+        await supabase
+          .from("leagues")
+          .update({ is_archived: true })
+          .eq("id", league.id);
+      } catch {
+        // ignore
+      }
+
       try {
         await syncActiveLeagueFromSupabase({ leagueId: league.id, withRounds: false });
       } catch {
@@ -940,6 +1012,13 @@ export default function League() {
             <div className="mt-1 text-[11px] font-semibold text-slate-500">
               League admins can edit points in{" "}
               <span className="font-extrabold text-slate-700">League Settings</span>.
+              {roleLoading ? (
+                <span className="ml-2 text-slate-400">Checking role…</span>
+              ) : myRole ? (
+                <span className="ml-2 rounded-lg bg-slate-100 px-2 py-1 text-[11px] font-extrabold text-slate-700 ring-1 ring-slate-200">
+                  Your role: {myRole}
+                </span>
+              ) : null}
             </div>
 
             {leagueLoading ? (
@@ -949,7 +1028,9 @@ export default function League() {
 
           <div className="ml-auto text-right">
             <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Week</div>
-            <div className="text-2xl font-extrabold text-emerald-700">{String(week).padStart(2, "0")}</div>
+            <div className="text-2xl font-extrabold text-emerald-700">
+              {String(week).padStart(2, "0")}
+            </div>
           </div>
         </div>
 
@@ -961,6 +1042,7 @@ export default function League() {
             + Submit Round
           </button>
 
+          {/* ✅ FIXED: go to real banter route (not feed) */}
           <button
             onClick={() => {
               const lid = resolveBestLeagueId({ league, resolvedLeagueId, stableLeagueIdRef });
@@ -970,10 +1052,10 @@ export default function League() {
               }
               // eslint-disable-next-line no-void
               void setActiveLeagueId(lid);
-              navigate("/?scope=league");
+              navigate(`/league/${encodeURIComponent(lid)}/banter`, { state: { leagueId: lid } });
             }}
             className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-            title="Opens the feed filtered to League banter"
+            title="League-only banter"
           >
             League Banter →
           </button>
@@ -1014,7 +1096,11 @@ export default function League() {
 
         {standings.length === 0 ? (
           <div className="p-4">
-            <EmptyState icon="📋" title="No rounds yet" description="Submit the first round to populate the league table." />
+            <EmptyState
+              icon="📋"
+              title="No rounds yet"
+              description="Submit the first round to populate the league table."
+            />
           </div>
         ) : (
           <div className="divide-y divide-slate-200">
@@ -1034,7 +1120,9 @@ export default function League() {
 
                     <div className="min-w-0">
                       <div className="truncate text-sm font-extrabold text-slate-900">{row.name}</div>
-                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">⭐ {row.majors} majors</div>
+                      <div className="mt-0.5 text-[11px] font-semibold text-slate-500">
+                        ⭐ {row.majors} majors
+                      </div>
                     </div>
 
                     <div className="text-center text-sm font-extrabold text-slate-900">{row.rounds}</div>
@@ -1055,9 +1143,24 @@ export default function League() {
 
         <div className="flex items-center justify-between gap-2 border-t border-slate-200 bg-white px-4 py-3">
           <div className="text-xs font-semibold text-slate-600">{leagueRounds.length} rounds played</div>
+
+          {/* ✅ FIXED: only admins can end season */}
           <button
-            onClick={() => setShowEndSeason(true)}
-            className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-extrabold text-white hover:bg-rose-500"
+            onClick={() => {
+              if (!isAdmin) {
+                setToast("Only the Host / Co-host can end the season.");
+                return;
+              }
+              setShowEndSeason(true);
+            }}
+            disabled={roleLoading}
+            className={[
+              "rounded-xl px-4 py-2 text-xs font-extrabold",
+              !isAdmin || roleLoading
+                ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                : "bg-rose-600 text-white hover:bg-rose-500",
+            ].join(" ")}
+            title={!isAdmin ? "Host/Co-host only" : "End the season"}
           >
             End Season
           </button>
@@ -1065,32 +1168,38 @@ export default function League() {
       </div>
 
       <Modal open={showEndSeason} title="End season?" onClose={() => setShowEndSeason(false)}>
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-            <div className="font-extrabold text-slate-900">What happens:</div>
-            <ul className="mt-2 list-disc space-y-1 pl-5 font-semibold">
-              <li>League Champion trophy awarded to #1 in points.</li>
-              <li>Season awards: Most Birdies / Most Eagles / Major Hound.</li>
-              <li>Standings snapshot archived to seasonArchives.</li>
-              <li>Rounds cleared for a fresh season start (demo flow).</li>
-            </ul>
+        {!isAdmin ? (
+          <div className="rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
+            Only the Host / Co-host can end the season.
           </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+              <div className="font-extrabold text-slate-900">What happens:</div>
+              <ul className="mt-2 list-disc space-y-1 pl-5 font-semibold">
+                <li>League Champion trophy awarded to #1 in points.</li>
+                <li>Season awards: Most Birdies / Most Eagles / Major Hound.</li>
+                <li>Standings snapshot archived to seasonArchives.</li>
+                <li>Rounds cleared for a fresh season start (demo flow).</li>
+              </ul>
+            </div>
 
-          <div className="flex flex-wrap gap-2">
-            <button
-              onClick={endSeasonConfirm}
-              className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-extrabold text-white hover:bg-rose-500"
-            >
-              Confirm End Season
-            </button>
-            <button
-              onClick={() => setShowEndSeason(false)}
-              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
-            >
-              Cancel
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={endSeasonConfirm}
+                className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-extrabold text-white hover:bg-rose-500"
+              >
+                Confirm End Season
+              </button>
+              <button
+                onClick={() => setShowEndSeason(false)}
+                className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-extrabold text-slate-900 hover:bg-slate-200"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </Modal>
 
       <Toast message={toast} onClose={() => setToast("")} />
