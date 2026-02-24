@@ -106,6 +106,7 @@ const router = createBrowserRouter([
         ),
         errorElement: <RouteError />,
       },
+
       {
         path: "league-settings",
         element: (
@@ -117,6 +118,7 @@ const router = createBrowserRouter([
       },
 
       // ✅ Per-league banter (auth + league membership enforced by RLS)
+      // URL: /league/<leagueId>/banter
       {
         path: "league/:leagueId/banter",
         element: (
@@ -136,6 +138,7 @@ const router = createBrowserRouter([
         ),
         errorElement: <RouteError />,
       },
+
       {
         path: "friends",
         element: (
@@ -145,6 +148,7 @@ const router = createBrowserRouter([
         ),
         errorElement: <RouteError />,
       },
+
       {
         path: "profile",
         element: (
@@ -158,6 +162,7 @@ const router = createBrowserRouter([
       { path: "rules", element: <Rules />, errorElement: <RouteError /> },
       { path: "majors", element: <Majors />, errorElement: <RouteError /> },
 
+      // Back-compat redirects
       { path: "league", element: <Navigate to="/leagues" replace /> },
       { path: "submit", element: <Navigate to="/post" replace /> },
       { path: "find", element: <Navigate to="/friends" replace /> },
