@@ -30,8 +30,11 @@ function shortId(id) {
 }
 
 function shortName(p) {
-  // profiles table: you told me you have username text (and may have display_name too)
-  return p?.display_name || p?.username || (p?.email ? String(p.email).split("@")[0] : null);
+  return (
+    p?.display_name ||
+    p?.username ||
+    (p?.email ? String(p.email).split("@")[0] : null)
+  );
 }
 
 function pairLowHigh(a, b) {
@@ -61,15 +64,9 @@ export default function FindGolfers() {
   const [email, setEmail] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
 
-  /**
-   * IMPORTANT NOTE:
-   * Your friendships column is addresse_id (double-s).
-   * If your real DB is addressee_id (double-e) instead, this page will never match incoming/outgoing.
-   * You previously said addresse_id, so we keep it.
-   */
-
+  // ✅ Correct column name: addressee_id
   const incoming = useMemo(() => {
-    return friendships.filter((f) => f.status === "pending" && f.addresse_id === authId);
+    return friendships.filter((f) => f.status === "pending" && f.addressee_id === authId);
   }, [friendships, authId]);
 
   const outgoing = useMemo(() => {
@@ -77,29 +74,24 @@ export default function FindGolfers() {
   }, [friendships, authId]);
 
   const friends = useMemo(() => {
-    // Schema-safe: accept rows involving me using either pair columns OR requester/addresse columns
-    return friendships.filter((f) => {
-      if (f.status !== "accepted") return false;
-      const involvedByPair = f.user_low === authId || f.user_high === authId;
-      const involvedByDirection = f.requester_id === authId || f.addresse_id === authId;
-      return involvedByPair || involvedByDirection;
-    });
+    // Only accepted rows involving me (pair columns are canonical)
+    return friendships.filter(
+      (f) =>
+        f.status === "accepted" &&
+        (f.user_low === authId || f.user_high === authId)
+    );
   }, [friendships, authId]);
 
+  // Canonical "other user" (use user_low/user_high, not requester/addressee direction)
   function otherId(row) {
     if (!row || !authId) return null;
 
-    // Preferred: user_low/user_high pairing
-    if (row.user_low && row.user_high) {
-      if (row.user_low === authId) return row.user_high;
-      if (row.user_high === authId) return row.user_low;
-    }
+    if (row.user_low === authId) return row.user_high;
+    if (row.user_high === authId) return row.user_low;
 
-    // Fallback: requester/addresse direction
-    if (row.requester_id && row.addresse_id) {
-      if (row.requester_id === authId) return row.addresse_id;
-      if (row.addresse_id === authId) return row.requester_id;
-    }
+    // Fallback (shouldn’t happen if query filters correctly)
+    if (row.requester_id === authId) return row.addressee_id;
+    if (row.addressee_id === authId) return row.requester_id;
 
     return null;
   }
@@ -109,7 +101,6 @@ export default function FindGolfers() {
     const name = shortName(p);
     const mail = p?.email ? String(p.email) : "";
 
-    // Always render something useful even if profiles/email are blocked by RLS.
     if (name && mail) return `${prefix}${name} (${mail})`;
     if (name) return `${prefix}${name}`;
     return `${prefix}User ${shortId(uid)}`;
@@ -121,7 +112,6 @@ export default function FindGolfers() {
 
     try {
       const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, "Auth session");
-
       const uid = sessionRes?.data?.session?.user?.id || null;
       setAuthId(uid);
 
@@ -133,9 +123,13 @@ export default function FindGolfers() {
         return;
       }
 
-      // Load my profile (email may be blocked by RLS — that's okay)
+      // Load my profile
       const meRes = await withTimeout(
-        supabase.from("profiles").select("id,email,display_name,username,created_at").eq("id", uid).maybeSingle(),
+        supabase
+          .from("profiles")
+          .select("id,email,display_name,username,created_at")
+          .eq("id", uid)
+          .maybeSingle(),
         8000,
         "Load profile"
       );
@@ -147,9 +141,8 @@ export default function FindGolfers() {
       const frRes = await withTimeout(
         supabase
           .from("friendships")
-          .select("id,user_low,user_high,requester_id,addresse_id,status,created_at,updated_at")
-          // Use pairing columns for involvement (works for pending + accepted if you always set user_low/user_high)
-          .or(`user_low.eq.${uid},user_high.eq.${uid},requester_id.eq.${uid},addresse_id.eq.${uid}`)
+          .select("id,user_low,user_high,requester_id,addressee_id,status,created_at,updated_at")
+          .or(`user_low.eq.${uid},user_high.eq.${uid}`)
           .order("updated_at", { ascending: false }),
         8000,
         "Load friendships"
@@ -160,7 +153,7 @@ export default function FindGolfers() {
       const rows = ensureArr(frRes.data);
       setFriendships(rows);
 
-      // Get all unique "other user ids" we need profiles for
+      // Load profiles for the "other" ids
       const ids = Array.from(new Set(rows.map((r) => otherId(r)).filter(Boolean)));
 
       if (!ids.length) {
@@ -168,14 +161,13 @@ export default function FindGolfers() {
         return;
       }
 
-      // Load friend profiles (email may be private; still fine)
       const profRes = await withTimeout(
         supabase.from("profiles").select("id,email,display_name,username,created_at").in("id", ids),
         8000,
         "Load friend profiles"
       );
 
-      // If profiles SELECT is blocked by RLS, we don’t crash — we still show fallback ids.
+      // If profiles SELECT is blocked by RLS, don’t crash
       if (profRes.error) {
         setProfilesById({});
         return;
@@ -231,9 +223,13 @@ export default function FindGolfers() {
 
     try {
       // Find profile by email
-      // NOTE: This only works if profiles.email is searchable under RLS for authenticated users.
+      // NOTE: This only works if profiles.email is readable/searchable under RLS.
       const profRes = await withTimeout(
-        supabase.from("profiles").select("id,email,display_name,username").eq("email", targetEmail).maybeSingle(),
+        supabase
+          .from("profiles")
+          .select("id,email,display_name,username")
+          .eq("email", targetEmail)
+          .maybeSingle(),
         8000,
         "Find profile by email"
       );
@@ -258,7 +254,7 @@ export default function FindGolfers() {
           user_low,
           user_high,
           requester_id: authId,
-          addresse_id: other, // ✅ your column name
+          addressee_id: other, // ✅ correct column name
           status: "pending",
         }),
         8000,
@@ -267,10 +263,7 @@ export default function FindGolfers() {
 
       if (insRes.error) {
         if (String(insRes.error.code) === "23505") {
-          setStatus({
-            type: "info",
-            message: "You already have a request/friendship with this golfer.",
-          });
+          setStatus({ type: "info", message: "You already have a request/friendship with this golfer." });
           return;
         }
         throw insRes.error;
@@ -293,7 +286,11 @@ export default function FindGolfers() {
 
     try {
       const upRes = await withTimeout(
-        supabase.from("friendships").update({ status: "accepted" }).eq("id", rowId).eq("addresse_id", authId),
+        supabase
+          .from("friendships")
+          .update({ status: "accepted" })
+          .eq("id", rowId)
+          .eq("addressee_id", authId),
         8000,
         "Accept request"
       );
@@ -315,7 +312,11 @@ export default function FindGolfers() {
     setStatus({ type: "", message: "" });
 
     try {
-      const delRes = await withTimeout(supabase.from("friendships").delete().eq("id", rowId), 8000, "Remove friendship");
+      const delRes = await withTimeout(
+        supabase.from("friendships").delete().eq("id", rowId),
+        8000,
+        "Remove friendship"
+      );
 
       if (delRes.error) throw delRes.error;
 
@@ -387,7 +388,9 @@ export default function FindGolfers() {
 
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-600">Friend’s email</div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-600">
+              Friend’s email
+            </div>
             <input
               type="email"
               value={email}
@@ -480,7 +483,7 @@ export default function FindGolfers() {
         ) : (
           <div className="space-y-2">
             {outgoing.map((r) => {
-              const toId = r.addresse_id;
+              const toId = r.addressee_id;
               return (
                 <div
                   key={r.id}
