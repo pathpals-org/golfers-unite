@@ -30,11 +30,7 @@ function shortId(id) {
 }
 
 function shortName(p) {
-  return (
-    p?.display_name ||
-    p?.username ||
-    (p?.email ? String(p.email).split("@")[0] : null)
-  );
+  return p?.display_name || p?.username || (p?.email ? String(p.email).split("@")[0] : null);
 }
 
 function pairLowHigh(a, b) {
@@ -74,24 +70,27 @@ export default function FindGolfers() {
   }, [friendships, authId]);
 
   const friends = useMemo(() => {
-    // Only accepted rows involving me (pair columns are canonical)
     return friendships.filter(
       (f) =>
         f.status === "accepted" &&
-        (f.user_low === authId || f.user_high === authId)
+        (f.user_low === authId || f.user_high === authId || f.requester_id === authId || f.addressee_id === authId)
     );
   }, [friendships, authId]);
 
-  // Canonical "other user" (use user_low/user_high, not requester/addressee direction)
   function otherId(row) {
     if (!row || !authId) return null;
 
-    if (row.user_low === authId) return row.user_high;
-    if (row.user_high === authId) return row.user_low;
+    // Preferred: canonical pair columns
+    if (row.user_low && row.user_high) {
+      if (row.user_low === authId) return row.user_high;
+      if (row.user_high === authId) return row.user_low;
+    }
 
-    // Fallback (shouldn’t happen if query filters correctly)
-    if (row.requester_id === authId) return row.addressee_id;
-    if (row.addressee_id === authId) return row.requester_id;
+    // Fallback: directional columns
+    if (row.requester_id && row.addressee_id) {
+      if (row.requester_id === authId) return row.addressee_id;
+      if (row.addressee_id === authId) return row.requester_id;
+    }
 
     return null;
   }
@@ -108,7 +107,7 @@ export default function FindGolfers() {
 
   async function loadMeAndFriends() {
     setLoading(true);
-    setStatus({ type: "", message: "" });
+    setStatus((s) => (s?.type === "success" ? s : { type: "", message: "" }));
 
     try {
       const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, "Auth session");
@@ -125,11 +124,7 @@ export default function FindGolfers() {
 
       // Load my profile
       const meRes = await withTimeout(
-        supabase
-          .from("profiles")
-          .select("id,email,display_name,username,created_at")
-          .eq("id", uid)
-          .maybeSingle(),
+        supabase.from("profiles").select("id,email,display_name,username,created_at").eq("id", uid).maybeSingle(),
         8000,
         "Load profile"
       );
@@ -137,12 +132,12 @@ export default function FindGolfers() {
       if (meRes.error) throw meRes.error;
       setMeProfile(meRes.data || null);
 
-      // Load friendships involving me
+      // ✅ IMPORTANT: Load friendships involving me using BOTH pair + direction columns
       const frRes = await withTimeout(
         supabase
           .from("friendships")
           .select("id,user_low,user_high,requester_id,addressee_id,status,created_at,updated_at")
-          .or(`user_low.eq.${uid},user_high.eq.${uid}`)
+          .or(`user_low.eq.${uid},user_high.eq.${uid},requester_id.eq.${uid},addressee_id.eq.${uid}`)
           .order("updated_at", { ascending: false }),
         8000,
         "Load friendships"
@@ -153,7 +148,6 @@ export default function FindGolfers() {
       const rows = ensureArr(frRes.data);
       setFriendships(rows);
 
-      // Load profiles for the "other" ids
       const ids = Array.from(new Set(rows.map((r) => otherId(r)).filter(Boolean)));
 
       if (!ids.length) {
@@ -167,7 +161,7 @@ export default function FindGolfers() {
         "Load friend profiles"
       );
 
-      // If profiles SELECT is blocked by RLS, don’t crash
+      // If profiles SELECT blocked by RLS, still show fallback IDs
       if (profRes.error) {
         setProfilesById({});
         return;
@@ -202,6 +196,33 @@ export default function FindGolfers() {
     }
   }
 
+  async function lookupExistingFriendship(myId, otherId) {
+    const { user_low, user_high } = pairLowHigh(myId, otherId);
+
+    // Try canonical pair lookup first
+    const a = await supabase
+      .from("friendships")
+      .select("id,status,requester_id,addressee_id,created_at,updated_at")
+      .eq("user_low", user_low)
+      .eq("user_high", user_high)
+      .maybeSingle();
+
+    if (!a.error && a.data) return a.data;
+
+    // Fallback: direction lookup
+    const b = await supabase
+      .from("friendships")
+      .select("id,status,requester_id,addressee_id,created_at,updated_at")
+      .or(
+        `and(requester_id.eq.${myId},addressee_id.eq.${otherId}),and(requester_id.eq.${otherId},addressee_id.eq.${myId})`
+      )
+      .maybeSingle();
+
+    if (!b.error && b.data) return b.data;
+
+    return null;
+  }
+
   async function sendFriendRequest() {
     const targetEmail = normEmail(email);
 
@@ -222,14 +243,9 @@ export default function FindGolfers() {
     setStatus({ type: "", message: "" });
 
     try {
-      // Find profile by email
-      // NOTE: This only works if profiles.email is readable/searchable under RLS.
+      // Find profile by email (only works if profiles.email is readable under RLS)
       const profRes = await withTimeout(
-        supabase
-          .from("profiles")
-          .select("id,email,display_name,username")
-          .eq("email", targetEmail)
-          .maybeSingle(),
+        supabase.from("profiles").select("id,email,display_name,username").eq("email", targetEmail).maybeSingle(),
         8000,
         "Find profile by email"
       );
@@ -254,7 +270,7 @@ export default function FindGolfers() {
           user_low,
           user_high,
           requester_id: authId,
-          addressee_id: other, // ✅ correct column name
+          addressee_id: other,
           status: "pending",
         }),
         8000,
@@ -263,9 +279,25 @@ export default function FindGolfers() {
 
       if (insRes.error) {
         if (String(insRes.error.code) === "23505") {
-          setStatus({ type: "info", message: "You already have a request/friendship with this golfer." });
+          // ✅ Explain what already exists
+          const existing = await lookupExistingFriendship(authId, other);
+
+          if (existing?.status === "accepted") {
+            setStatus({ type: "info", message: "You’re already friends ✅ Scroll down — they’ll be in ‘Your friends’." });
+          } else if (existing?.status === "pending") {
+            if (existing.requester_id === authId) {
+              setStatus({ type: "info", message: "You already sent a request to this golfer. See ‘Pending you sent’." });
+            } else {
+              setStatus({ type: "info", message: "They already sent you a request. See ‘Incoming requests’ and accept it." });
+            }
+          } else {
+            setStatus({ type: "info", message: "A friendship/request already exists. Check the lists below." });
+          }
+
+          await loadMeAndFriends();
           return;
         }
+
         throw insRes.error;
       }
 
@@ -286,11 +318,7 @@ export default function FindGolfers() {
 
     try {
       const upRes = await withTimeout(
-        supabase
-          .from("friendships")
-          .update({ status: "accepted" })
-          .eq("id", rowId)
-          .eq("addressee_id", authId),
+        supabase.from("friendships").update({ status: "accepted" }).eq("id", rowId).eq("addressee_id", authId),
         8000,
         "Accept request"
       );
@@ -312,12 +340,7 @@ export default function FindGolfers() {
     setStatus({ type: "", message: "" });
 
     try {
-      const delRes = await withTimeout(
-        supabase.from("friendships").delete().eq("id", rowId),
-        8000,
-        "Remove friendship"
-      );
-
+      const delRes = await withTimeout(supabase.from("friendships").delete().eq("id", rowId), 8000, "Remove friendship");
       if (delRes.error) throw delRes.error;
 
       setStatus({ type: "success", message: "Removed." });
@@ -388,9 +411,7 @@ export default function FindGolfers() {
 
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
           <div>
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-600">
-              Friend’s email
-            </div>
+            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-600">Friend’s email</div>
             <input
               type="email"
               value={email}
@@ -435,14 +456,9 @@ export default function FindGolfers() {
             {incoming.map((r) => {
               const fromId = r.requester_id;
               return (
-                <div
-                  key={r.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3"
-                >
+                <div key={r.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-slate-900">
-                      {displayLineFromUserId(fromId, "From: ")}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-slate-900">{displayLineFromUserId(fromId, "From: ")}</div>
                     <div className="truncate text-xs font-semibold text-slate-600">
                       Request • {r.created_at ? new Date(r.created_at).toLocaleString() : "—"}
                     </div>
@@ -485,14 +501,9 @@ export default function FindGolfers() {
             {outgoing.map((r) => {
               const toId = r.addressee_id;
               return (
-                <div
-                  key={r.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3"
-                >
+                <div key={r.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-slate-900">
-                      {displayLineFromUserId(toId, "To: ")}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-slate-900">{displayLineFromUserId(toId, "To: ")}</div>
                     <div className="truncate text-xs font-semibold text-slate-600">
                       Pending • {r.created_at ? new Date(r.created_at).toLocaleString() : "—"}
                     </div>
@@ -520,24 +531,15 @@ export default function FindGolfers() {
         {loading ? (
           <div className="text-sm font-semibold text-slate-600">Loading…</div>
         ) : friends.length === 0 ? (
-          <EmptyState
-            icon="👥"
-            title="No friends yet"
-            description="Add your mates by email so you can invite them into leagues."
-          />
+          <EmptyState icon="👥" title="No friends yet" description="Add your mates by email so you can invite them into leagues." />
         ) : (
           <div className="space-y-2">
             {friends.map((r) => {
               const oid = otherId(r);
               return (
-                <div
-                  key={r.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3"
-                >
+                <div key={r.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-slate-900">
-                      {displayLineFromUserId(oid)}
-                    </div>
+                    <div className="truncate text-sm font-extrabold text-slate-900">{displayLineFromUserId(oid)}</div>
                     <div className="truncate text-xs font-semibold text-slate-600">
                       Friends • {r.created_at ? new Date(r.created_at).toLocaleDateString() : "—"}
                     </div>
