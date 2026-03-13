@@ -5,29 +5,19 @@ import { useNavigate } from "react-router-dom";
 import Card from "../components/ui/Card";
 import PageHeader from "../components/ui/PageHeader";
 import EmptyState from "../components/ui/EmptyState";
+import { supabase } from "../lib/supabaseClient";
 
 import {
   KEYS,
-  get,
   set,
   getLeague,
-  setLeague,
-  getUsers,
   getRounds,
   getPointsSystem,
-  getBadges,
-  getTrophiesMap,
-  setBadges,
-  setTrophiesMap,
   calculateLeaguePoints,
   DEFAULT_POINTS_SYSTEM,
+  getActiveLeagueIdSupabaseFirst,
+  syncActiveLeagueFromSupabase,
 } from "../utils/storage";
-
-const CURRENT_USER_KEY = "currentUserId";
-
-function uid(prefix = "id") {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
 
 function safeUUID(prefix = "id") {
   try {
@@ -37,7 +27,7 @@ function safeUUID(prefix = "id") {
   } catch {
     // ignore
   }
-  return uid(prefix);
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function todayISO() {
@@ -62,110 +52,17 @@ function ensureObj(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
 
-function awardIfMissing(list, award) {
-  const exists = list.some((a) => a?.key === award.key);
-  if (exists) return list;
-  return [award, ...list];
-}
-
-function computeAwardsForRound({ round, previousRoundsForPlayer }) {
-  const badges = [];
-  const trophies = [];
-
-  const prevCount = previousRoundsForPlayer.length;
-  const isFirstRound = prevCount === 0;
-
-  if (isFirstRound) {
-    badges.push({
-      key: "badge_first_round",
-      title: "First Round",
-      desc: "Submitted your first round.",
-      icon: "🏁",
-    });
-  }
-
-  if ((round.birdies || 0) > 0) {
-    badges.push({
-      key: "badge_first_birdie",
-      title: "First Birdie",
-      desc: "Logged a birdie in a submitted round.",
-      icon: "🐦",
-    });
-  }
-
-  if ((round.eagles || 0) > 0) {
-    trophies.push({
-      key: "trophy_eagle_club",
-      title: "Eagle Club",
-      desc: "Logged an eagle in a submitted round.",
-      icon: "🦅",
-    });
-  }
-
-  if ((round.hio || 0) > 0) {
-    trophies.push({
-      key: "trophy_hole_in_one",
-      title: "Hole in One",
-      desc: "Aces are forever.",
-      icon: "⛳️",
-    });
-  }
-
-  const gross = Number(round.grossScore);
-  const par = Number(round.par);
-  const diff = Number.isFinite(gross) && Number.isFinite(par) ? gross - par : null;
-
-  if (Number.isFinite(gross) && gross < 90) {
-    badges.push({
-      key: "badge_break_90",
-      title: "Break 90",
-      desc: "Shot under 90.",
-      icon: "🔥",
-    });
-  }
-
-  if (Number.isFinite(gross) && gross < 80) {
-    trophies.push({
-      key: "trophy_break_80",
-      title: "Break 80",
-      desc: "That’s a proper score.",
-      icon: "🏆",
-    });
-  }
-
-  if (diff !== null && diff <= 0) {
-    trophies.push({
-      key: "trophy_par_or_better",
-      title: "Par or Better",
-      desc: "Finished level par or better.",
-      icon: "⭐️",
-    });
-  }
-
-  if ((round.birdies || 0) >= 5) {
-    trophies.push({
-      key: "trophy_birdie_fest",
-      title: "Birdie Fest",
-      desc: "5+ birdies in one round.",
-      icon: "🎉",
-    });
-  }
-
-  if (round.isMajor) {
-    badges.push({
-      key: "badge_major_day",
-      title: "Major Day",
-      desc: "Submitted a Major round.",
-      icon: "🏟️",
-    });
-  }
-
-  return { badges, trophies };
+function cleanLeagueId(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (s.toLowerCase() === "undefined" || s.toLowerCase() === "null") return null;
+  return s;
 }
 
 function getPlayerLabel(p) {
   if (!p) return "Unknown";
-  return p.name || p.fullName || p.displayName || p.username || "Unnamed Player";
+  return p.display_name || p.username || p.name || p.fullName || p.displayName || "Unnamed Player";
 }
 
 function Pill({ active, onClick, children }) {
@@ -187,9 +84,6 @@ function Pill({ active, onClick, children }) {
 
 /**
  * Image compression (no libraries)
- * - Resize longest side to maxDim
- * - Encode to JPEG at quality
- * Returns: dataURL ("data:image/jpeg;base64,...")
  */
 async function compressImageToDataURL(file, { maxDim = 1280, quality = 0.78 } = {}) {
   if (!file) return null;
@@ -226,10 +120,6 @@ async function compressImageToDataURL(file, { maxDim = 1280, quality = 0.78 } = 
   }
 }
 
-/**
- * Event key for placement ranking
- * (same leagueId + date + course + holes)
- */
 function makeEventKey({ leagueId, date, course, holes }) {
   return [
     leagueId || "no_league",
@@ -239,11 +129,6 @@ function makeEventKey({ leagueId, date, course, holes }) {
   ].join("::");
 }
 
-/**
- * Rank within an event (ties share same rank).
- * Medal mode: lower grossScore is better.
- * Competition ranking: 1,1,3...
- */
 function rankForGrossScore(eventRounds, grossScore) {
   const s = Number(grossScore);
   if (!Number.isFinite(s)) return null;
@@ -259,10 +144,6 @@ function rankForGrossScore(eventRounds, grossScore) {
   return distinctLower.size + 1;
 }
 
-/**
- * ✅ IMPORTANT: recompute placement points for everyone in the event
- * so earlier submitters get updated if someone beats them later.
- */
 function recomputeEventPoints(allRounds, { leagueId, date, course, holes, pointsSystem }) {
   const eventKey = makeEventKey({ leagueId, date, course, holes });
 
@@ -318,33 +199,169 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
   return updated;
 }
 
+function humanErr(e) {
+  return e?.message || String(e || "Something went wrong.");
+}
+
+async function resolveCurrentLeagueForUser(authUserId) {
+  const cachedLeague = getLeague(null);
+  const cachedId = cleanLeagueId(cachedLeague?.id);
+
+  if (cachedId) {
+    return cachedId;
+  }
+
+  try {
+    const activeLeagueId = await getActiveLeagueIdSupabaseFirst();
+    const cleanActive = cleanLeagueId(activeLeagueId);
+    if (cleanActive) return cleanActive;
+  } catch {
+    // ignore
+  }
+
+  const membershipRes = await supabase
+    .from("league_members")
+    .select("league_id, role, status, joined_at")
+    .eq("user_id", authUserId)
+    .eq("status", "active")
+    .order("joined_at", { ascending: false })
+    .limit(1);
+
+  if (membershipRes.error) throw membershipRes.error;
+
+  return cleanLeagueId(membershipRes.data?.[0]?.league_id || null);
+}
+
+async function insertRoundRobust({
+  leagueId,
+  playerId,
+  submittedBy,
+  date,
+  course,
+  holes,
+  par,
+  grossScore,
+  birdies,
+  eagles,
+  hio,
+  isMajor,
+  notes,
+}) {
+  const attempts = [
+    {
+      league_id: leagueId,
+      user_id: playerId,
+      submitted_by: submittedBy,
+      date,
+      course,
+      holes,
+      par,
+      gross_score: grossScore,
+      birdies,
+      eagles,
+      hio,
+      is_major: isMajor,
+      notes,
+      status: "approved",
+    },
+    {
+      league_id: leagueId,
+      player_id: playerId,
+      submitted_by: submittedBy,
+      date,
+      course,
+      holes,
+      par,
+      gross_score: grossScore,
+      birdies,
+      eagles,
+      hio,
+      is_major: isMajor,
+      notes,
+      status: "approved",
+    },
+    {
+      league_id: leagueId,
+      user_id: playerId,
+      date,
+      course,
+      holes,
+      par,
+      gross_score: grossScore,
+      birdies,
+      eagles,
+      hio,
+      is_major: isMajor,
+      notes,
+      status: "approved",
+    },
+    {
+      league_id: leagueId,
+      player_id: playerId,
+      date,
+      course,
+      holes,
+      par,
+      gross_score: grossScore,
+      birdies,
+      eagles,
+      hio,
+      is_major: isMajor,
+      notes,
+      status: "approved",
+    },
+    {
+      league_id: leagueId,
+      user_id: playerId,
+      date,
+      course,
+      gross_score: grossScore,
+    },
+    {
+      league_id: leagueId,
+      player_id: playerId,
+      date,
+      course,
+      gross_score: grossScore,
+    },
+  ];
+
+  let lastError = null;
+
+  for (const payload of attempts) {
+    // eslint-disable-next-line no-await-in-loop
+    const res = await supabase.from("rounds").insert(payload).select("*").maybeSingle();
+
+    if (!res.error) return res.data || null;
+
+    lastError = res.error;
+    const msg = String(res.error?.message || "").toLowerCase();
+
+    if (msg.includes("column") && msg.includes("does not exist")) continue;
+    if (msg.includes("null value") && msg.includes("violates")) continue;
+    if (msg.includes("schema cache")) continue;
+    break;
+  }
+
+  throw lastError || new Error("Failed to save round to Supabase.");
+}
+
 export default function SubmitRound() {
   const navigate = useNavigate();
 
-  const [players, setPlayers] = useState([]);
-  const [pointsSystem, setPointsSystemState] = useState(null);
   const [league, setLeagueState] = useState(() => getLeague(null));
+  const [players, setPlayers] = useState([]);
+  const [authUserId, setAuthUserId] = useState("");
+  const [myRole, setMyRole] = useState("");
+  const [leagueLoading, setLeagueLoading] = useState(true);
+  const [leagueError, setLeagueError] = useState("");
 
-  // "Current user" (MVP identity)
-  const [currentUserId, setCurrentUserId] = useState(() => {
-    try {
-      return localStorage.getItem(CURRENT_USER_KEY) || "";
-    } catch {
-      return "";
-    }
-  });
+  const [legacyPointsSystem, setLegacyPointsSystem] = useState(null);
 
   const [toast, setToast] = useState(null);
   const [touched, setTouched] = useState({});
   const [saving, setSaving] = useState(false);
 
-  // ✅ optional feed post
-  const [createPost, setCreatePost] = useState(true);
-  const [postToPublic, setPostToPublic] = useState(true);
-  const [postToFriends, setPostToFriends] = useState(false);
-  const [postToLeague, setPostToLeague] = useState(true);
-
-  // Scorecard photo (compressed)
   const [cardPhoto, setCardPhoto] = useState(null);
   const [compressing, setCompressing] = useState(false);
 
@@ -363,72 +380,157 @@ export default function SubmitRound() {
   }));
 
   useEffect(() => {
-    const loadedPlayers = ensureArray(getUsers([]));
-    setPlayers(loadedPlayers);
-
-    const loadedPoints = getPointsSystem(null);
-    setPointsSystemState(loadedPoints);
-
-    const lg = getLeague(null);
-
-    // ✅ Ensure league has a hostId AND persist it
-    if (lg && !lg.hostId) {
-      const firstUser = loadedPlayers[0]?.id || loadedPlayers[0]?._id || "";
-      const next = { ...lg, hostId: firstUser || "" };
-      setLeague(next);
-      setLeagueState(next);
-    } else {
-      setLeagueState(lg);
-    }
-
-    // Default current user if missing
-    if (!currentUserId && loadedPlayers.length) {
-      const first = loadedPlayers[0]?.id || loadedPlayers[0]?._id || "";
-      if (first) {
-        try {
-          localStorage.setItem(CURRENT_USER_KEY, first);
-        } catch {
-          // ignore
-        }
-        setCurrentUserId(first);
-      }
-    }
-
-    // Default playerId to current user
-    const resolvedUserId =
-      (currentUserId || "").trim() || (loadedPlayers[0]?.id || loadedPlayers[0]?._id || "");
-
-    if (!form.playerId && resolvedUserId) {
-      setForm((f) => ({ ...f, playerId: resolvedUserId }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Keep form playerId aligned to current user unless host is editing
-  useEffect(() => {
-    if (!currentUserId) return;
-    const host = league?.hostId && league.hostId === currentUserId;
-    if (host) return;
-    setForm((f) => (f.playerId === currentUserId ? f : { ...f, playerId: currentUserId }));
-  }, [currentUserId, league?.hostId]);
-
-  useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), 2400);
+    const t = setTimeout(() => setToast(null), 2600);
     return () => clearTimeout(t);
   }, [toast]);
 
+  useEffect(() => {
+    let alive = true;
+
+    async function loadSubmitContext() {
+      setLeagueLoading(true);
+      setLeagueError("");
+
+      try {
+        const sessionRes = await supabase.auth.getSession();
+        const uid = sessionRes?.data?.session?.user?.id || "";
+        if (!alive) return;
+
+        if (!uid) {
+          setLeagueError("You’re not logged in.");
+          setPlayers([]);
+          setLeagueState(null);
+          setAuthUserId("");
+          return;
+        }
+
+        setAuthUserId(uid);
+
+        const fallbackPoints = getPointsSystem(null);
+        setLegacyPointsSystem(fallbackPoints);
+
+        const leagueId = await resolveCurrentLeagueForUser(uid);
+        if (!alive) return;
+
+        if (!leagueId) {
+          setLeagueState(null);
+          setPlayers([]);
+          setLeagueError("You’re not currently in a league.");
+          return;
+        }
+
+        const leagueRes = await supabase
+          .from("leagues")
+          .select("id,name,description,season_label,points_rules,host_user_id,created_by")
+          .eq("id", leagueId)
+          .maybeSingle();
+
+        if (leagueRes.error) throw leagueRes.error;
+
+        const leagueRow = leagueRes.data || null;
+        if (!leagueRow?.id) {
+          setLeagueState(null);
+          setPlayers([]);
+          setLeagueError("Couldn’t load your league.");
+          return;
+        }
+
+        const memberRes = await supabase
+          .from("league_members")
+          .select("league_id,user_id,role,status,joined_at")
+          .eq("league_id", leagueId)
+          .eq("status", "active");
+
+        if (memberRes.error) throw memberRes.error;
+
+        const memberRows = ensureArray(memberRes.data);
+        const userIds = memberRows.map((m) => m.user_id).filter(Boolean);
+
+        let profileMap = {};
+        if (userIds.length) {
+          const profileRes = await supabase
+            .from("profiles")
+            .select("id,username,display_name")
+            .in("id", userIds);
+
+          if (!profileRes.error) {
+            ensureArray(profileRes.data).forEach((p) => {
+              if (!p?.id) return;
+              profileMap[p.id] = p;
+            });
+          }
+        }
+
+        const nextPlayers = memberRows.map((m) => {
+          const p = profileMap[m.user_id] || {};
+          return {
+            id: m.user_id,
+            user_id: m.user_id,
+            role: m.role,
+            status: m.status,
+            username: p.username || "",
+            display_name: p.display_name || "",
+            name: p.display_name || p.username || `User ${String(m.user_id).slice(0, 8)}…`,
+          };
+        });
+
+        const meMembership = memberRows.find((m) => m.user_id === uid) || null;
+        const nextRole = meMembership?.role || "";
+
+        const nextLeague = {
+          ...leagueRow,
+          id: leagueRow.id,
+          name: leagueRow.name || "League",
+          hostId: leagueRow.host_user_id || leagueRow.created_by || "",
+          pointsSystem:
+            leagueRow.points_rules && typeof leagueRow.points_rules === "object"
+              ? leagueRow.points_rules
+              : null,
+        };
+
+        if (!alive) return;
+
+        setLeagueState(nextLeague);
+        setPlayers(nextPlayers);
+        setMyRole(nextRole);
+
+        setForm((f) => ({
+          ...f,
+          playerId:
+            nextRole === "host" || nextRole === "co_host"
+              ? f.playerId || uid
+              : uid,
+        }));
+      } catch (e) {
+        if (!alive) return;
+        setLeagueError(humanErr(e));
+        setPlayers([]);
+        setLeagueState(null);
+      } finally {
+        if (!alive) return;
+        setLeagueLoading(false);
+      }
+    }
+
+    loadSubmitContext();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const currentUser = useMemo(() => {
-    if (!currentUserId) return null;
-    return players.find((p) => p.id === currentUserId || p._id === currentUserId) || null;
-  }, [players, currentUserId]);
+    if (!authUserId) return null;
+    return players.find((p) => p.id === authUserId || p.user_id === authUserId) || null;
+  }, [players, authUserId]);
 
   const selectedPlayer = useMemo(() => {
     const id = form.playerId;
-    return players.find((p) => p.id === id || p._id === id) || null;
+    return players.find((p) => p.id === id || p.user_id === id) || null;
   }, [players, form.playerId]);
 
-  const isHost = Boolean(currentUserId && league?.hostId && league.hostId === currentUserId);
+  const isHost = myRole === "host" || myRole === "co_host";
 
   const leaguePointsSystem = useMemo(() => {
     const ps = league?.pointsSystem ? ensureObj(league.pointsSystem) : null;
@@ -505,8 +607,7 @@ export default function SubmitRound() {
       };
     }
 
-    // Legacy fallback preview
-    const legacy = pointsSystem && typeof pointsSystem === "object" ? pointsSystem : null;
+    const legacy = legacyPointsSystem && typeof legacyPointsSystem === "object" ? legacyPointsSystem : null;
 
     const birdies = clampInt(Number(form.birdies), 0, 99);
     const eagles = clampInt(Number(form.eagles), 0, 99);
@@ -532,16 +633,22 @@ export default function SubmitRound() {
 
     return {
       points: total,
-      breakdown: { mode: "legacy", baseRound, extras: preMult - baseRound, multiplier: form.isMajor ? majorMultiplier : 1 },
+      breakdown: {
+        mode: "legacy",
+        baseRound,
+        extras: preMult - baseRound,
+        multiplier: form.isMajor ? majorMultiplier : 1,
+      },
       diff,
       netLabel: diff === null ? "—" : diff === 0 ? "E" : diff > 0 ? `+${diff}` : `${diff}`,
     };
-  }, [form, league?.id, leaguePointsSystem, usingNewPoints, pointsSystem]);
+  }, [form, league?.id, leaguePointsSystem, usingNewPoints, legacyPointsSystem]);
 
   const errors = useMemo(() => {
     const e = {};
 
-    if (!currentUserId) e.currentUserId = "Pick who you are (top card).";
+    if (!authUserId) e.authUserId = "You must be logged in.";
+    if (!league?.id) e.league = "No active league found.";
     if (!form.playerId) e.playerId = "Pick a player.";
     if (!form.date) e.date = "Pick a date.";
     if (!form.course.trim()) e.course = "Course name is required.";
@@ -564,9 +671,9 @@ export default function SubmitRound() {
     if (!Number.isFinite(hio) || hio < 0) e.hio = "HIO must be 0 or more.";
 
     return e;
-  }, [form, currentUserId]);
+  }, [form, authUserId, league?.id]);
 
-  const canSubmit = Object.keys(errors).length === 0 && !saving && !compressing;
+  const canSubmit = Object.keys(errors).length === 0 && !saving && !compressing && !leagueLoading;
 
   function update(name, value) {
     setForm((f) => ({ ...f, [name]: value }));
@@ -574,55 +681,6 @@ export default function SubmitRound() {
 
   function markTouched(name) {
     setTouched((t) => ({ ...t, [name]: true }));
-  }
-
-  function pushFeedPost({ round, pointsAdded, pointsBreakdown }) {
-    if (!createPost) return;
-
-    const toPublic = postToPublic;
-    const toFriends = postToFriends;
-    const toLeague = postToLeague;
-
-    if (!toPublic && !toFriends && !toLeague) return;
-
-    const posts = ensureArray(get(KEYS.playPosts, []));
-
-    const rank = pointsBreakdown?.rank;
-    const modeLabel =
-      typeof rank === "number"
-        ? `(${rank}${rank === 1 ? "st" : rank === 2 ? "nd" : rank === 3 ? "rd" : "th"})`
-        : "";
-
-    const post = {
-      id: safeUUID("post"),
-      userId: round.playerId,
-      leagueId: toLeague ? league?.id || null : null,
-      createdAt: new Date().toISOString(),
-
-      toPublic,
-      toFriends,
-      toLeague,
-
-      text:
-        round.notes?.trim() ||
-        `${round.playerName} posted a round at ${round.course} — ${round.grossScore} (${computed.netLabel}). ${pointsAdded} pts ${modeLabel}`.trim(),
-      score: {
-        total: round.grossScore,
-        birdies: round.birdies,
-        eagles: round.eagles,
-        hio: round.hio,
-        points: pointsAdded,
-        toPar: computed.netLabel,
-        course: round.course,
-        date: round.date,
-        isMajor: round.isMajor,
-      },
-      media: null,
-      likes: [],
-      comments: [],
-    };
-
-    set(KEYS.playPosts, [post, ...posts]);
   }
 
   async function onPickScorecard(e) {
@@ -642,7 +700,7 @@ export default function SubmitRound() {
         return;
       }
       setCardPhoto(dataUrl);
-      setToast({ type: "success", title: "Scorecard added", msg: "Saved as a lightweight photo for the round." });
+      setToast({ type: "success", title: "Scorecard added", msg: "Saved with this round preview." });
     } catch {
       setToast({ type: "error", title: "Image failed", msg: "Try a different photo." });
     } finally {
@@ -653,8 +711,10 @@ export default function SubmitRound() {
 
   async function handleSubmit(e) {
     e.preventDefault();
+
     setTouched({
-      currentUserId: true,
+      authUserId: true,
+      league: true,
       date: true,
       playerId: true,
       course: true,
@@ -672,52 +732,76 @@ export default function SubmitRound() {
     }
 
     setSaving(true);
+
     try {
+      const leagueId = cleanLeagueId(league?.id);
+      if (!leagueId) throw new Error("No active league found.");
+
+      const playerId = isHost ? form.playerId : authUserId;
+
+      const playerObj = players.find((p) => p.id === playerId || p.user_id === playerId);
+      const playerName = getPlayerLabel(playerObj);
+
+      const grossScore = Number(form.grossScore);
+      const birdies = clampInt(Number(form.birdies), 0, 99);
+      const eagles = clampInt(Number(form.eagles), 0, 99);
+      const hio = clampInt(Number(form.hio), 0, 18);
+
+      // 1) Save to Supabase first
+      let insertedRound = null;
+      try {
+        insertedRound = await insertRoundRobust({
+          leagueId,
+          playerId,
+          submittedBy: authUserId,
+          date: form.date,
+          course: form.course.trim(),
+          holes: Number(form.holes),
+          par: Number(form.par),
+          grossScore,
+          birdies,
+          eagles,
+          hio,
+          isMajor: Boolean(form.isMajor),
+          notes: form.notes.trim(),
+        });
+      } catch (dbErr) {
+        throw new Error(`Round save failed in Supabase: ${humanErr(dbErr)}`);
+      }
+
+      // 2) Also update local cache immediately for fast UI/preview
       const allRoundsBefore = ensureArray(getRounds([]));
 
-      // players submit THEIR OWN score; host can submit for others
-      const playerId = isHost ? form.playerId : currentUserId;
-
-      const prevRoundsForPlayer = allRoundsBefore.filter((r) => (r.playerId || r.userId) === playerId);
-
-      const playerObj = players.find((p) => p.id === playerId || p._id === playerId);
-
       const baseRound = {
-        id: uid("round"),
-        createdAt: new Date().toISOString(),
+        id: insertedRound?.id || safeUUID("round"),
+        createdAt: insertedRound?.created_at || new Date().toISOString(),
         date: form.date,
-
         playerId,
-        submittedBy: currentUserId,
-        playerName: getPlayerLabel(playerObj),
-
+        userId: playerId,
+        submittedBy: authUserId,
+        playerName,
         course: form.course.trim(),
         holes: Number(form.holes),
         par: Number(form.par),
-        grossScore: Number(form.grossScore),
-        birdies: clampInt(Number(form.birdies), 0, 99),
-        eagles: clampInt(Number(form.eagles), 0, 99),
-        hio: clampInt(Number(form.hio), 0, 18),
+        grossScore,
+        birdies,
+        eagles,
+        hio,
         isMajor: Boolean(form.isMajor),
         notes: form.notes.trim(),
-        leagueId: league?.id || null,
-
+        leagueId,
         cardPhoto: cardPhoto || null,
         status: "approved",
-
-        // ✅ save preview points (will be corrected when we recompute the event)
         points: Number(computed.points) || 0,
         pointsBreakdown: computed.breakdown || null,
       };
 
-      // ✅ Add round newest-first manually so we can recompute & persist cleanly
       const allAfterAdd = [baseRound, ...allRoundsBefore];
 
-      // ✅ If using new placement system, recompute everyone in this event and persist
       let finalAll = allAfterAdd;
       if (usingNewPoints) {
         finalAll = recomputeEventPoints(allAfterAdd, {
-          leagueId: baseRound.leagueId || null,
+          leagueId,
           date: baseRound.date,
           course: baseRound.course,
           holes: baseRound.holes,
@@ -725,40 +809,16 @@ export default function SubmitRound() {
         });
       }
 
-      // ✅ Persist rounds list
       set(KEYS.rounds, finalAll);
 
-      // Pull the updated copy (so toast/feed uses corrected points)
+      // 3) Re-sync league cache from Supabase if available
+      try {
+        await syncActiveLeagueFromSupabase({ leagueId, withRounds: true });
+      } catch {
+        // fail-soft
+      }
+
       const savedRound = finalAll.find((r) => r.id === baseRound.id) || baseRound;
-
-      // Awards (use savedRound)
-      const computedAwards = computeAwardsForRound({
-        round: savedRound,
-        previousRoundsForPlayer: prevRoundsForPlayer,
-      });
-
-      const stamp = new Date().toISOString();
-
-      const allBadges = getBadges({});
-      const existingBadges = ensureArray(allBadges[playerId]);
-      const nextBadges = computedAwards.badges.reduce((acc, a) => {
-        return awardIfMissing(acc, { ...a, earnedAt: stamp, roundId: savedRound.id });
-      }, existingBadges);
-      setBadges({ ...allBadges, [playerId]: nextBadges });
-
-      const trophiesMap = getTrophiesMap();
-      const existingTrophies = ensureArray(trophiesMap[playerId]);
-      const nextTrophies = computedAwards.trophies.reduce((acc, a) => {
-        return awardIfMissing(acc, { ...a, earnedAt: stamp, roundId: savedRound.id });
-      }, existingTrophies);
-      setTrophiesMap({ ...trophiesMap, [playerId]: nextTrophies });
-
-      // Feed post (uses final points)
-      pushFeedPost({
-        round: savedRound,
-        pointsAdded: Number(savedRound.points) || 0,
-        pointsBreakdown: savedRound.pointsBreakdown || null,
-      });
 
       const rank = savedRound?.pointsBreakdown?.rank;
       const rankLabel =
@@ -774,13 +834,12 @@ export default function SubmitRound() {
 
       setToast({
         type: "success",
-        title: "Round submitted",
+        title: "Round posted",
         msg: rankLabel
-          ? `${rankLabel} place — +${savedRound.points} points added for ${getPlayerLabel(playerObj)}.`
-          : `+${savedRound.points} points added for ${getPlayerLabel(playerObj)}.`,
+          ? `${playerName} posted a round in ${league?.name || "your league"} — ${rankLabel}, +${savedRound.points} pts.`
+          : `${playerName} posted a round in ${league?.name || "your league"} — +${savedRound.points} pts.`,
       });
 
-      // Reset
       setForm((f) => ({
         ...f,
         date: todayISO(),
@@ -793,14 +852,20 @@ export default function SubmitRound() {
         hio: 0,
         isMajor: false,
         notes: "",
-        playerId: isHost ? f.playerId : currentUserId,
+        playerId: isHost ? f.playerId : authUserId,
       }));
       setTouched({});
       setCardPhoto(null);
 
       setTimeout(() => {
         navigate("/leagues");
-      }, 650);
+      }, 700);
+    } catch (err) {
+      setToast({
+        type: "error",
+        title: "Couldn’t post round",
+        msg: humanErr(err),
+      });
     } finally {
       setSaving(false);
     }
@@ -812,9 +877,7 @@ export default function SubmitRound() {
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-sm font-semibold text-slate-900">Points Preview</div>
-            <div className="text-xs text-slate-600">
-              Legacy mode. Switch points in League → More → Points Settings.
-            </div>
+            <div className="text-xs text-slate-600">Legacy mode.</div>
           </div>
           <div className="rounded-2xl bg-slate-900 px-3 py-1.5 text-sm font-bold text-white">
             {computed.points} pts
@@ -844,7 +907,7 @@ export default function SubmitRound() {
         <div>
           <div className="text-sm font-semibold text-slate-900">Points Preview</div>
           <div className="text-xs text-slate-600">
-            Rank if submitted now: <span className="font-semibold text-slate-900">{rankLabel}</span>
+            Rank if posted now: <span className="font-semibold text-slate-900">{rankLabel}</span>
             {" · "}Placement {placementPoints}
             {participationPoints ? ` · Play +${participationPoints}` : ""}
             {bonusPoints ? ` · Bonus +${bonusPoints}` : " · Bonuses off"}
@@ -857,21 +920,60 @@ export default function SubmitRound() {
     );
   }, [computed, usingNewPoints]);
 
-  if (!players.length) {
+  if (leagueLoading) {
     return (
       <div className="pt-2">
-        <PageHeader title="Submit Round" subtitle="Add a round to the league." />
+        <PageHeader title="Submit Round" subtitle="Loading your league…" />
+        <div className="mt-4">
+          <Card className="p-5">
+            <div className="text-sm font-extrabold text-slate-900">Loading…</div>
+            <div className="mt-2 text-sm font-semibold text-slate-600">
+              Checking which league you’re in and loading members.
+            </div>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+
+  if (leagueError || !league?.id) {
+    return (
+      <div className="pt-2">
+        <PageHeader title="Submit Round" subtitle="Post a round into your league." />
         <div className="mt-4">
           <EmptyState
-            icon="👥"
-            title="No players found"
-            description="Your league needs at least one player in localStorage to submit a round."
+            icon="🏌️"
+            title="No active league found"
+            description={leagueError || "You need to be in a league before posting a round."}
             action={
               <button
                 onClick={() => navigate("/leagues")}
                 className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
               >
-                Back to League
+                Back to Leagues
+              </button>
+            }
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (!players.length) {
+    return (
+      <div className="pt-2">
+        <PageHeader title="Submit Round" subtitle="Post a round into your league." />
+        <div className="mt-4">
+          <EmptyState
+            icon="👥"
+            title="No league members found"
+            description="Your league loaded, but no active members were found to submit a round for."
+            action={
+              <button
+                onClick={() => navigate("/leagues")}
+                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white"
+              >
+                Back to Leagues
               </button>
             }
           />
@@ -882,7 +984,7 @@ export default function SubmitRound() {
 
   return (
     <div className="space-y-4">
-      <PageHeader title="Submit Round" subtitle="Fast entry. Clean stats. Auto points." />
+      <PageHeader title="Submit Round" subtitle="Post a round directly into your current league." />
 
       {toast ? (
         <div
@@ -898,45 +1000,50 @@ export default function SubmitRound() {
         </div>
       ) : null}
 
-      {/* Who you are */}
       <Card className="p-4">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-sm font-extrabold text-slate-900">You are</div>
-            <div className="mt-0.5 text-xs font-semibold text-slate-600">
-              For MVP testing: pick who’s using this device right now.
+            <div className="text-sm font-extrabold text-slate-900">Posting into</div>
+            <div className="mt-1 text-lg font-extrabold text-slate-900">{league.name || "League"}</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Only rounds for this league will be posted from this page.
             </div>
           </div>
 
-          {isHost ? (
-            <div className="rounded-xl bg-amber-100 px-3 py-2 text-xs font-extrabold text-amber-900 ring-1 ring-amber-200">
-              Host
+          <span className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+            {isHost ? "Host / Co-host" : "Player"}
+          </span>
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-slate-900">Submitting as</div>
+            <div className="mt-0.5 text-xs font-semibold text-slate-600">
+              Players submit their own rounds. Host/co-host can submit for any active member.
             </div>
-          ) : (
-            <div className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
-              Player
-            </div>
-          )}
+          </div>
+
+          <div className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+            {getPlayerLabel(currentUser)}
+          </div>
         </div>
 
         <div className="mt-3">
+          <label className="mb-1 block text-xs font-semibold text-slate-700">Player</label>
           <select
-            value={currentUserId}
-            onChange={(e) => {
-              const next = e.target.value;
-              setCurrentUserId(next);
-              try {
-                localStorage.setItem(CURRENT_USER_KEY, next);
-              } catch {
-                // ignore
-              }
-            }}
+            value={form.playerId}
+            onChange={(e) => update("playerId", e.target.value)}
+            onBlur={() => markTouched("playerId")}
+            disabled={!isHost}
             className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
-              touched.currentUserId && errors.currentUserId ? "border-rose-300" : "border-slate-200"
-            }`}
+              touched.playerId && errors.playerId ? "border-rose-300" : "border-slate-200"
+            } ${!isHost ? "bg-slate-50 text-slate-600" : ""}`}
+            title={!isHost ? "Players submit their own scores. Host/co-host can submit for others." : ""}
           >
             {players.map((p) => {
-              const id = p.id || p._id || "";
+              const id = p.id || p.user_id || "";
               return (
                 <option key={id} value={id}>
                   {getPlayerLabel(p)}
@@ -945,64 +1052,16 @@ export default function SubmitRound() {
             })}
           </select>
 
-          {errors.currentUserId ? (
-            <div className="mt-1 text-xs font-semibold text-rose-600">{errors.currentUserId}</div>
-          ) : null}
-
-          {currentUser ? (
-            <div className="mt-2 text-xs font-semibold text-slate-600">
-              Submitting as:{" "}
-              <span className="font-extrabold text-slate-900">{getPlayerLabel(currentUser)}</span>
+          {!isHost ? (
+            <div className="mt-1 text-xs font-semibold text-slate-500">
+              You can only post your own score from this account.
             </div>
           ) : null}
+
+          {touched.playerId && errors.playerId ? (
+            <div className="mt-1 text-xs text-rose-600">{errors.playerId}</div>
+          ) : null}
         </div>
-      </Card>
-
-      <Card className="p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-extrabold text-slate-900">Create a feed post?</div>
-            <div className="mt-0.5 text-xs font-semibold text-slate-600">
-              Makes the app feel social (recommended).
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => setCreatePost((v) => !v)}
-            className={`relative inline-flex h-8 w-14 items-center rounded-full border transition ${
-              createPost ? "border-emerald-300 bg-emerald-100" : "border-slate-200 bg-white"
-            }`}
-            aria-pressed={createPost}
-          >
-            <span
-              className={`inline-block h-6 w-6 transform rounded-full bg-slate-900 transition ${
-                createPost ? "translate-x-7" : "translate-x-1"
-              }`}
-            />
-          </button>
-        </div>
-
-        {createPost ? (
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Post to:</div>
-            <Pill active={postToPublic} onClick={() => setPostToPublic((v) => !v)}>
-              Public
-            </Pill>
-            <Pill active={postToFriends} onClick={() => setPostToFriends((v) => !v)}>
-              Friends
-            </Pill>
-            <Pill active={postToLeague} onClick={() => setPostToLeague((v) => !v)}>
-              League
-            </Pill>
-
-            {!postToPublic && !postToFriends && !postToLeague ? (
-              <div className="w-full text-xs font-semibold text-rose-600">
-                Pick at least one destination (Public / Friends / League).
-              </div>
-            ) : null}
-          </div>
-        ) : null}
       </Card>
 
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -1011,51 +1070,19 @@ export default function SubmitRound() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold text-slate-900">Round Details</div>
-                <div className="text-xs text-slate-600">Date, player, and basic scoring.</div>
+                <div className="text-xs text-slate-600">Date, course, score, and round type.</div>
               </div>
+
               <button
                 type="button"
                 onClick={() => navigate("/leagues")}
                 className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-900 shadow-sm active:scale-[0.99]"
               >
-                League
+                Back
               </button>
             </div>
 
             <div className="grid grid-cols-1 gap-3">
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Player</label>
-                <select
-                  value={form.playerId}
-                  onChange={(e) => update("playerId", e.target.value)}
-                  onBlur={() => markTouched("playerId")}
-                  disabled={!isHost}
-                  className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
-                    touched.playerId && errors.playerId ? "border-rose-300" : "border-slate-200"
-                  } ${!isHost ? "bg-slate-50 text-slate-600" : ""}`}
-                  title={!isHost ? "Players submit their own scores. Host can submit for others." : ""}
-                >
-                  {players.map((p) => {
-                    const id = p.id || p._id || "";
-                    return (
-                      <option key={id} value={id}>
-                        {getPlayerLabel(p)}
-                      </option>
-                    );
-                  })}
-                </select>
-
-                {!isHost ? (
-                  <div className="mt-1 text-xs font-semibold text-slate-500">
-                    Players submit their own score. (Host can submit for others.)
-                  </div>
-                ) : null}
-
-                {touched.playerId && errors.playerId ? (
-                  <div className="mt-1 text-xs text-rose-600">{errors.playerId}</div>
-                ) : null}
-              </div>
-
               <div>
                 <label className="mb-1 block text-xs font-semibold text-slate-700">Date</label>
                 <input
@@ -1151,22 +1178,31 @@ export default function SubmitRound() {
                 </div>
               </div>
             </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Round type:</div>
+              <Pill active={!form.isMajor} onClick={() => update("isMajor", false)}>
+                Standard
+              </Pill>
+              <Pill active={form.isMajor} onClick={() => update("isMajor", true)}>
+                Major
+              </Pill>
+            </div>
           </div>
         </Card>
 
-        {/* Scorecard photo */}
         <Card className="p-4">
           <div className="space-y-3">
             <div>
               <div className="text-sm font-semibold text-slate-900">Scorecard photo (optional)</div>
               <div className="text-xs text-slate-600">
-                Helps verify rounds. Saved as a small, compressed image (MVP-safe).
+                Helpful for proof. Saved with the round preview.
               </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-xs font-extrabold text-white hover:bg-slate-800">
-                {compressing ? "Compressing…" : "Upload photo"}
+                {compressing ? "Processing…" : "Upload photo"}
                 <input
                   type="file"
                   accept="image/*"
@@ -1190,13 +1226,10 @@ export default function SubmitRound() {
             {cardPhoto ? (
               <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
                 <img src={cardPhoto} alt="Scorecard" className="h-56 w-full object-cover" />
-                <div className="border-t border-slate-200 px-4 py-3 text-xs font-semibold text-slate-600">
-                  Stored with the round (not posted to feed by default).
-                </div>
               </div>
             ) : (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-600">
-                Tip: snap the card flat + good lighting. (Later: AI scan can auto-fill the form.)
+                Tip: later you can wire AI scorecard scanning into this image flow.
               </div>
             )}
           </div>
@@ -1207,7 +1240,7 @@ export default function SubmitRound() {
             <div>
               <div className="text-sm font-semibold text-slate-900">Scoring Events</div>
               <div className="text-xs text-slate-600">
-                Always tracked for badges/trophies. Bonus points are league-controlled.
+                These feed badges/trophies later and can affect bonus points now.
               </div>
             </div>
 
@@ -1258,11 +1291,11 @@ export default function SubmitRound() {
 
             {usingNewPoints ? (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-700">
-                League points are active (custom placement table + optional bonuses).
+                This league is using its live Supabase points rules.
               </div>
             ) : (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-700">
-                Legacy scoring is active. Set league points in League → More → Points Settings.
+                Using fallback local points settings.
               </div>
             )}
           </div>
@@ -1273,44 +1306,47 @@ export default function SubmitRound() {
             <div>
               <div className="text-sm font-semibold text-slate-900">Notes</div>
               <div className="text-xs text-slate-600">
-                Optional. If you create a feed post, this becomes the caption.
+                Optional notes about the round.
               </div>
             </div>
 
             <textarea
               value={form.notes}
               onChange={(e) => update("notes", e.target.value)}
-              placeholder="Quick highlight… conditions, best holes, matchplay drama…"
+              placeholder="Quick highlight… weather, best hole, drama…"
               rows={4}
               className="w-full resize-none rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm outline-none"
             />
           </div>
         </Card>
 
-        <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/90 px-4 py-3 backdrop-blur">
-          <div className="mx-auto flex max-w-xl items-center gap-3">
-            <button
-              type="button"
-              onClick={() => navigate("/leagues")}
-              className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-900 shadow-sm active:scale-[0.99]"
-            >
-              Cancel
-            </button>
+        {/* ✅ Clear sticky submit area, above mobile bottom tabs */}
+        <div className="sticky bottom-24 z-20">
+          <Card className="p-3 shadow-lg ring-1 ring-slate-200">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => navigate("/leagues")}
+                className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-900 shadow-sm active:scale-[0.99]"
+              >
+                Cancel
+              </button>
 
-            <button
-              type="submit"
-              disabled={!canSubmit}
-              className={`w-full rounded-2xl px-4 py-3 text-sm font-semibold text-white shadow-sm active:scale-[0.99] ${
-                canSubmit ? "bg-slate-900" : "bg-slate-400"
-              }`}
-            >
-              {saving ? "Saving…" : compressing ? "Processing…" : `Submit (+${computed.points})`}
-            </button>
-          </div>
+              <button
+                type="submit"
+                disabled={!canSubmit}
+                className={`w-full rounded-2xl px-4 py-3 text-sm font-extrabold text-white shadow-sm active:scale-[0.99] ${
+                  canSubmit ? "bg-emerald-600 hover:bg-emerald-500" : "bg-slate-400"
+                }`}
+              >
+                {saving ? "Posting…" : compressing ? "Processing…" : `Post Round (+${computed.points})`}
+              </button>
+            </div>
+          </Card>
         </div>
       </form>
 
-      <div className="h-24" />
+      <div className="h-10" />
     </div>
   );
 }
