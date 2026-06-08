@@ -4,43 +4,57 @@ import { createClient } from "@supabase/supabase-js";
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-// In-memory fallback (used only if localStorage is unavailable)
+// In-memory fallback used only if localStorage is unavailable
 const memoryStorage = (() => {
   const store = {};
+
   return {
     getItem: (key) => (key in store ? store[key] : null),
+
     setItem: (key, value) => {
       store[key] = value;
     },
+
     removeItem: (key) => {
       delete store[key];
     },
   };
 })();
 
-// ✅ Robust browser check (prevents SSR/build-time surprises)
+// Robust browser check
 const hasWindow = typeof window !== "undefined";
 
 // Safe storage wrapper: tries localStorage, falls back to memory
 const safeStorage = {
   getItem: (key) => {
     if (!hasWindow) return memoryStorage.getItem(key);
+
     try {
       return window.localStorage.getItem(key);
     } catch {
       return memoryStorage.getItem(key);
     }
   },
+
   setItem: (key, value) => {
-    if (!hasWindow) return memoryStorage.setItem(key, value);
+    if (!hasWindow) {
+      memoryStorage.setItem(key, value);
+      return;
+    }
+
     try {
       window.localStorage.setItem(key, value);
     } catch {
       memoryStorage.setItem(key, value);
     }
   },
+
   removeItem: (key) => {
-    if (!hasWindow) return memoryStorage.removeItem(key);
+    if (!hasWindow) {
+      memoryStorage.removeItem(key);
+      return;
+    }
+
     try {
       window.localStorage.removeItem(key);
     } catch {
@@ -49,7 +63,6 @@ const safeStorage = {
   },
 };
 
-// --- Helper: trim and validate env values (Netlify sometimes includes whitespace)
 function cleanEnv(v) {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -57,8 +70,8 @@ function cleanEnv(v) {
 const url = cleanEnv(supabaseUrl);
 const anon = cleanEnv(supabaseAnonKey);
 
-// --- Debug (safe): lets you confirm what the Netlify build actually received
-// Check on desktop Netlify console: window.__SUPABASE_ENV__
+// Safe debug helper so you can check the Netlify build received env vars.
+// In browser console, type: window.__SUPABASE_ENV__
 if (hasWindow) {
   window.__SUPABASE_ENV__ = {
     hasUrl: Boolean(url),
@@ -77,21 +90,18 @@ if (hasWindow) {
   };
 }
 
-// --- If env is missing, don't hard-crash the whole app — log loudly.
 if (!url || !anon) {
   // eslint-disable-next-line no-console
   console.error(
-    "[Supabase] Missing VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY in this build. " +
-      "On Netlify: Site configuration → Environment variables → add both, then Trigger deploy → Clear cache and deploy."
+    "[Supabase] Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. " +
+      "On Netlify, go to Site configuration → Environment variables, add both values, then redeploy."
   );
 }
 
-// Use a clearly-invalid placeholder when env is missing (prevents accidental localhost confusion)
 const FALLBACK_URL = "https://invalid.supabase.local";
 const FALLBACK_ANON = "missing-anon-key";
 
-// ✅ If you are NOT using magic links / OAuth redirects, keep this false.
-// If you DO use them, set true.
+// Keep false unless you use magic links or OAuth redirects
 const DETECT_SESSION_IN_URL = false;
 
 export const supabase = createClient(url || FALLBACK_URL, anon || FALLBACK_ANON, {
@@ -103,10 +113,11 @@ export const supabase = createClient(url || FALLBACK_URL, anon || FALLBACK_ANON,
   },
 });
 
-// ✅ DEBUG: prove this module actually executed in the production bundle.
-// If this is undefined in prod, the app is not loading this file.
+// Debug: proves this file loaded in the production bundle.
+// In browser console, type: window.__SUPABASE_DEBUG__
 if (hasWindow) {
   window.supabase = supabase;
+
   window.__SUPABASE_DEBUG__ = {
     attached: true,
     tag: "SUPABASE_CLIENT_ATTACHED_v2",
@@ -114,6 +125,4 @@ if (hasWindow) {
   };
 }
 
-
-
-
+export default supabase;
