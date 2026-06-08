@@ -27,6 +27,7 @@ function safeUUID(prefix = "id") {
   } catch {
     // ignore
   }
+
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -154,6 +155,7 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
       course: r.course,
       holes: r.holes,
     });
+
     return k === eventKey;
   });
 
@@ -166,6 +168,7 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
       course: r.course,
       holes: r.holes,
     });
+
     if (k !== eventKey) return r;
 
     const rank = rankForGrossScore(eventRounds, r.grossScore);
@@ -232,6 +235,14 @@ async function resolveCurrentLeagueForUser(authUserId) {
   return cleanLeagueId(membershipRes.data?.[0]?.league_id || null);
 }
 
+/**
+ * ✅ IMPORTANT FIX:
+ * Your Supabase rounds table uses:
+ * - played_on instead of date
+ * - course_name instead of course
+ * - points_awarded instead of points
+ * - bonus JSON for extra scoring details
+ */
 async function insertRoundRobust({
   leagueId,
   playerId,
@@ -246,104 +257,39 @@ async function insertRoundRobust({
   hio,
   isMajor,
   notes,
+  points,
 }) {
-  const attempts = [
-    {
-      league_id: leagueId,
-      user_id: playerId,
-      submitted_by: submittedBy,
-      date,
-      course,
-      holes,
-      par,
-      gross_score: grossScore,
-      birdies,
-      eagles,
-      hio,
-      is_major: isMajor,
-      notes,
-      status: "approved",
-    },
-    {
-      league_id: leagueId,
-      player_id: playerId,
-      submitted_by: submittedBy,
-      date,
-      course,
-      holes,
-      par,
-      gross_score: grossScore,
-      birdies,
-      eagles,
-      hio,
-      is_major: isMajor,
-      notes,
-      status: "approved",
-    },
-    {
-      league_id: leagueId,
-      user_id: playerId,
-      date,
-      course,
-      holes,
-      par,
-      gross_score: grossScore,
-      birdies,
-      eagles,
-      hio,
-      is_major: isMajor,
-      notes,
-      status: "approved",
-    },
-    {
-      league_id: leagueId,
-      player_id: playerId,
-      date,
-      course,
-      holes,
-      par,
-      gross_score: grossScore,
-      birdies,
-      eagles,
-      hio,
-      is_major: isMajor,
-      notes,
-      status: "approved",
-    },
-    {
-      league_id: leagueId,
-      user_id: playerId,
-      date,
-      course,
-      gross_score: grossScore,
-    },
-    {
-      league_id: leagueId,
-      player_id: playerId,
-      date,
-      course,
-      gross_score: grossScore,
-    },
-  ];
+  const bonus = {
+    holes,
+    par,
+    birdies,
+    eagles,
+    hio,
+    isMajor,
+    submittedBy,
+  };
 
-  let lastError = null;
+  const payload = {
+    league_id: leagueId,
+    user_id: playerId,
+    played_on: date,
+    course_name: course,
+    gross_score: grossScore,
+    net_score: null,
+    notes,
+    bonus,
+    points_awarded: Number(points) || 0,
+  };
 
-  for (const payload of attempts) {
-    // eslint-disable-next-line no-await-in-loop
-    const res = await supabase.from("rounds").insert(payload).select("*").maybeSingle();
+  const res = await supabase
+    .from("rounds")
+    .insert(payload)
+    .select("*")
+    .maybeSingle();
 
-    if (!res.error) return res.data || null;
+  if (res.error) throw res.error;
 
-    lastError = res.error;
-    const msg = String(res.error?.message || "").toLowerCase();
-
-    if (msg.includes("column") && msg.includes("does not exist")) continue;
-    if (msg.includes("null value") && msg.includes("violates")) continue;
-    if (msg.includes("schema cache")) continue;
-    break;
-  }
-
-  throw lastError || new Error("Failed to save round to Supabase.");
+  return res.data || null;
 }
 
 export default function SubmitRound() {
@@ -381,6 +327,7 @@ export default function SubmitRound() {
 
   useEffect(() => {
     if (!toast) return;
+
     const t = setTimeout(() => setToast(null), 2600);
     return () => clearTimeout(t);
   }, [toast]);
@@ -395,6 +342,7 @@ export default function SubmitRound() {
       try {
         const sessionRes = await supabase.auth.getSession();
         const uid = sessionRes?.data?.session?.user?.id || "";
+
         if (!alive) return;
 
         if (!uid) {
@@ -411,6 +359,7 @@ export default function SubmitRound() {
         setLegacyPointsSystem(fallbackPoints);
 
         const leagueId = await resolveCurrentLeagueForUser(uid);
+
         if (!alive) return;
 
         if (!leagueId) {
@@ -429,6 +378,7 @@ export default function SubmitRound() {
         if (leagueRes.error) throw leagueRes.error;
 
         const leagueRow = leagueRes.data || null;
+
         if (!leagueRow?.id) {
           setLeagueState(null);
           setPlayers([]);
@@ -448,6 +398,7 @@ export default function SubmitRound() {
         const userIds = memberRows.map((m) => m.user_id).filter(Boolean);
 
         let profileMap = {};
+
         if (userIds.length) {
           const profileRes = await supabase
             .from("profiles")
@@ -464,6 +415,7 @@ export default function SubmitRound() {
 
         const nextPlayers = memberRows.map((m) => {
           const p = profileMap[m.user_id] || {};
+
           return {
             id: m.user_id,
             user_id: m.user_id,
@@ -498,12 +450,13 @@ export default function SubmitRound() {
         setForm((f) => ({
           ...f,
           playerId:
-            nextRole === "host" || nextRole === "co_host"
+            nextRole === "host" || nextRole === "admin"
               ? f.playerId || uid
               : uid,
         }));
       } catch (e) {
         if (!alive) return;
+
         setLeagueError(humanErr(e));
         setPlayers([]);
         setLeagueState(null);
@@ -530,7 +483,7 @@ export default function SubmitRound() {
     return players.find((p) => p.id === id || p.user_id === id) || null;
   }, [players, form.playerId]);
 
-  const isHost = myRole === "host" || myRole === "co_host";
+  const isHost = myRole === "host" || myRole === "admin";
 
   const leaguePointsSystem = useMemo(() => {
     const ps = league?.pointsSystem ? ensureObj(league.pointsSystem) : null;
@@ -546,6 +499,7 @@ export default function SubmitRound() {
 
     if (usingNewPoints) {
       const allRounds = ensureArray(getRounds([]));
+
       const draft = {
         id: "__draft__",
         leagueId: league?.id || null,
@@ -572,11 +526,14 @@ export default function SubmitRound() {
           course: r.course,
           holes: r.holes,
         });
+
         return k === eventKey;
       });
 
       const tempRounds =
-        Number.isFinite(gross) && draft.course && draft.date ? [...eventRounds, draft] : eventRounds;
+        Number.isFinite(gross) && draft.course && draft.date
+          ? [...eventRounds, draft]
+          : eventRounds;
 
       const rank = rankForGrossScore(tempRounds, draft.grossScore);
 
@@ -607,7 +564,10 @@ export default function SubmitRound() {
       };
     }
 
-    const legacy = legacyPointsSystem && typeof legacyPointsSystem === "object" ? legacyPointsSystem : null;
+    const legacy =
+      legacyPointsSystem && typeof legacyPointsSystem === "object"
+        ? legacyPointsSystem
+        : null;
 
     const birdies = clampInt(Number(form.birdies), 0, 99);
     const eagles = clampInt(Number(form.eagles), 0, 99);
@@ -654,13 +614,19 @@ export default function SubmitRound() {
     if (!form.course.trim()) e.course = "Course name is required.";
 
     const gross = Number(form.grossScore);
-    if (!Number.isFinite(gross) || form.grossScore === "") e.grossScore = "Enter a valid score.";
+    if (!Number.isFinite(gross) || form.grossScore === "") {
+      e.grossScore = "Enter a valid score.";
+    }
 
     const par = Number(form.par);
-    if (!Number.isFinite(par) || par < 60 || par > 78) e.par = "Par must be between 60 and 78.";
+    if (!Number.isFinite(par) || par < 60 || par > 78) {
+      e.par = "Par must be between 60 and 78.";
+    }
 
     const holes = Number(form.holes);
-    if (![9, 18].includes(holes)) e.holes = "Holes must be 9 or 18.";
+    if (![9, 18].includes(holes)) {
+      e.holes = "Holes must be 9 or 18.";
+    }
 
     const birdies = Number(form.birdies);
     const eagles = Number(form.eagles);
@@ -685,24 +651,50 @@ export default function SubmitRound() {
 
   async function onPickScorecard(e) {
     const file = e.target.files?.[0];
+
     if (!file) return;
 
     if (!file.type?.startsWith("image/")) {
-      setToast({ type: "error", title: "Not an image", msg: "Please choose a photo from your camera roll." });
+      setToast({
+        type: "error",
+        title: "Not an image",
+        msg: "Please choose a photo from your camera roll.",
+      });
+
       return;
     }
 
     setCompressing(true);
+
     try {
-      const dataUrl = await compressImageToDataURL(file, { maxDim: 1280, quality: 0.78 });
+      const dataUrl = await compressImageToDataURL(file, {
+        maxDim: 1280,
+        quality: 0.78,
+      });
+
       if (!dataUrl) {
-        setToast({ type: "error", title: "Couldn’t process image", msg: "Try a different photo." });
+        setToast({
+          type: "error",
+          title: "Couldn’t process image",
+          msg: "Try a different photo.",
+        });
+
         return;
       }
+
       setCardPhoto(dataUrl);
-      setToast({ type: "success", title: "Scorecard added", msg: "Saved with this round preview." });
+
+      setToast({
+        type: "success",
+        title: "Scorecard added",
+        msg: "Saved with this round preview.",
+      });
     } catch {
-      setToast({ type: "error", title: "Image failed", msg: "Try a different photo." });
+      setToast({
+        type: "error",
+        title: "Image failed",
+        msg: "Try a different photo.",
+      });
     } finally {
       setCompressing(false);
       e.target.value = "";
@@ -727,7 +719,12 @@ export default function SubmitRound() {
     });
 
     if (!canSubmit) {
-      setToast({ type: "error", title: "Fix the form", msg: "Please check the highlighted fields." });
+      setToast({
+        type: "error",
+        title: "Fix the form",
+        msg: "Please check the highlighted fields.",
+      });
+
       return;
     }
 
@@ -735,7 +732,10 @@ export default function SubmitRound() {
 
     try {
       const leagueId = cleanLeagueId(league?.id);
-      if (!leagueId) throw new Error("No active league found.");
+
+      if (!leagueId) {
+        throw new Error("No active league found.");
+      }
 
       const playerId = isHost ? form.playerId : authUserId;
 
@@ -747,8 +747,9 @@ export default function SubmitRound() {
       const eagles = clampInt(Number(form.eagles), 0, 99);
       const hio = clampInt(Number(form.hio), 0, 18);
 
-      // 1) Save to Supabase first
+      // 1) Save to Supabase first using the real column names
       let insertedRound = null;
+
       try {
         insertedRound = await insertRoundRobust({
           leagueId,
@@ -764,6 +765,7 @@ export default function SubmitRound() {
           hio,
           isMajor: Boolean(form.isMajor),
           notes: form.notes.trim(),
+          points: computed.points,
         });
       } catch (dbErr) {
         throw new Error(`Round save failed in Supabase: ${humanErr(dbErr)}`);
@@ -772,33 +774,43 @@ export default function SubmitRound() {
       // 2) Also update local cache immediately for fast UI/preview
       const allRoundsBefore = ensureArray(getRounds([]));
 
+      const bonusFromDb = ensureObj(insertedRound?.bonus);
+
       const baseRound = {
         id: insertedRound?.id || safeUUID("round"),
         createdAt: insertedRound?.created_at || new Date().toISOString(),
-        date: form.date,
-        playerId,
-        userId: playerId,
-        submittedBy: authUserId,
+
+        date: insertedRound?.played_on || form.date,
+        playerId: insertedRound?.user_id || playerId,
+        userId: insertedRound?.user_id || playerId,
+        submittedBy: bonusFromDb.submittedBy || authUserId,
+
         playerName,
-        course: form.course.trim(),
-        holes: Number(form.holes),
-        par: Number(form.par),
-        grossScore,
-        birdies,
-        eagles,
-        hio,
-        isMajor: Boolean(form.isMajor),
-        notes: form.notes.trim(),
-        leagueId,
+        course: insertedRound?.course_name || form.course.trim(),
+
+        holes: Number(bonusFromDb.holes || form.holes),
+        par: Number(bonusFromDb.par || form.par),
+        grossScore: Number(insertedRound?.gross_score ?? grossScore),
+
+        birdies: Number(bonusFromDb.birdies ?? birdies),
+        eagles: Number(bonusFromDb.eagles ?? eagles),
+        hio: Number(bonusFromDb.hio ?? hio),
+        isMajor: Boolean(bonusFromDb.isMajor ?? form.isMajor),
+
+        notes: insertedRound?.notes || form.notes.trim(),
+        leagueId: insertedRound?.league_id || leagueId,
+
         cardPhoto: cardPhoto || null,
         status: "approved",
-        points: Number(computed.points) || 0,
+
+        points: Number(insertedRound?.points_awarded ?? computed.points) || 0,
         pointsBreakdown: computed.breakdown || null,
       };
 
       const allAfterAdd = [baseRound, ...allRoundsBefore];
 
       let finalAll = allAfterAdd;
+
       if (usingNewPoints) {
         finalAll = recomputeEventPoints(allAfterAdd, {
           leagueId,
@@ -813,7 +825,10 @@ export default function SubmitRound() {
 
       // 3) Re-sync league cache from Supabase if available
       try {
-        await syncActiveLeagueFromSupabase({ leagueId, withRounds: true });
+        await syncActiveLeagueFromSupabase({
+          leagueId,
+          withRounds: true,
+        });
       } catch {
         // fail-soft
       }
@@ -821,15 +836,16 @@ export default function SubmitRound() {
       const savedRound = finalAll.find((r) => r.id === baseRound.id) || baseRound;
 
       const rank = savedRound?.pointsBreakdown?.rank;
+
       const rankLabel =
         typeof rank === "number"
           ? rank === 1
             ? "1st"
             : rank === 2
-            ? "2nd"
-            : rank === 3
-            ? "3rd"
-            : `${rank}th`
+              ? "2nd"
+              : rank === 3
+                ? "3rd"
+                : `${rank}th`
           : null;
 
       setToast({
@@ -854,6 +870,7 @@ export default function SubmitRound() {
         notes: "",
         playerId: isHost ? f.playerId : authUserId,
       }));
+
       setTouched({});
       setCardPhoto(null);
 
@@ -879,6 +896,7 @@ export default function SubmitRound() {
             <div className="text-sm font-semibold text-slate-900">Points Preview</div>
             <div className="text-xs text-slate-600">Legacy mode.</div>
           </div>
+
           <div className="rounded-2xl bg-slate-900 px-3 py-1.5 text-sm font-bold text-white">
             {computed.points} pts
           </div>
@@ -887,15 +905,16 @@ export default function SubmitRound() {
     }
 
     const rank = computed.breakdown?.rank;
+
     const rankLabel =
       typeof rank === "number"
         ? rank === 1
           ? "1st"
           : rank === 2
-          ? "2nd"
-          : rank === 3
-          ? "3rd"
-          : `${rank}th`
+            ? "2nd"
+            : rank === 3
+              ? "3rd"
+              : `${rank}th`
         : "—";
 
     const placementPoints = computed.breakdown?.placementPoints ?? 0;
@@ -906,6 +925,7 @@ export default function SubmitRound() {
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-semibold text-slate-900">Points Preview</div>
+
           <div className="text-xs text-slate-600">
             Rank if posted now: <span className="font-semibold text-slate-900">{rankLabel}</span>
             {" · "}Placement {placementPoints}
@@ -913,6 +933,7 @@ export default function SubmitRound() {
             {bonusPoints ? ` · Bonus +${bonusPoints}` : " · Bonuses off"}
           </div>
         </div>
+
         <div className="rounded-2xl bg-slate-900 px-3 py-1.5 text-sm font-bold text-white">
           {computed.points} pts
         </div>
@@ -924,9 +945,11 @@ export default function SubmitRound() {
     return (
       <div className="pt-2">
         <PageHeader title="Submit Round" subtitle="Loading your league…" />
+
         <div className="mt-4">
           <Card className="p-5">
             <div className="text-sm font-extrabold text-slate-900">Loading…</div>
+
             <div className="mt-2 text-sm font-semibold text-slate-600">
               Checking which league you’re in and loading members.
             </div>
@@ -940,6 +963,7 @@ export default function SubmitRound() {
     return (
       <div className="pt-2">
         <PageHeader title="Submit Round" subtitle="Post a round into your league." />
+
         <div className="mt-4">
           <EmptyState
             icon="🏌️"
@@ -963,6 +987,7 @@ export default function SubmitRound() {
     return (
       <div className="pt-2">
         <PageHeader title="Submit Round" subtitle="Post a round into your league." />
+
         <div className="mt-4">
           <EmptyState
             icon="👥"
@@ -1004,14 +1029,16 @@ export default function SubmitRound() {
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-slate-900">Posting into</div>
-            <div className="mt-1 text-lg font-extrabold text-slate-900">{league.name || "League"}</div>
+            <div className="mt-1 text-lg font-extrabold text-slate-900">
+              {league.name || "League"}
+            </div>
             <div className="mt-1 text-xs font-semibold text-slate-600">
               Only rounds for this league will be posted from this page.
             </div>
           </div>
 
           <span className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
-            {isHost ? "Host / Co-host" : "Player"}
+            {isHost ? "Host / Admin" : "Player"}
           </span>
         </div>
       </Card>
@@ -1020,8 +1047,9 @@ export default function SubmitRound() {
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-extrabold text-slate-900">Submitting as</div>
+
             <div className="mt-0.5 text-xs font-semibold text-slate-600">
-              Players submit their own rounds. Host/co-host can submit for any active member.
+              Players submit their own rounds. Host/admin can submit for any active member.
             </div>
           </div>
 
@@ -1031,7 +1059,10 @@ export default function SubmitRound() {
         </div>
 
         <div className="mt-3">
-          <label className="mb-1 block text-xs font-semibold text-slate-700">Player</label>
+          <label className="mb-1 block text-xs font-semibold text-slate-700">
+            Player
+          </label>
+
           <select
             value={form.playerId}
             onChange={(e) => update("playerId", e.target.value)}
@@ -1040,10 +1071,11 @@ export default function SubmitRound() {
             className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
               touched.playerId && errors.playerId ? "border-rose-300" : "border-slate-200"
             } ${!isHost ? "bg-slate-50 text-slate-600" : ""}`}
-            title={!isHost ? "Players submit their own scores. Host/co-host can submit for others." : ""}
+            title={!isHost ? "Players submit their own scores. Host/admin can submit for others." : ""}
           >
             {players.map((p) => {
               const id = p.id || p.user_id || "";
+
               return (
                 <option key={id} value={id}>
                   {getPlayerLabel(p)}
@@ -1070,7 +1102,9 @@ export default function SubmitRound() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold text-slate-900">Round Details</div>
-                <div className="text-xs text-slate-600">Date, course, score, and round type.</div>
+                <div className="text-xs text-slate-600">
+                  Date, course, score, and round type.
+                </div>
               </div>
 
               <button
@@ -1084,7 +1118,10 @@ export default function SubmitRound() {
 
             <div className="grid grid-cols-1 gap-3">
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Date</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Date
+                </label>
+
                 <input
                   type="date"
                   value={form.date}
@@ -1094,13 +1131,17 @@ export default function SubmitRound() {
                     touched.date && errors.date ? "border-rose-300" : "border-slate-200"
                   }`}
                 />
+
                 {touched.date && errors.date ? (
                   <div className="mt-1 text-xs text-rose-600">{errors.date}</div>
                 ) : null}
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Course</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Course
+                </label>
+
                 <input
                   type="text"
                   value={form.course}
@@ -1111,6 +1152,7 @@ export default function SubmitRound() {
                     touched.course && errors.course ? "border-rose-300" : "border-slate-200"
                   }`}
                 />
+
                 {touched.course && errors.course ? (
                   <div className="mt-1 text-xs text-rose-600">{errors.course}</div>
                 ) : null}
@@ -1119,7 +1161,10 @@ export default function SubmitRound() {
 
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Holes</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Holes
+                </label>
+
                 <select
                   value={form.holes}
                   onChange={(e) => update("holes", Number(e.target.value))}
@@ -1131,39 +1176,54 @@ export default function SubmitRound() {
                   <option value={18}>18</option>
                   <option value={9}>9</option>
                 </select>
+
                 {touched.holes && errors.holes ? (
                   <div className="mt-1 text-xs text-rose-600">{errors.holes}</div>
                 ) : null}
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Par</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Par
+                </label>
+
                 <input
                   inputMode="numeric"
                   value={form.par}
-                  onChange={(e) => update("par", clampInt(parseInt(e.target.value || "0", 10), 60, 78))}
+                  onChange={(e) =>
+                    update("par", clampInt(parseInt(e.target.value || "0", 10), 60, 78))
+                  }
                   onBlur={() => markTouched("par")}
                   className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
                     touched.par && errors.par ? "border-rose-300" : "border-slate-200"
                   }`}
                 />
+
                 {touched.par && errors.par ? (
                   <div className="mt-1 text-xs text-rose-600">{errors.par}</div>
                 ) : null}
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Score</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Score
+                </label>
+
                 <input
                   inputMode="numeric"
                   value={form.grossScore}
-                  onChange={(e) => update("grossScore", e.target.value.replace(/[^\d]/g, "").slice(0, 3))}
+                  onChange={(e) =>
+                    update("grossScore", e.target.value.replace(/[^\d]/g, "").slice(0, 3))
+                  }
                   onBlur={() => markTouched("grossScore")}
                   placeholder="e.g. 84"
                   className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
-                    touched.grossScore && errors.grossScore ? "border-rose-300" : "border-slate-200"
+                    touched.grossScore && errors.grossScore
+                      ? "border-rose-300"
+                      : "border-slate-200"
                   }`}
                 />
+
                 {touched.grossScore && errors.grossScore ? (
                   <div className="mt-1 text-xs text-rose-600">{errors.grossScore}</div>
                 ) : null}
@@ -1173,6 +1233,7 @@ export default function SubmitRound() {
             <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
               <div className="flex items-center justify-between">
                 <div className="text-xs font-semibold text-slate-700">To Par</div>
+
                 <div className="rounded-xl bg-white px-2.5 py-1 text-xs font-bold text-slate-900 shadow-sm">
                   {computed.netLabel}
                 </div>
@@ -1180,10 +1241,14 @@ export default function SubmitRound() {
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">Round type:</div>
+              <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+                Round type:
+              </div>
+
               <Pill active={!form.isMajor} onClick={() => update("isMajor", false)}>
                 Standard
               </Pill>
+
               <Pill active={form.isMajor} onClick={() => update("isMajor", true)}>
                 Major
               </Pill>
@@ -1194,15 +1259,19 @@ export default function SubmitRound() {
         <Card className="p-4">
           <div className="space-y-3">
             <div>
-              <div className="text-sm font-semibold text-slate-900">Scorecard photo (optional)</div>
+              <div className="text-sm font-semibold text-slate-900">
+                Scorecard photo (optional)
+              </div>
+
               <div className="text-xs text-slate-600">
-                Helpful for proof. Saved with the round preview.
+                Helpful for proof. Currently saved in the local preview.
               </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-xs font-extrabold text-white hover:bg-slate-800">
                 {compressing ? "Processing…" : "Upload photo"}
+
                 <input
                   type="file"
                   accept="image/*"
@@ -1239,6 +1308,7 @@ export default function SubmitRound() {
           <div className="space-y-4">
             <div>
               <div className="text-sm font-semibold text-slate-900">Scoring Events</div>
+
               <div className="text-xs text-slate-600">
                 These feed badges/trophies later and can affect bonus points now.
               </div>
@@ -1246,37 +1316,56 @@ export default function SubmitRound() {
 
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Birdies</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Birdies
+                </label>
+
                 <input
                   inputMode="numeric"
                   value={form.birdies}
-                  onChange={(e) => update("birdies", clampInt(parseInt(e.target.value || "0", 10), 0, 99))}
+                  onChange={(e) =>
+                    update("birdies", clampInt(parseInt(e.target.value || "0", 10), 0, 99))
+                  }
                   onBlur={() => markTouched("birdies")}
                   className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
-                    touched.birdies && errors.birdies ? "border-rose-300" : "border-slate-200"
+                    touched.birdies && errors.birdies
+                      ? "border-rose-300"
+                      : "border-slate-200"
                   }`}
                 />
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">Eagles</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  Eagles
+                </label>
+
                 <input
                   inputMode="numeric"
                   value={form.eagles}
-                  onChange={(e) => update("eagles", clampInt(parseInt(e.target.value || "0", 10), 0, 99))}
+                  onChange={(e) =>
+                    update("eagles", clampInt(parseInt(e.target.value || "0", 10), 0, 99))
+                  }
                   onBlur={() => markTouched("eagles")}
                   className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
-                    touched.eagles && errors.eagles ? "border-rose-300" : "border-slate-200"
+                    touched.eagles && errors.eagles
+                      ? "border-rose-300"
+                      : "border-slate-200"
                   }`}
                 />
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-slate-700">HIO</label>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">
+                  HIO
+                </label>
+
                 <input
                   inputMode="numeric"
                   value={form.hio}
-                  onChange={(e) => update("hio", clampInt(parseInt(e.target.value || "0", 10), 0, 18))}
+                  onChange={(e) =>
+                    update("hio", clampInt(parseInt(e.target.value || "0", 10), 0, 18))
+                  }
                   onBlur={() => markTouched("hio")}
                   className={`w-full rounded-xl border bg-white px-3 py-3 text-sm outline-none ${
                     touched.hio && errors.hio ? "border-rose-300" : "border-slate-200"
@@ -1305,9 +1394,8 @@ export default function SubmitRound() {
           <div className="space-y-3">
             <div>
               <div className="text-sm font-semibold text-slate-900">Notes</div>
-              <div className="text-xs text-slate-600">
-                Optional notes about the round.
-              </div>
+
+              <div className="text-xs text-slate-600">Optional notes about the round.</div>
             </div>
 
             <textarea
@@ -1320,7 +1408,6 @@ export default function SubmitRound() {
           </div>
         </Card>
 
-        {/* ✅ Clear sticky submit area, above mobile bottom tabs */}
         <div className="sticky bottom-24 z-20">
           <Card className="p-3 shadow-lg ring-1 ring-slate-200">
             <div className="flex items-center gap-3">
@@ -1350,9 +1437,3 @@ export default function SubmitRound() {
     </div>
   );
 }
-
-
-
-
-
-

@@ -95,7 +95,7 @@ function placementRowsFromMap(map) {
 
 function roleLabel(role) {
   if (role === LEAGUE_ROLES.host) return "Host";
-  if (role === LEAGUE_ROLES.co_host) return "Co-host";
+  if (role === LEAGUE_ROLES.admin || role === "admin") return "Admin";
   return "Member";
 }
 
@@ -217,7 +217,7 @@ export default function LeagueSettings() {
 
   // ✅ Permissions based ONLY on Supabase role
   const effectiveRole = myRoleLive || LEAGUE_ROLES.member;
-  const canEdit = effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.co_host;
+  const canEdit = effectiveRole === LEAGUE_ROLES.host || effectiveRole === LEAGUE_ROLES.admin || effectiveRole === "admin";
 
   // ✅ final stable id for this render
   const stableLeagueId = cleanLeagueId(leagueId) || cleanLeagueId(league?.id) || null;
