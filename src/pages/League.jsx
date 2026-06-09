@@ -283,11 +283,11 @@ export default function League() {
   const [leagueLoading, setLeagueLoading] = useState(false);
   const [leagueSyncError, setLeagueSyncError] = useState("");
 
-  // ✅ NEW: lock actions by role (host/cohost only)
+  // ✅ NEW: lock actions by role (host/admin only)
   const [myRole, setMyRole] = useState(null);
   const [roleLoading, setRoleLoading] = useState(false);
 
-  const isAdmin = myRole === "host" || myRole === "cohost";
+  const isAdmin = myRole === "host" || myRole === "admin";
 
   // ✅ NEW: league invites inbox for users with no league
   const [pendingInvites, setPendingInvites] = useState([]);
@@ -319,7 +319,7 @@ export default function League() {
     return mergePointsSystem(getPointsSystem(DEFAULT_POINTS_SYSTEM));
   }, [league?.pointsSystem]);
 
-  // ✅ Load my role for this league (host/cohost gating)
+  // ✅ Load my role for this league (host/admin gating)
   async function loadMyRole({ leagueId, userId }) {
     if (!leagueId || !userId) {
       setMyRole(null);
@@ -869,7 +869,7 @@ export default function League() {
   function endSeasonConfirm() {
     // ✅ HARD BLOCK: only host/cohost
     if (!isAdmin) {
-      setToast("Only the Host / Co-host can end the season.");
+      setToast("Only the Host / Admin can end the season.");
       setShowEndSeason(false);
       return;
     }
@@ -1148,7 +1148,7 @@ export default function League() {
           <button
             onClick={() => {
               if (!isAdmin) {
-                setToast("Only the Host / Co-host can end the season.");
+                setToast("Only the Host / Admin can end the season.");
                 return;
               }
               setShowEndSeason(true);
@@ -1160,7 +1160,7 @@ export default function League() {
                 ? "bg-slate-200 text-slate-500 cursor-not-allowed"
                 : "bg-rose-600 text-white hover:bg-rose-500",
             ].join(" ")}
-            title={!isAdmin ? "Host/Co-host only" : "End the season"}
+            title={!isAdmin ? "Host/Admin only" : "End the season"}
           >
             End Season
           </button>
@@ -1170,7 +1170,7 @@ export default function League() {
       <Modal open={showEndSeason} title="End season?" onClose={() => setShowEndSeason(false)}>
         {!isAdmin ? (
           <div className="rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
-            Only the Host / Co-host can end the season.
+            Only the Host / Admin can end the season.
           </div>
         ) : (
           <div className="space-y-4">

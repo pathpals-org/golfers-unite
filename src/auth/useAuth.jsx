@@ -2,35 +2,58 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
-// ✅ keep localStorage scoped per signed-in user (prevents cross-account bleed)
+// keep localStorage scoped per signed-in user
 import { setStorageUserId } from "../utils/storage";
 
 const AuthContext = createContext(null);
 
 function withTimeout(promise, ms, label = "Request") {
   let t;
+
   const timeout = new Promise((_, reject) => {
     t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
+
   return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
-async function fetchMyProfile(userId) {
-  if (!userId) return null;
+function normEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
 
-  // ✅ Profiles fetch is allowed to time out WITHOUT breaking auth.
+function fallbackUsernameFromEmail(email) {
+  const prefix = String(email || "").split("@")[0] || "golfer";
+  return prefix.trim() || "golfer";
+}
+
+async function ensureProfileForUser(user) {
+  if (!user?.id) return null;
+
+  const email = normEmail(user.email || "");
+
+  const username =
+    String(user.user_metadata?.username || "").trim() ||
+    String(user.user_metadata?.display_name || "").trim() ||
+    fallbackUsernameFromEmail(email);
+
+  const payload = {
+    id: user.id,
+    email,
+    username,
+    display_name: username,
+  };
+
   try {
     const { data, error } = await withTimeout(
       supabase
         .from("profiles")
-        .select("id, username, display_name, avatar_url, handicap_index, created_at")
-        .eq("id", userId)
+        .upsert(payload, { onConflict: "id" })
+        .select("id, email, username, display_name, avatar_url, handicap_index, active_league_id, created_at")
         .maybeSingle(),
       20000,
-      "Load profile"
+      "Ensure profile"
     );
 
-    // RLS block or missing row = null (never block UI)
     if (error) return null;
     return data ?? null;
   } catch {
@@ -38,8 +61,40 @@ async function fetchMyProfile(userId) {
   }
 }
 
+async function fetchMyProfile(userId, user = null) {
+  if (!userId) return null;
+
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from("profiles")
+        .select("id, email, username, display_name, avatar_url, handicap_index, active_league_id, created_at")
+        .eq("id", userId)
+        .maybeSingle(),
+      20000,
+      "Load profile"
+    );
+
+    if (!error && data) return data;
+
+    // If missing or RLS timing issue, try to repair profile row.
+    if (user?.id) {
+      return await ensureProfileForUser(user);
+    }
+
+    return null;
+  } catch {
+    if (user?.id) {
+      return await ensureProfileForUser(user);
+    }
+
+    return null;
+  }
+}
+
 function isInvalidRefreshTokenError(err) {
   const msg = String(err?.message || err?.error_description || err || "").toLowerCase();
+
   return (
     msg.includes("invalid refresh token") ||
     msg.includes("refresh token not found") ||
@@ -50,9 +105,14 @@ function isInvalidRefreshTokenError(err) {
 function clearSupabaseAuthStorageKeys() {
   try {
     if (typeof window === "undefined") return;
+
     const keys = Object.keys(window.localStorage);
+
     keys.forEach((k) => {
-      if (k.startsWith("sb-") && k.includes("-auth-token")) window.localStorage.removeItem(k);
+      if (k.startsWith("sb-") && k.includes("-auth-token")) {
+        window.localStorage.removeItem(k);
+      }
+
       if (k.toLowerCase().includes("supabase") && k.toLowerCase().includes("auth")) {
         window.localStorage.removeItem(k);
       }
@@ -74,8 +134,12 @@ export function AuthProvider({ children }) {
     const userId = overrideUserId ?? user?.id ?? null;
     if (!userId) return null;
 
-    const p = await fetchMyProfile(userId);
-    if (mountedRef.current && p) setProfile(p);
+    const p = await fetchMyProfile(userId, user);
+
+    if (mountedRef.current && p) {
+      setProfile(p);
+    }
+
     return p;
   };
 
@@ -95,6 +159,7 @@ export function AuthProvider({ children }) {
         setStorageUserId(null);
 
         if (!mountedRef.current) return;
+
         setSession(null);
         setUser(null);
         setProfile(null);
@@ -105,8 +170,6 @@ export function AuthProvider({ children }) {
       setLoading(true);
 
       try {
-        // ✅ IMPORTANT: DO NOT timeout getSession().
-        // Timeouts here cause “signed in but user null” when Supabase is just slow.
         const { data, error } = await supabase.auth.getSession();
 
         if (!mountedRef.current) return;
@@ -118,43 +181,51 @@ export function AuthProvider({ children }) {
           if (isInvalidRefreshTokenError(error)) {
             await safeClearSession("Invalid refresh token during getSession()");
           } else {
-            // fail-soft: treat as no session without nuking storage
             setSession(null);
             setUser(null);
             setStorageUserId(null);
-            // keep profile as-is (don’t force null)
           }
+
           return;
         }
 
         const s = data?.session ?? null;
-        setSession(s);
-        setUser(s?.user ?? null);
-        setStorageUserId(s?.user?.id || null);
+        const u = s?.user ?? null;
 
-        if (s?.user?.id) {
-          const p = await fetchMyProfile(s.user.id);
+        setSession(s);
+        setUser(u);
+        setStorageUserId(u?.id || null);
+
+        if (u?.id) {
+          const p = await fetchMyProfile(u.id, u);
+
           if (!mountedRef.current) return;
-          if (p) setProfile(p);
+
+          if (p) {
+            setProfile(p);
+          } else {
+            setProfile(null);
+          }
         } else {
           setProfile(null);
         }
       } catch (e) {
         // eslint-disable-next-line no-console
         console.error("Auth bootstrap error:", e);
+
         if (!mountedRef.current) return;
 
         if (isInvalidRefreshTokenError(e)) {
           await safeClearSession("Invalid refresh token thrown during bootstrap");
         } else {
-          // fail-soft: do not wipe local storage unless you KNOW it’s invalid tokens
           setSession(null);
           setUser(null);
           setStorageUserId(null);
-          // keep profile as-is
         }
       } finally {
-        if (mountedRef.current) setLoading(false);
+        if (mountedRef.current) {
+          setLoading(false);
+        }
       }
     };
 
@@ -163,20 +234,24 @@ export function AuthProvider({ children }) {
     const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
       if (!mountedRef.current) return;
 
-      setSession(newSession ?? null);
-      setUser(newSession?.user ?? null);
-      setStorageUserId(newSession?.user?.id || null);
+      const u = newSession?.user ?? null;
 
-      // If signed out
-      if (!newSession?.user?.id) {
+      setSession(newSession ?? null);
+      setUser(u);
+      setStorageUserId(u?.id || null);
+
+      if (!u?.id) {
         setProfile(null);
         return;
       }
 
-      // Profile refresh is fail-soft
-      const p = await fetchMyProfile(newSession.user.id);
+      const p = await fetchMyProfile(u.id, u);
+
       if (!mountedRef.current) return;
-      if (p) setProfile(p);
+
+      if (p) {
+        setProfile(p);
+      }
     });
 
     return () => {
@@ -201,7 +276,10 @@ export function AuthProvider({ children }) {
 
 export function useAuth() {
   const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error("useAuth must be used inside <AuthProvider />");
+
+  if (!ctx) {
+    throw new Error("useAuth must be used inside <AuthProvider />");
+  }
+
   return ctx;
 }
-

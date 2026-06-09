@@ -26,7 +26,7 @@ function humanAuthError(message) {
 export default function Signup() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user, loading } = useAuth();
+  const { user, loading, refreshProfile } = useAuth();
 
   const fromPath = useMemo(() => {
     const maybe = location.state?.from?.pathname;
@@ -47,6 +47,7 @@ export default function Signup() {
   // Already logged in → go where they intended
   useEffect(() => {
     if (!loading && user) {
+      await refreshProfile(data.session.user?.id);
       navigate(fromPath, { replace: true });
     }
   }, [user, loading, navigate, fromPath]);

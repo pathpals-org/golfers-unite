@@ -130,12 +130,29 @@ function makeEventKey({ leagueId, date, course, holes }) {
   ].join("::");
 }
 
+function getRoundDate(r) {
+  return r?.date || r?.played_on || null;
+}
+
+function getRoundCourse(r) {
+  return r?.course || r?.course_name || "";
+}
+
+function getRoundGrossScore(r) {
+  return Number(r?.grossScore ?? r?.gross_score);
+}
+
+function getRoundHoles(r) {
+  const bonus = ensureObj(r?.bonus);
+  return Number(r?.holes ?? bonus.holes ?? 18);
+}
+
 function rankForGrossScore(eventRounds, grossScore) {
   const s = Number(grossScore);
   if (!Number.isFinite(s)) return null;
 
   const scores = ensureArray(eventRounds)
-    .map((r) => Number(r.grossScore))
+    .map((r) => getRoundGrossScore(r))
     .filter((x) => Number.isFinite(x))
     .sort((a, b) => a - b);
 
@@ -145,15 +162,25 @@ function rankForGrossScore(eventRounds, grossScore) {
   return distinctLower.size + 1;
 }
 
+function getBonusFlagsFromRound(r) {
+  const bonus = ensureObj(r?.bonus);
+
+  return {
+    birdie: Number(r?.birdies ?? bonus.birdies ?? 0) > 0,
+    eagle: Number(r?.eagles ?? bonus.eagles ?? 0) > 0,
+    hio: Number(r?.hio ?? bonus.hio ?? 0) > 0,
+  };
+}
+
 function recomputeEventPoints(allRounds, { leagueId, date, course, holes, pointsSystem }) {
   const eventKey = makeEventKey({ leagueId, date, course, holes });
 
   const eventRounds = allRounds.filter((r) => {
     const k = makeEventKey({
-      leagueId: r.leagueId || null,
-      date: r.date,
-      course: r.course,
-      holes: r.holes,
+      leagueId: r.leagueId || r.league_id || null,
+      date: getRoundDate(r),
+      course: getRoundCourse(r),
+      holes: getRoundHoles(r),
     });
 
     return k === eventKey;
@@ -161,27 +188,21 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
 
   if (!eventRounds.length) return allRounds;
 
-  const updated = allRounds.map((r) => {
+  return allRounds.map((r) => {
     const k = makeEventKey({
-      leagueId: r.leagueId || null,
-      date: r.date,
-      course: r.course,
-      holes: r.holes,
+      leagueId: r.leagueId || r.league_id || null,
+      date: getRoundDate(r),
+      course: getRoundCourse(r),
+      holes: getRoundHoles(r),
     });
 
     if (k !== eventKey) return r;
 
-    const rank = rankForGrossScore(eventRounds, r.grossScore);
-
-    const bonusFlags = {
-      birdie: Number(r.birdies) > 0,
-      eagle: Number(r.eagles) > 0,
-      hio: Number(r.hio) > 0,
-    };
+    const rank = rankForGrossScore(eventRounds, getRoundGrossScore(r));
 
     const res = calculateLeaguePoints({
       place: rank,
-      bonusFlags,
+      bonusFlags: getBonusFlagsFromRound(r),
       played: true,
       pointsSystem: pointsSystem || DEFAULT_POINTS_SYSTEM,
     });
@@ -189,6 +210,7 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
     return {
       ...r,
       points: res.totalPoints,
+      points_awarded: res.totalPoints,
       pointsBreakdown: {
         mode: "league",
         rank,
@@ -198,8 +220,6 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
       },
     };
   });
-
-  return updated;
 }
 
 function humanErr(e) {
@@ -236,12 +256,7 @@ async function resolveCurrentLeagueForUser(authUserId) {
 }
 
 /**
- * ✅ IMPORTANT FIX:
- * Your Supabase rounds table uses:
- * - played_on instead of date
- * - course_name instead of course
- * - points_awarded instead of points
- * - bonus JSON for extra scoring details
+ * Save one round using your actual Supabase column names.
  */
 async function insertRoundRobust({
   leagueId,
@@ -290,6 +305,120 @@ async function insertRoundRobust({
   if (res.error) throw res.error;
 
   return res.data || null;
+}
+
+/**
+ * ✅ NEW:
+ * Recalculate points for every round in the same event and update Supabase.
+ *
+ * Event = same league + date + course + holes.
+ */
+async function recalculateEventPointsInSupabase({
+  leagueId,
+  date,
+  course,
+  holes,
+  pointsSystem,
+}) {
+  const cleanLeague = cleanLeagueId(leagueId);
+
+  if (!cleanLeague || !date || !course) {
+    return {
+      updatedRows: [],
+      updatedMap: {},
+    };
+  }
+
+  const res = await supabase
+    .from("rounds")
+    .select("id,league_id,user_id,played_on,course_name,gross_score,bonus,points_awarded,created_at,notes")
+    .eq("league_id", cleanLeague)
+    .eq("played_on", date)
+    .ilike("course_name", course.trim());
+
+  if (res.error) throw res.error;
+
+  const rows = ensureArray(res.data).filter((r) => {
+    const bonus = ensureObj(r.bonus);
+    const rowHoles = Number(bonus.holes ?? 18);
+    return rowHoles === Number(holes || 18);
+  });
+
+  if (!rows.length) {
+    return {
+      updatedRows: [],
+      updatedMap: {},
+    };
+  }
+
+  const withPoints = rows.map((r) => {
+    const rank = rankForGrossScore(rows, r.gross_score);
+
+    const bonus = ensureObj(r.bonus);
+
+    const calc = calculateLeaguePoints({
+      place: rank,
+      bonusFlags: {
+        birdie: Number(bonus.birdies ?? 0) > 0,
+        eagle: Number(bonus.eagles ?? 0) > 0,
+        hio: Number(bonus.hio ?? 0) > 0,
+      },
+      played: true,
+      pointsSystem: pointsSystem || DEFAULT_POINTS_SYSTEM,
+    });
+
+    const breakdown = {
+      mode: "league",
+      rank,
+      placementPoints: calc.placementPoints,
+      bonusPoints: calc.bonusPoints,
+      participationPoints: calc.participationPoints,
+    };
+
+    return {
+      ...r,
+      recalculatedPoints: calc.totalPoints,
+      recalculatedBreakdown: breakdown,
+    };
+  });
+
+  for (const r of withPoints) {
+    const bonus = ensureObj(r.bonus);
+
+    const nextBonus = {
+      ...bonus,
+      pointsBreakdown: r.recalculatedBreakdown,
+    };
+
+    const updateRes = await supabase
+      .from("rounds")
+      .update({
+        points_awarded: r.recalculatedPoints,
+        bonus: nextBonus,
+      })
+      .eq("id", r.id);
+
+    if (updateRes.error) throw updateRes.error;
+  }
+
+  const updatedMap = {};
+
+  withPoints.forEach((r) => {
+    updatedMap[r.id] = {
+      points: r.recalculatedPoints,
+      points_awarded: r.recalculatedPoints,
+      pointsBreakdown: r.recalculatedBreakdown,
+      bonus: {
+        ...ensureObj(r.bonus),
+        pointsBreakdown: r.recalculatedBreakdown,
+      },
+    };
+  });
+
+  return {
+    updatedRows: withPoints,
+    updatedMap,
+  };
 }
 
 export default function SubmitRound() {
@@ -521,10 +650,10 @@ export default function SubmitRound() {
 
       const eventRounds = allRounds.filter((r) => {
         const k = makeEventKey({
-          leagueId: r.leagueId || null,
-          date: r.date,
-          course: r.course,
-          holes: r.holes,
+          leagueId: r.leagueId || r.league_id || null,
+          date: getRoundDate(r),
+          course: getRoundCourse(r),
+          holes: getRoundHoles(r),
         });
 
         return k === eventKey;
@@ -747,7 +876,6 @@ export default function SubmitRound() {
       const eagles = clampInt(Number(form.eagles), 0, 99);
       const hio = clampInt(Number(form.hio), 0, 18);
 
-      // 1) Save to Supabase first using the real column names
       let insertedRound = null;
 
       try {
@@ -771,13 +899,36 @@ export default function SubmitRound() {
         throw new Error(`Round save failed in Supabase: ${humanErr(dbErr)}`);
       }
 
-      // 2) Also update local cache immediately for fast UI/preview
-      const allRoundsBefore = ensureArray(getRounds([]));
+      let recalculated = {
+        updatedRows: [],
+        updatedMap: {},
+      };
 
+      try {
+        recalculated = await recalculateEventPointsInSupabase({
+          leagueId,
+          date: form.date,
+          course: form.course.trim(),
+          holes: Number(form.holes),
+          pointsSystem: leaguePointsSystem || DEFAULT_POINTS_SYSTEM,
+        });
+      } catch (recalcErr) {
+        // Score is still saved, but points may need refresh later.
+        setToast({
+          type: "error",
+          title: "Round saved, points need refresh",
+          msg: humanErr(recalcErr),
+        });
+      }
+
+      const allRoundsBefore = ensureArray(getRounds([]));
       const bonusFromDb = ensureObj(insertedRound?.bonus);
+      const insertedId = insertedRound?.id || safeUUID("round");
+
+      const recalculatedForInserted = recalculated.updatedMap?.[insertedRound?.id] || null;
 
       const baseRound = {
-        id: insertedRound?.id || safeUUID("round"),
+        id: insertedId,
         createdAt: insertedRound?.created_at || new Date().toISOString(),
 
         date: insertedRound?.played_on || form.date,
@@ -803,11 +954,24 @@ export default function SubmitRound() {
         cardPhoto: cardPhoto || null,
         status: "approved",
 
-        points: Number(insertedRound?.points_awarded ?? computed.points) || 0,
-        pointsBreakdown: computed.breakdown || null,
+        points:
+          Number(
+            recalculatedForInserted?.points ??
+              insertedRound?.points_awarded ??
+              computed.points
+          ) || 0,
+        points_awarded:
+          Number(
+            recalculatedForInserted?.points_awarded ??
+              insertedRound?.points_awarded ??
+              computed.points
+          ) || 0,
+        pointsBreakdown:
+          recalculatedForInserted?.pointsBreakdown || computed.breakdown || null,
       };
 
-      const allAfterAdd = [baseRound, ...allRoundsBefore];
+      const withoutDuplicate = allRoundsBefore.filter((r) => r?.id !== baseRound.id);
+      const allAfterAdd = [baseRound, ...withoutDuplicate];
 
       let finalAll = allAfterAdd;
 
@@ -821,9 +985,15 @@ export default function SubmitRound() {
         });
       }
 
+      if (recalculated.updatedMap && Object.keys(recalculated.updatedMap).length > 0) {
+        finalAll = finalAll.map((r) => {
+          const patch = recalculated.updatedMap[r?.id];
+          return patch ? { ...r, ...patch } : r;
+        });
+      }
+
       set(KEYS.rounds, finalAll);
 
-      // 3) Re-sync league cache from Supabase if available
       try {
         await syncActiveLeagueFromSupabase({
           leagueId,
@@ -834,7 +1004,6 @@ export default function SubmitRound() {
       }
 
       const savedRound = finalAll.find((r) => r.id === baseRound.id) || baseRound;
-
       const rank = savedRound?.pointsBreakdown?.rank;
 
       const rankLabel =
@@ -852,7 +1021,7 @@ export default function SubmitRound() {
         type: "success",
         title: "Round posted",
         msg: rankLabel
-          ? `${playerName} posted a round in ${league?.name || "your league"} — ${rankLabel}, +${savedRound.points} pts.`
+          ? `${playerName} posted a round in ${league?.name || "your league"} — current rank ${rankLabel}, +${savedRound.points} pts.`
           : `${playerName} posted a round in ${league?.name || "your league"} — +${savedRound.points} pts.`,
       });
 
@@ -1380,7 +1549,7 @@ export default function SubmitRound() {
 
             {usingNewPoints ? (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-700">
-                This league is using its live Supabase points rules.
+                This league is using its live Supabase points rules. Points will recalculate as more scores are added.
               </div>
             ) : (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-700">

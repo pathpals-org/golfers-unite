@@ -43,7 +43,7 @@ export default function BanterPage() {
   const [posts, setPosts] = useState([]);
   const [profilesById, setProfilesById] = useState({});
   const [imageUrlsByPostId, setImageUrlsByPostId] = useState({});
-  const [myRole, setMyRole] = useState(null); // host/co_host/member (depends on your DB values)
+  const [myRole, setMyRole] = useState(null); // host/admin/member
 
   const [content, setContent] = useState("");
   const [file, setFile] = useState(null);

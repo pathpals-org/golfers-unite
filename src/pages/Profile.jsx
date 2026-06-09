@@ -14,6 +14,10 @@ function ensureArr(v) {
   return Array.isArray(v) ? v : [];
 }
 
+function ensureObj(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+}
+
 function sum(nums) {
   return nums.reduce((a, b) => a + (Number(b) || 0), 0);
 }
@@ -46,13 +50,47 @@ function emailPrefix(email) {
 }
 
 function displayNameFrom(p, email) {
-  // Supabase-first, never show "Golfer" if we can help it
-  return (
-    p?.display_name ||
-    p?.username ||
-    emailPrefix(email) ||
-    "Golfer"
-  );
+  return p?.display_name || p?.username || emailPrefix(email) || "Golfer";
+}
+
+function getRoundBonus(r) {
+  return ensureObj(r?.bonus);
+}
+
+function getRoundUserId(r) {
+  return r?.playerId || r?.userId || r?.userID || r?.uid || r?.user_id || null;
+}
+
+function getRoundGrossScore(r) {
+  return safeNum(r?.grossScore ?? r?.gross_score ?? r?.score, null);
+}
+
+function getRoundPoints(r) {
+  return safeNum(r?.points ?? r?.points_awarded ?? r?.pointsAwarded ?? r?.pointsEarned, 0);
+}
+
+function getRoundBirdies(r) {
+  const bonus = getRoundBonus(r);
+  return safeNum(r?.birdies ?? bonus.birdies, 0);
+}
+
+function getRoundEagles(r) {
+  const bonus = getRoundBonus(r);
+  return safeNum(r?.eagles ?? bonus.eagles, 0);
+}
+
+function getRoundHio(r) {
+  const bonus = getRoundBonus(r);
+  return safeNum(r?.hio ?? r?.holeInOnes ?? bonus.hio, 0);
+}
+
+function getRoundIsMajor(r) {
+  const bonus = getRoundBonus(r);
+  return Boolean(r?.isMajor ?? r?.is_major ?? bonus.isMajor);
+}
+
+function getRoundDate(r) {
+  return r?.date || r?.played_on || r?.createdAt || r?.created_at || "";
 }
 
 function Stat({ label, value }) {
@@ -205,7 +243,6 @@ export default function Profile() {
   const [badgesMap, setBadgesMap] = useState(() => getBadges({}));
   const [trophiesMap, setTrophiesMapState] = useState(() => getTrophiesMap());
 
-  // ✅ Supabase-first profile state (fixes “falls back to email”)
   const [liveProfile, setLiveProfile] = useState(profile || null);
   const [profileLoading, setProfileLoading] = useState(false);
 
@@ -223,19 +260,19 @@ export default function Profile() {
 
   useEffect(() => {
     resyncLocal();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
 
   const myId = user?.id || null;
 
-  // keep liveProfile in sync when auth context profile changes
   useEffect(() => {
     if (profile) setLiveProfile(profile);
   }, [profile]);
 
   async function fetchLiveProfile() {
     if (!myId) return;
+
     setProfileLoading(true);
+
     try {
       const { data, error } = await supabase
         .from("profiles")
@@ -249,7 +286,6 @@ export default function Profile() {
     }
   }
 
-  // Supabase-first fetch on entry / user change
   useEffect(() => {
     fetchLiveProfile();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -257,7 +293,7 @@ export default function Profile() {
 
   const myRounds = useMemo(() => {
     if (!myId) return [];
-    return rounds.filter((r) => r?.playerId === myId);
+    return rounds.filter((r) => getRoundUserId(r) === myId);
   }, [rounds, myId]);
 
   const myBadges = useMemo(() => {
@@ -281,19 +317,37 @@ export default function Profile() {
   }, [myBadges]);
 
   const stats = useMemo(() => {
-    const grossScores = myRounds.map((r) => Number(r?.grossScore)).filter((n) => Number.isFinite(n));
-    const points = myRounds.map((r) => Number(r?.points)).filter((n) => Number.isFinite(n));
+    const grossScores = myRounds.map((r) => getRoundGrossScore(r)).filter((x) => Number.isFinite(x));
+    const points = myRounds.map((r) => getRoundPoints(r)).filter((x) => Number.isFinite(x));
 
-    const birdies = sum(myRounds.map((r) => r?.birdies));
-    const eagles = sum(myRounds.map((r) => r?.eagles));
-    const hio = sum(myRounds.map((r) => r?.hio));
-    const majors = myRounds.filter((r) => !!r?.isMajor).length;
+    const birdies = sum(myRounds.map((r) => getRoundBirdies(r)));
+    const eagles = sum(myRounds.map((r) => getRoundEagles(r)));
+    const hio = sum(myRounds.map((r) => getRoundHio(r)));
+    const majors = myRounds.filter((r) => getRoundIsMajor(r)).length;
 
     const best = grossScores.length ? Math.min(...grossScores) : null;
     const totalPoints = points.length ? sum(points) : 0;
 
-    const lastRound = myRounds[0] || null;
-    return { rounds: myRounds.length, totalPoints, birdies, eagles, hio, majors, best, lastRound };
+    const sortedMyRounds = [...myRounds].sort((a, b) => {
+      const ad = String(getRoundDate(a));
+      const bd = String(getRoundDate(b));
+      if (ad > bd) return -1;
+      if (ad < bd) return 1;
+      return 0;
+    });
+
+    const lastRound = sortedMyRounds[0] || null;
+
+    return {
+      rounds: myRounds.length,
+      totalPoints,
+      birdies,
+      eagles,
+      hio,
+      majors,
+      best,
+      lastRound,
+    };
   }, [myRounds]);
 
   const handicap =
@@ -330,9 +384,9 @@ export default function Profile() {
       };
 
       const { error } = await supabase.from("profiles").upsert(payload, { onConflict: "id" });
+
       if (error) throw error;
 
-      // ✅ hard refresh both sources so UI sticks instantly
       await fetchLiveProfile();
       await refreshProfile(myId);
 
@@ -450,7 +504,6 @@ export default function Profile() {
         </div>
       </Card>
 
-      {/* Awards */}
       <Card className="p-5">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -506,7 +559,6 @@ export default function Profile() {
         )}
       </Card>
 
-      {/* Edit modal */}
       {editing ? (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4">
           <div className="w-full max-w-md rounded-3xl bg-white p-5 shadow-xl ring-1 ring-slate-200">
@@ -569,6 +621,3 @@ export default function Profile() {
     </div>
   );
 }
-
-
-
