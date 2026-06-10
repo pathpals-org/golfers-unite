@@ -43,10 +43,18 @@ export default function BanterPage() {
   const [posts, setPosts] = useState([]);
   const [profilesById, setProfilesById] = useState({});
   const [imageUrlsByPostId, setImageUrlsByPostId] = useState({});
-  const [myRole, setMyRole] = useState(null); // host/admin/member
+  const [myRole, setMyRole] = useState(null);
+
+  const [likesByPostId, setLikesByPostId] = useState({});
+  const [commentsByPostId, setCommentsByPostId] = useState({});
+  const [commentDrafts, setCommentDrafts] = useState({});
+  const [busyPostId, setBusyPostId] = useState(null);
+  const [busyCommentId, setBusyCommentId] = useState(null);
 
   const [content, setContent] = useState("");
   const [file, setFile] = useState(null);
+
+  const isAdmin = useMemo(() => myRole === "host" || myRole === "admin", [myRole]);
 
   const StatusBanner = status?.message ? (
     <div
@@ -63,13 +71,6 @@ export default function BanterPage() {
     </div>
   ) : null;
 
-  // IMPORTANT: your league_members.role values appear to be 'host' and 'co_host' in other files.
-  // Your code used 'cohost'. We'll support BOTH so it doesn't break.
-  const isAdmin = useMemo(
-    () => myRole === "host" || myRole === "co_host" || myRole === "cohost",
-    [myRole]
-  );
-
   async function load() {
     setLoading(true);
     setStatus({ type: "", message: "" });
@@ -83,6 +84,8 @@ export default function BanterPage() {
         setPosts([]);
         setProfilesById({});
         setImageUrlsByPostId({});
+        setLikesByPostId({});
+        setCommentsByPostId({});
         setMyRole(null);
         setStatus({ type: "error", message: "You’re not logged in." });
         return;
@@ -93,7 +96,6 @@ export default function BanterPage() {
         return;
       }
 
-      // 1) Load my league role (optional UX - RLS must allow this select)
       const roleRes = await supabase
         .from("league_members")
         .select("role,status")
@@ -107,7 +109,6 @@ export default function BanterPage() {
         setMyRole(null);
       }
 
-      // 2) Load banter posts
       const { data, error } = await supabase
         .from("banter_posts")
         .select("id, league_id, user_id, content, image_path, created_at")
@@ -120,13 +121,84 @@ export default function BanterPage() {
       const rows = ensureArr(data);
       setPosts(rows);
 
-      // 3) Load author profiles (fail-soft if RLS blocks it)
-      const authorIds = Array.from(new Set(rows.map((p) => p.user_id).filter(Boolean)));
-      if (authorIds.length) {
+      const postIds = rows.map((p) => p.id).filter(Boolean);
+
+      if (postIds.length) {
+        const likesRes = await supabase
+          .from("banter_post_likes")
+          .select("post_id,user_id,created_at")
+          .in("post_id", postIds);
+
+        if (!likesRes.error) {
+          const map = {};
+          ensureArr(likesRes.data).forEach((like) => {
+            const pid = like?.post_id;
+            if (!pid) return;
+            if (!map[pid]) map[pid] = { count: 0, likedByMe: false };
+            map[pid].count += 1;
+            if (like.user_id === uid) map[pid].likedByMe = true;
+          });
+          setLikesByPostId(map);
+        } else {
+          setLikesByPostId({});
+        }
+
+        const commentsRes = await supabase
+          .from("banter_post_comments")
+          .select("id,post_id,user_id,text,created_at")
+          .in("post_id", postIds)
+          .order("created_at", { ascending: true });
+
+        if (!commentsRes.error) {
+          const map = {};
+          ensureArr(commentsRes.data).forEach((comment) => {
+            const pid = comment?.post_id;
+            if (!pid) return;
+            if (!map[pid]) map[pid] = [];
+            map[pid].push(comment);
+          });
+          setCommentsByPostId(map);
+        } else {
+          setCommentsByPostId({});
+        }
+      } else {
+        setLikesByPostId({});
+        setCommentsByPostId({});
+      }
+
+      const authorIds = Array.from(
+        new Set([
+          ...rows.map((p) => p.user_id).filter(Boolean),
+          ...Object.values(commentsByPostId)
+            .flat()
+            .map((c) => c.user_id)
+            .filter(Boolean),
+        ])
+      );
+
+      const commentAuthorIds = [];
+      if (postIds.length) {
+        const commentsRes = await supabase
+          .from("banter_post_comments")
+          .select("user_id")
+          .in("post_id", postIds);
+
+        if (!commentsRes.error) {
+          ensureArr(commentsRes.data).forEach((c) => {
+            if (c?.user_id) commentAuthorIds.push(c.user_id);
+          });
+        }
+      }
+
+      const allProfileIds = Array.from(
+        new Set([...rows.map((p) => p.user_id).filter(Boolean), ...commentAuthorIds])
+      );
+
+      if (allProfileIds.length) {
         const profRes = await supabase
           .from("profiles")
           .select("id, display_name, username")
-          .in("id", authorIds);
+          .in("id", allProfileIds);
 
         if (!profRes.error) {
           const map = {};
@@ -136,9 +208,10 @@ export default function BanterPage() {
           });
           setProfilesById(map);
         }
+      } else {
+        setProfilesById({});
       }
 
-      // 4) Signed URLs for images (parallel)
       const rowsWithImages = rows.filter((r) => !!r.image_path);
       if (!rowsWithImages.length) {
         setImageUrlsByPostId({});
@@ -188,6 +261,12 @@ export default function BanterPage() {
     return isAdmin;
   }
 
+  function canDeleteComment(comment) {
+    if (!authId) return false;
+    if (comment?.user_id === authId) return true;
+    return isAdmin;
+  }
+
   async function createPost() {
     if (!authId || !leagueId) return;
 
@@ -225,6 +304,7 @@ export default function BanterPage() {
           upsert: true,
           contentType: file.type || undefined,
         });
+
         if (up.error) throw up.error;
 
         const upd = await supabase.from("banter_posts").update({ image_path: path }).eq("id", postId);
@@ -245,6 +325,7 @@ export default function BanterPage() {
 
   async function deletePost(post) {
     if (!post?.id) return;
+
     if (!canDeletePost(post)) {
       setStatus({ type: "error", message: "You can’t delete this post." });
       return;
@@ -270,6 +351,104 @@ export default function BanterPage() {
     }
   }
 
+  async function toggleLike(postId) {
+    if (!authId || !postId) return;
+
+    const current = likesByPostId[postId] || { count: 0, likedByMe: false };
+    setBusyPostId(postId);
+    setStatus({ type: "", message: "" });
+
+    try {
+      if (current.likedByMe) {
+        const { error } = await supabase
+          .from("banter_post_likes")
+          .delete()
+          .eq("post_id", postId)
+          .eq("user_id", authId);
+
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from("banter_post_likes").insert({
+          post_id: postId,
+          user_id: authId,
+        });
+
+        if (error) throw error;
+      }
+
+      await load();
+    } catch (e) {
+      setStatus({ type: "error", message: humanErr(e) });
+    } finally {
+      setBusyPostId(null);
+    }
+  }
+
+  function updateCommentDraft(postId, value) {
+    setCommentDrafts((cur) => ({
+      ...cur,
+      [postId]: value,
+    }));
+  }
+
+  async function createComment(postId) {
+    if (!authId || !postId) return;
+
+    const text = String(commentDrafts[postId] || "").trim();
+
+    if (!text) {
+      setStatus({ type: "error", message: "Write a comment first." });
+      return;
+    }
+
+    setBusyPostId(postId);
+    setStatus({ type: "", message: "" });
+
+    try {
+      const { error } = await supabase.from("banter_post_comments").insert({
+        post_id: postId,
+        user_id: authId,
+        text,
+      });
+
+      if (error) throw error;
+
+      setCommentDrafts((cur) => ({
+        ...cur,
+        [postId]: "",
+      }));
+
+      await load();
+    } catch (e) {
+      setStatus({ type: "error", message: humanErr(e) });
+    } finally {
+      setBusyPostId(null);
+    }
+  }
+
+  async function deleteComment(comment) {
+    if (!comment?.id) return;
+
+    if (!canDeleteComment(comment)) {
+      setStatus({ type: "error", message: "You can’t delete this comment." });
+      return;
+    }
+
+    setBusyCommentId(comment.id);
+    setStatus({ type: "", message: "" });
+
+    try {
+      const { error } = await supabase.from("banter_post_comments").delete().eq("id", comment.id);
+      if (error) throw error;
+
+      await load();
+    } catch (e) {
+      setStatus({ type: "error", message: humanErr(e) });
+    } finally {
+      setBusyCommentId(null);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -283,6 +462,7 @@ export default function BanterPage() {
             >
               Back
             </button>
+
             <button
               onClick={load}
               className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-extrabold text-white hover:bg-slate-800 disabled:opacity-60"
@@ -299,7 +479,7 @@ export default function BanterPage() {
           <div>
             <div className="text-sm font-extrabold text-slate-900">Post something</div>
             <div className="mt-1 text-xs font-semibold text-slate-600">
-              Text is required. Image is optional (memes welcome).
+              Text is required. Image is optional.
             </div>
           </div>
 
@@ -320,7 +500,7 @@ export default function BanterPage() {
         />
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <label className="inline-flex items-center gap-2 rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-200 cursor-pointer">
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-900 ring-1 ring-slate-200 hover:bg-slate-200">
             <input
               ref={fileInputRef}
               type="file"
@@ -338,7 +518,7 @@ export default function BanterPage() {
             className={[
               "rounded-xl px-4 py-2 text-sm font-extrabold",
               !canPost
-                ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                ? "cursor-not-allowed bg-slate-200 text-slate-500"
                 : "bg-emerald-600 text-white hover:bg-emerald-500",
             ].join(" ")}
           >
@@ -347,11 +527,6 @@ export default function BanterPage() {
         </div>
 
         {StatusBanner}
-
-        {/* Tiny roadmap so it doesn't feel "unfinished" */}
-        <div className="rounded-2xl bg-slate-50 p-3 text-xs font-semibold text-slate-700 ring-1 ring-slate-200">
-          Coming next: 👍 Likes + 💬 Comments (after the banter tables are created in Supabase).
-        </div>
       </Card>
 
       <Card className="p-5 space-y-3">
@@ -363,64 +538,136 @@ export default function BanterPage() {
           <EmptyState icon="💬" title="No banter yet" description="Be the first to post a meme or a chirp." />
         ) : (
           <div className="space-y-3">
-            {posts.map((p) => (
-              <div key={p.id} className="rounded-2xl bg-white p-4 ring-1 ring-slate-200 space-y-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-extrabold text-slate-900">
-                      {authorLabel(p.user_id)}
+            {posts.map((p) => {
+              const likeInfo = likesByPostId[p.id] || { count: 0, likedByMe: false };
+              const comments = commentsByPostId[p.id] || [];
+              const draft = commentDrafts[p.id] || "";
+              const postBusy = busyPostId === p.id;
+
+              return (
+                <div key={p.id} className="space-y-3 rounded-2xl bg-white p-4 ring-1 ring-slate-200">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-extrabold text-slate-900">
+                        {authorLabel(p.user_id)}
+                      </div>
+                      <div className="text-xs font-semibold text-slate-500">
+                        {new Date(p.created_at).toLocaleString()}
+                      </div>
                     </div>
-                    <div className="text-xs font-semibold text-slate-500">
-                      {new Date(p.created_at).toLocaleString()}
-                    </div>
+
+                    {canDeletePost(p) ? (
+                      <button
+                        onClick={() => deletePost(p)}
+                        disabled={posting}
+                        className="rounded-xl bg-rose-600 px-3 py-2 text-xs font-extrabold text-white hover:bg-rose-500 disabled:opacity-60"
+                        title="Delete"
+                      >
+                        Delete
+                      </button>
+                    ) : null}
                   </div>
 
-                  {canDeletePost(p) ? (
-                    <button
-                      onClick={() => deletePost(p)}
-                      disabled={posting}
-                      className="rounded-xl bg-rose-600 px-3 py-2 text-xs font-extrabold text-white hover:bg-rose-500 disabled:opacity-60"
-                      title="Delete"
-                    >
-                      Delete
-                    </button>
+                  <div className="whitespace-pre-wrap text-sm font-semibold text-slate-800">{p.content}</div>
+
+                  {imageUrlsByPostId[p.id] ? (
+                    <img
+                      src={imageUrlsByPostId[p.id]}
+                      alt="Banter"
+                      className="max-h-[520px] w-full rounded-xl border border-slate-200 bg-slate-50 object-contain"
+                      loading="lazy"
+                    />
                   ) : null}
-                </div>
 
-                <div className="text-sm font-semibold text-slate-800 whitespace-pre-wrap">
-                  {p.content}
-                </div>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      disabled={postBusy}
+                      onClick={() => toggleLike(p.id)}
+                      className={[
+                        "rounded-xl px-3 py-2 text-xs font-extrabold ring-1",
+                        likeInfo.likedByMe
+                          ? "bg-emerald-600 text-white ring-emerald-600 hover:bg-emerald-500"
+                          : "bg-slate-100 text-slate-700 ring-slate-200 hover:bg-slate-200",
+                        postBusy ? "opacity-60" : "",
+                      ].join(" ")}
+                    >
+                      👍 {likeInfo.likedByMe ? "Liked" : "Like"} · {likeInfo.count}
+                    </button>
 
-                {imageUrlsByPostId[p.id] ? (
-                  <img
-                    src={imageUrlsByPostId[p.id]}
-                    alt="Banter"
-                    className="w-full max-h-[520px] object-contain rounded-xl border border-slate-200 bg-slate-50"
-                    loading="lazy"
-                  />
-                ) : null}
+                    <span className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-700 ring-1 ring-slate-200">
+                      💬 {comments.length}
+                    </span>
+                  </div>
 
-                {/* Placeholder action row so it feels like a proper social post */}
-                <div className="flex items-center gap-2 pt-1">
-                  <button
-                    type="button"
-                    disabled
-                    className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-500 ring-1 ring-slate-200 cursor-not-allowed"
-                    title="Likes coming next"
-                  >
-                    👍 Like
-                  </button>
-                  <button
-                    type="button"
-                    disabled
-                    className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-extrabold text-slate-500 ring-1 ring-slate-200 cursor-not-allowed"
-                    title="Comments coming next"
-                  >
-                    💬 Comment
-                  </button>
+                  <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
+                    <div className="space-y-2">
+                      {comments.length === 0 ? (
+                        <div className="text-xs font-semibold text-slate-500">No comments yet.</div>
+                      ) : (
+                        comments.map((c) => {
+                          const commentBusy = busyCommentId === c.id;
+
+                          return (
+                            <div key={c.id} className="rounded-xl bg-white p-3 ring-1 ring-slate-200">
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="truncate text-xs font-extrabold text-slate-900">
+                                    {authorLabel(c.user_id)}
+                                  </div>
+                                  <div className="text-[11px] font-semibold text-slate-500">
+                                    {new Date(c.created_at).toLocaleString()}
+                                  </div>
+                                </div>
+
+                                {canDeleteComment(c) ? (
+                                  <button
+                                    type="button"
+                                    disabled={commentBusy}
+                                    onClick={() => deleteComment(c)}
+                                    className="rounded-lg bg-rose-50 px-2 py-1 text-[11px] font-extrabold text-rose-700 ring-1 ring-rose-200 hover:bg-rose-100 disabled:opacity-60"
+                                  >
+                                    Delete
+                                  </button>
+                                ) : null}
+                              </div>
+
+                              <div className="mt-2 whitespace-pre-wrap text-sm font-semibold text-slate-800">
+                                {c.text}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+
+                    <div className="mt-3 flex gap-2">
+                      <input
+                        value={draft}
+                        onChange={(e) => updateCommentDraft(p.id, e.target.value)}
+                        placeholder="Write a comment…"
+                        disabled={postBusy}
+                        className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 placeholder:text-slate-400 outline-none ring-emerald-200 focus:ring-4"
+                      />
+
+                      <button
+                        type="button"
+                        disabled={postBusy || !draft.trim()}
+                        onClick={() => createComment(p.id)}
+                        className={[
+                          "rounded-xl px-3 py-2 text-xs font-extrabold",
+                          postBusy || !draft.trim()
+                            ? "cursor-not-allowed bg-slate-200 text-slate-500"
+                            : "bg-slate-900 text-white hover:bg-slate-800",
+                        ].join(" ")}
+                      >
+                        Comment
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Card>
