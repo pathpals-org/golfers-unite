@@ -45,6 +45,12 @@ function clampInt(n, min, max) {
   return Math.min(max, Math.max(min, x));
 }
 
+function safeNum(v, fallback = null) {
+  if (v === null || v === undefined || v === "") return fallback;
+  const n = typeof v === "string" ? Number(v) : v;
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function ensureArray(v) {
   return Array.isArray(v) ? v : [];
 }
@@ -66,6 +72,23 @@ function getPlayerLabel(p) {
   return p.display_name || p.username || p.name || p.fullName || p.displayName || "Unnamed Player";
 }
 
+function getPlayerHandicap(p) {
+  return safeNum(p?.handicap_index ?? p?.handicap ?? p?.handicapIndex, 0) || 0;
+}
+
+function calculateNetScore(grossScore, handicap) {
+  const gross = safeNum(grossScore, null);
+  const hcap = safeNum(handicap, 0) || 0;
+  if (!Number.isFinite(gross)) return null;
+  return Number((gross - hcap).toFixed(1));
+}
+
+function formatScore(v) {
+  const n = safeNum(v, null);
+  if (!Number.isFinite(n)) return "—";
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
 function Pill({ active, onClick, children }) {
   return (
     <button
@@ -83,9 +106,6 @@ function Pill({ active, onClick, children }) {
   );
 }
 
-/**
- * Image compression (no libraries)
- */
 async function compressImageToDataURL(file, { maxDim = 1280, quality = 0.78 } = {}) {
   if (!file) return null;
 
@@ -142,17 +162,35 @@ function getRoundGrossScore(r) {
   return Number(r?.grossScore ?? r?.gross_score);
 }
 
+function getRoundNetScore(r) {
+  const explicitNet = safeNum(r?.netScore ?? r?.net_score, null);
+  if (Number.isFinite(explicitNet)) return explicitNet;
+
+  const gross = getRoundGrossScore(r);
+  const bonus = ensureObj(r?.bonus);
+  const handicap = safeNum(r?.handicap ?? r?.handicap_index ?? bonus.handicap ?? bonus.handicap_index, 0) || 0;
+
+  if (!Number.isFinite(gross)) return NaN;
+  return calculateNetScore(gross, handicap);
+}
+
+function getRoundRankingScore(r) {
+  const net = getRoundNetScore(r);
+  if (Number.isFinite(net)) return net;
+  return getRoundGrossScore(r);
+}
+
 function getRoundHoles(r) {
   const bonus = ensureObj(r?.bonus);
   return Number(r?.holes ?? bonus.holes ?? 18);
 }
 
-function rankForGrossScore(eventRounds, grossScore) {
-  const s = Number(grossScore);
+function rankForScore(eventRounds, score) {
+  const s = Number(score);
   if (!Number.isFinite(s)) return null;
 
   const scores = ensureArray(eventRounds)
-    .map((r) => getRoundGrossScore(r))
+    .map((r) => getRoundRankingScore(r))
     .filter((x) => Number.isFinite(x))
     .sort((a, b) => a - b);
 
@@ -198,7 +236,8 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
 
     if (k !== eventKey) return r;
 
-    const rank = rankForGrossScore(eventRounds, getRoundGrossScore(r));
+    const rankingScore = getRoundRankingScore(r);
+    const rank = rankForScore(eventRounds, rankingScore);
 
     const res = calculateLeaguePoints({
       place: rank,
@@ -214,6 +253,8 @@ function recomputeEventPoints(allRounds, { leagueId, date, course, holes, points
       pointsBreakdown: {
         mode: "league",
         rank,
+        rankedBy: "net",
+        rankingScore,
         placementPoints: res.placementPoints,
         bonusPoints: res.bonusPoints,
         participationPoints: res.participationPoints,
@@ -255,9 +296,6 @@ async function resolveCurrentLeagueForUser(authUserId) {
   return cleanLeagueId(membershipRes.data?.[0]?.league_id || null);
 }
 
-/**
- * Save one round using your actual Supabase column names.
- */
 async function insertRoundRobust({
   leagueId,
   playerId,
@@ -267,6 +305,8 @@ async function insertRoundRobust({
   holes,
   par,
   grossScore,
+  netScore,
+  handicap,
   birdies,
   eagles,
   hio,
@@ -277,6 +317,8 @@ async function insertRoundRobust({
   const bonus = {
     holes,
     par,
+    handicap,
+    handicap_index: handicap,
     birdies,
     eagles,
     hio,
@@ -290,29 +332,19 @@ async function insertRoundRobust({
     played_on: date,
     course_name: course,
     gross_score: grossScore,
-    net_score: null,
+    net_score: netScore,
     notes,
     bonus,
     points_awarded: Number(points) || 0,
   };
 
-  const res = await supabase
-    .from("rounds")
-    .insert(payload)
-    .select("*")
-    .maybeSingle();
+  const res = await supabase.from("rounds").insert(payload).select("*").maybeSingle();
 
   if (res.error) throw res.error;
 
   return res.data || null;
 }
 
-/**
- * ✅ NEW:
- * Recalculate points for every round in the same event and update Supabase.
- *
- * Event = same league + date + course + holes.
- */
 async function recalculateEventPointsInSupabase({
   leagueId,
   date,
@@ -331,7 +363,7 @@ async function recalculateEventPointsInSupabase({
 
   const res = await supabase
     .from("rounds")
-    .select("id,league_id,user_id,played_on,course_name,gross_score,bonus,points_awarded,created_at,notes")
+    .select("id,league_id,user_id,played_on,course_name,gross_score,net_score,bonus,points_awarded,created_at,notes")
     .eq("league_id", cleanLeague)
     .eq("played_on", date)
     .ilike("course_name", course.trim());
@@ -352,7 +384,8 @@ async function recalculateEventPointsInSupabase({
   }
 
   const withPoints = rows.map((r) => {
-    const rank = rankForGrossScore(rows, r.gross_score);
+    const rankingScore = getRoundRankingScore(r);
+    const rank = rankForScore(rows, rankingScore);
 
     const bonus = ensureObj(r.bonus);
 
@@ -370,6 +403,8 @@ async function recalculateEventPointsInSupabase({
     const breakdown = {
       mode: "league",
       rank,
+      rankedBy: "net",
+      rankingScore,
       placementPoints: calc.placementPoints,
       bonusPoints: calc.bonusPoints,
       participationPoints: calc.participationPoints,
@@ -531,7 +566,7 @@ export default function SubmitRound() {
         if (userIds.length) {
           const profileRes = await supabase
             .from("profiles")
-            .select("id,username,display_name")
+            .select("id,username,display_name,handicap_index")
             .in("id", userIds);
 
           if (!profileRes.error) {
@@ -544,6 +579,7 @@ export default function SubmitRound() {
 
         const nextPlayers = memberRows.map((m) => {
           const p = profileMap[m.user_id] || {};
+          const handicap = safeNum(p.handicap_index, 0) || 0;
 
           return {
             id: m.user_id,
@@ -552,6 +588,8 @@ export default function SubmitRound() {
             status: m.status,
             username: p.username || "",
             display_name: p.display_name || "",
+            handicap_index: handicap,
+            handicap,
             name: p.display_name || p.username || `User ${String(m.user_id).slice(0, 8)}…`,
           };
         });
@@ -612,6 +650,8 @@ export default function SubmitRound() {
     return players.find((p) => p.id === id || p.user_id === id) || null;
   }, [players, form.playerId]);
 
+  const selectedHandicap = useMemo(() => getPlayerHandicap(selectedPlayer), [selectedPlayer]);
+
   const isHost = myRole === "host" || myRole === "admin";
 
   const leaguePointsSystem = useMemo(() => {
@@ -624,7 +664,14 @@ export default function SubmitRound() {
   const computed = useMemo(() => {
     const gross = form.grossScore === "" ? NaN : Number(form.grossScore);
     const par = Number(form.par);
+    const netScore = calculateNetScore(gross, selectedHandicap);
+
     const diff = Number.isFinite(gross) && Number.isFinite(par) ? gross - par : null;
+    const netDiff = Number.isFinite(netScore) && Number.isFinite(par) ? netScore - par : null;
+
+    const toParLabel = diff === null ? "—" : diff === 0 ? "E" : diff > 0 ? `+${diff}` : `${diff}`;
+    const netToParLabel =
+      netDiff === null ? "—" : netDiff === 0 ? "E" : netDiff > 0 ? `+${formatScore(netDiff)}` : `${formatScore(netDiff)}`;
 
     if (usingNewPoints) {
       const allRounds = ensureArray(getRounds([]));
@@ -636,6 +683,10 @@ export default function SubmitRound() {
         course: form.course.trim(),
         holes: Number(form.holes),
         grossScore: gross,
+        gross_score: gross,
+        netScore,
+        net_score: netScore,
+        handicap: selectedHandicap,
         birdies: clampInt(Number(form.birdies), 0, 99),
         eagles: clampInt(Number(form.eagles), 0, 99),
         hio: clampInt(Number(form.hio), 0, 18),
@@ -660,11 +711,11 @@ export default function SubmitRound() {
       });
 
       const tempRounds =
-        Number.isFinite(gross) && draft.course && draft.date
+        Number.isFinite(gross) && Number.isFinite(netScore) && draft.course && draft.date
           ? [...eventRounds, draft]
           : eventRounds;
 
-      const rank = rankForGrossScore(tempRounds, draft.grossScore);
+      const rank = rankForScore(tempRounds, draft.netScore);
 
       const bonusFlags = {
         birdie: draft.birdies > 0,
@@ -684,12 +735,16 @@ export default function SubmitRound() {
         breakdown: {
           mode: "league",
           rank,
+          rankedBy: "net",
+          rankingScore: netScore,
           placementPoints: res.placementPoints,
           bonusPoints: res.bonusPoints,
           participationPoints: res.participationPoints,
         },
         diff,
-        netLabel: diff === null ? "—" : diff === 0 ? "E" : diff > 0 ? `+${diff}` : `${diff}`,
+        toParLabel,
+        netScore,
+        netToParLabel,
       };
     }
 
@@ -707,7 +762,9 @@ export default function SubmitRound() {
         points: 0,
         breakdown: { mode: "legacy", note: "No points system set." },
         diff,
-        netLabel: diff === null ? "—" : diff === 0 ? "E" : diff > 0 ? `+${diff}` : `${diff}`,
+        toParLabel,
+        netScore,
+        netToParLabel,
       };
     }
 
@@ -729,9 +786,11 @@ export default function SubmitRound() {
         multiplier: form.isMajor ? majorMultiplier : 1,
       },
       diff,
-      netLabel: diff === null ? "—" : diff === 0 ? "E" : diff > 0 ? `+${diff}` : `${diff}`,
+      toParLabel,
+      netScore,
+      netToParLabel,
     };
-  }, [form, league?.id, leaguePointsSystem, usingNewPoints, legacyPointsSystem]);
+  }, [form, league?.id, leaguePointsSystem, usingNewPoints, legacyPointsSystem, selectedHandicap]);
 
   const errors = useMemo(() => {
     const e = {};
@@ -870,8 +929,11 @@ export default function SubmitRound() {
 
       const playerObj = players.find((p) => p.id === playerId || p.user_id === playerId);
       const playerName = getPlayerLabel(playerObj);
+      const playerHandicap = getPlayerHandicap(playerObj);
 
       const grossScore = Number(form.grossScore);
+      const netScore = calculateNetScore(grossScore, playerHandicap);
+
       const birdies = clampInt(Number(form.birdies), 0, 99);
       const eagles = clampInt(Number(form.eagles), 0, 99);
       const hio = clampInt(Number(form.hio), 0, 18);
@@ -888,6 +950,8 @@ export default function SubmitRound() {
           holes: Number(form.holes),
           par: Number(form.par),
           grossScore,
+          netScore,
+          handicap: playerHandicap,
           birdies,
           eagles,
           hio,
@@ -913,7 +977,6 @@ export default function SubmitRound() {
           pointsSystem: leaguePointsSystem || DEFAULT_POINTS_SYSTEM,
         });
       } catch (recalcErr) {
-        // Score is still saved, but points may need refresh later.
         setToast({
           type: "error",
           title: "Round saved, points need refresh",
@@ -941,7 +1004,12 @@ export default function SubmitRound() {
 
         holes: Number(bonusFromDb.holes || form.holes),
         par: Number(bonusFromDb.par || form.par),
+        handicap: safeNum(bonusFromDb.handicap ?? bonusFromDb.handicap_index, playerHandicap) || 0,
+        handicap_index: safeNum(bonusFromDb.handicap_index ?? bonusFromDb.handicap, playerHandicap) || 0,
         grossScore: Number(insertedRound?.gross_score ?? grossScore),
+        gross_score: Number(insertedRound?.gross_score ?? grossScore),
+        netScore: safeNum(insertedRound?.net_score, netScore),
+        net_score: safeNum(insertedRound?.net_score, netScore),
 
         birdies: Number(bonusFromDb.birdies ?? birdies),
         eagles: Number(bonusFromDb.eagles ?? eagles),
@@ -950,6 +1018,7 @@ export default function SubmitRound() {
 
         notes: insertedRound?.notes || form.notes.trim(),
         leagueId: insertedRound?.league_id || leagueId,
+        league_id: insertedRound?.league_id || leagueId,
 
         cardPhoto: cardPhoto || null,
         status: "approved",
@@ -1021,8 +1090,8 @@ export default function SubmitRound() {
         type: "success",
         title: "Round posted",
         msg: rankLabel
-          ? `${playerName} posted a round in ${league?.name || "your league"} — current rank ${rankLabel}, +${savedRound.points} pts.`
-          : `${playerName} posted a round in ${league?.name || "your league"} — +${savedRound.points} pts.`,
+          ? `${playerName} posted ${grossScore} gross / ${formatScore(netScore)} net — current rank ${rankLabel}, +${savedRound.points} pts.`
+          : `${playerName} posted ${grossScore} gross / ${formatScore(netScore)} net — +${savedRound.points} pts.`,
       });
 
       setForm((f) => ({
@@ -1096,7 +1165,7 @@ export default function SubmitRound() {
           <div className="text-sm font-semibold text-slate-900">Points Preview</div>
 
           <div className="text-xs text-slate-600">
-            Rank if posted now: <span className="font-semibold text-slate-900">{rankLabel}</span>
+            Net rank if posted now: <span className="font-semibold text-slate-900">{rankLabel}</span>
             {" · "}Placement {placementPoints}
             {participationPoints ? ` · Play +${participationPoints}` : ""}
             {bonusPoints ? ` · Bonus +${bonusPoints}` : " · Bonuses off"}
@@ -1247,11 +1316,18 @@ export default function SubmitRound() {
 
               return (
                 <option key={id} value={id}>
-                  {getPlayerLabel(p)}
+                  {getPlayerLabel(p)} · HCP {formatScore(getPlayerHandicap(p))}
                 </option>
               );
             })}
           </select>
+
+          <div className="mt-2 rounded-2xl bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 ring-1 ring-slate-200">
+            Selected handicap:{" "}
+            <span className="font-extrabold text-slate-900">
+              {formatScore(selectedHandicap)}
+            </span>
+          </div>
 
           {!isHost ? (
             <div className="mt-1 text-xs font-semibold text-slate-500">
@@ -1375,7 +1451,7 @@ export default function SubmitRound() {
 
               <div>
                 <label className="mb-1 block text-xs font-semibold text-slate-700">
-                  Score
+                  Gross Score
                 </label>
 
                 <input
@@ -1399,12 +1475,25 @@ export default function SubmitRound() {
               </div>
             </div>
 
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-              <div className="flex items-center justify-between">
-                <div className="text-xs font-semibold text-slate-700">To Par</div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <div className="text-xs font-semibold text-slate-700">Gross to Par</div>
+                <div className="mt-1 text-sm font-extrabold text-slate-900">
+                  {computed.toParLabel}
+                </div>
+              </div>
 
-                <div className="rounded-xl bg-white px-2.5 py-1 text-xs font-bold text-slate-900 shadow-sm">
-                  {computed.netLabel}
+              <div className="rounded-2xl border border-slate-200 bg-emerald-50 px-4 py-3">
+                <div className="text-xs font-semibold text-emerald-800">Net Score</div>
+                <div className="mt-1 text-sm font-extrabold text-emerald-950">
+                  {formatScore(computed.netScore)}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+                <div className="text-xs font-semibold text-slate-700">Net to Par</div>
+                <div className="mt-1 text-sm font-extrabold text-slate-900">
+                  {computed.netToParLabel}
                 </div>
               </div>
             </div>
@@ -1474,7 +1563,7 @@ export default function SubmitRound() {
         </Card>
 
         <Card className="p-4">
-          <div className="space-y-4">
+          <div className="space-y-3">
             <div>
               <div className="text-sm font-semibold text-slate-900">Scoring Events</div>
 
@@ -1549,7 +1638,7 @@ export default function SubmitRound() {
 
             {usingNewPoints ? (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-700">
-                This league is using its live Supabase points rules. Points will recalculate as more scores are added.
+                This league ranks rounds by <span className="font-extrabold">net score</span>, using each player’s profile handicap.
               </div>
             ) : (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs font-semibold text-slate-700">
