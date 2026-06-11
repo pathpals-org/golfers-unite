@@ -158,7 +158,18 @@ export default function FindGolfers() {
       const rows = ensureArr(frRes.data);
       setFriendships(rows);
 
-      const ids = Array.from(new Set(rows.map((r) => otherId(r)).filter(Boolean)));
+      const ids = Array.from(
+  new Set(
+    rows
+      .flatMap((r) => [
+        r.user_low,
+        r.user_high,
+        r.requester_id,
+        r.addressee_id,
+      ])
+      .filter(Boolean)
+  )
+);
 
       if (!ids.length) {
         setProfilesById({});
