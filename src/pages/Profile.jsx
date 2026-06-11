@@ -204,6 +204,7 @@ function AchievementTile({ award, kind = "award" }) {
   return (
     <div className={["relative overflow-hidden rounded-2xl p-4 ring-1 shadow-sm", tone.bg, tone.ring].join(" ")}>
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/60 to-transparent" />
+
       <div className="flex items-start gap-3">
         <div className={["grid h-11 w-11 place-items-center rounded-2xl shadow-sm ring-1 ring-white/40", tone.iconBg, tone.iconText].join(" ")}>
           <span className="text-xl">{icon}</span>
@@ -251,6 +252,9 @@ export default function Profile() {
   const [draftHandicap, setDraftHandicap] = useState("");
   const [saveLoading, setSaveLoading] = useState(false);
   const [status, setStatus] = useState({ type: "", message: "" });
+
+  const [deleteConfirm, setDeleteConfirm] = useState("");
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   function resyncLocal() {
     setRounds(ensureArr(getRounds([])));
@@ -396,6 +400,63 @@ export default function Profile() {
       setStatus({ type: "error", message: humanErr(e) });
     } finally {
       setSaveLoading(false);
+    }
+  }
+
+  async function deleteMyAccountData() {
+    if (!myId) return;
+
+    if (deleteConfirm.trim().toUpperCase() !== "DELETE") {
+      setStatus({ type: "error", message: 'Type "DELETE" to confirm account deletion.' });
+      return;
+    }
+
+    setDeleteLoading(true);
+    setStatus({ type: "", message: "" });
+
+    try {
+      await supabase.from("banter_post_likes").delete().eq("user_id", myId);
+      await supabase.from("banter_post_comments").delete().eq("user_id", myId);
+      await supabase.from("banter_posts").delete().eq("user_id", myId);
+
+      await supabase.from("feed_post_likes").delete().eq("user_id", myId);
+      await supabase.from("feed_post_comments").delete().eq("user_id", myId);
+      await supabase.from("feed_posts").delete().eq("user_id", myId);
+
+      await supabase.from("round_scorecards").delete().eq("user_id", myId);
+      await supabase.from("rounds").delete().eq("user_id", myId);
+
+      await supabase.from("league_invites").delete().eq("invitee_user_id", myId);
+      await supabase.from("league_invites").delete().eq("inviter_user_id", myId);
+      await supabase.from("league_invites").delete().eq("invited_user_id", myId);
+      await supabase.from("league_invites").delete().eq("invited_by_user_id", myId);
+
+      await supabase.from("league_members").delete().eq("user_id", myId);
+
+      await supabase.from("friendships").delete().eq("requester_id", myId);
+      await supabase.from("friendships").delete().eq("addressee_id", myId);
+      await supabase.from("friendships").delete().eq("user_low", myId);
+      await supabase.from("friendships").delete().eq("user_high", myId);
+
+      await supabase.from("profiles").delete().eq("id", myId);
+
+      await supabase.auth.signOut();
+
+      try {
+        localStorage.clear();
+      } catch {
+        // ignore
+      }
+
+      navigate("/login", { replace: true });
+    } catch (e) {
+      setStatus({
+        type: "error",
+        message: "Account delete failed. This is usually a database permission issue. " + humanErr(e),
+      });
+    } finally {
+      setDeleteLoading(false);
+      setDeleteConfirm("");
     }
   }
 
@@ -557,6 +618,55 @@ export default function Profile() {
             ) : null}
           </div>
         )}
+      </Card>
+
+      <Card className="p-5 border border-rose-200">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-extrabold text-rose-900">Danger zone</div>
+            <div className="mt-1 text-xs font-semibold text-slate-600">
+              Delete your Golfers Unite profile and app data. This cannot be undone.
+            </div>
+          </div>
+
+          <span className="rounded-full bg-rose-50 px-3 py-2 text-xs font-extrabold text-rose-700 ring-1 ring-rose-200">
+            Beta
+          </span>
+        </div>
+
+        <div className="mt-4 rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-900 ring-1 ring-rose-200">
+          This removes your visible app data such as profile, rounds, friendships, invites,
+          banter posts, comments, and likes. Full Supabase Auth user deletion will need a
+          secure server-side function later.
+        </div>
+
+        <div className="mt-4">
+          <div className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+            Type DELETE to confirm
+          </div>
+
+          <input
+            value={deleteConfirm}
+            onChange={(e) => setDeleteConfirm(e.target.value)}
+            placeholder="DELETE"
+            disabled={deleteLoading}
+            className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-extrabold text-slate-900 outline-none ring-rose-200 focus:ring-4 disabled:bg-slate-50 disabled:text-slate-400"
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={deleteMyAccountData}
+          disabled={deleteLoading || deleteConfirm.trim().toUpperCase() !== "DELETE"}
+          className={[
+            "mt-4 rounded-xl px-4 py-2 text-sm font-extrabold",
+            deleteLoading || deleteConfirm.trim().toUpperCase() !== "DELETE"
+              ? "cursor-not-allowed bg-slate-200 text-slate-500"
+              : "bg-rose-600 text-white hover:bg-rose-500",
+          ].join(" ")}
+        >
+          {deleteLoading ? "Deleting…" : "Delete my account data"}
+        </button>
       </Card>
 
       {editing ? (
