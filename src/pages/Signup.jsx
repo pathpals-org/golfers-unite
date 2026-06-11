@@ -46,11 +46,11 @@ export default function Signup() {
 
   // Already logged in → go where they intended
   useEffect(() => {
-    if (!loading && user) {
-      await refreshProfile(data.session.user?.id);
-      navigate(fromPath, { replace: true });
-    }
-  }, [user, loading, navigate, fromPath]);
+  if (!loading && user) {
+    refreshProfile(user.id);
+    navigate(fromPath, { replace: true });
+  }
+}, [user, loading, navigate, fromPath, refreshProfile]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
