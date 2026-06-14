@@ -26,7 +26,7 @@ export default function App() {
 
       <TopNav />
 
-      <main className="relative mx-auto w-full max-w-xl px-4 pb-32 pt-5 sm:px-5 md:max-w-2xl md:pb-12 md:pt-6 lg:max-w-3xl">
+      <main className="relative mx-auto w-full max-w-xl px-4 pb-40 pt-5 sm:px-5 md:max-w-2xl md:pb-12 md:pt-6 lg:max-w-3xl">
         <div className="animate-[fadeIn_250ms_ease-out]">
           <Outlet />
         </div>

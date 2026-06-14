@@ -11,15 +11,19 @@ function humanAuthError(message) {
   if (msg.includes("user already registered")) {
     return "That email is already registered. Try logging in instead.";
   }
+
   if (msg.includes("duplicate key") || msg.includes("already exists")) {
     return "That username or email is already taken.";
   }
+
   if (msg.includes("password")) {
-    return "Password is too weak. Try 8+ characters.";
+    return "Password is too weak. Try at least 8 characters.";
   }
+
   if (msg.includes("network") || msg.includes("failed to fetch")) {
     return "Network issue — check your connection and try again.";
   }
+
   return "Signup failed. Please try again.";
 }
 
@@ -30,7 +34,11 @@ export default function Signup() {
 
   const fromPath = useMemo(() => {
     const maybe = location.state?.from?.pathname;
-    if (!maybe || maybe === "/login" || maybe === "/signup") return "/";
+
+    if (!maybe || maybe === "/login" || maybe === "/signup") {
+      return "/";
+    }
+
     return maybe;
   }, [location.state]);
 
@@ -40,20 +48,18 @@ export default function Signup() {
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-
-  // If signup requires email confirmation, Supabase may NOT return a session.
   const [needsEmailConfirm, setNeedsEmailConfirm] = useState(false);
 
-  // Already logged in → go where they intended
   useEffect(() => {
-  if (!loading && user) {
-    refreshProfile(user.id);
-    navigate(fromPath, { replace: true });
-  }
-}, [user, loading, navigate, fromPath, refreshProfile]);
+    if (!loading && user) {
+      refreshProfile(user.id);
+      navigate(fromPath, { replace: true });
+    }
+  }, [user, loading, navigate, fromPath, refreshProfile]);
 
-  const handleSubmit = async (e) => {
+  async function handleSubmit(e) {
     e.preventDefault();
+
     if (busy) return;
 
     setError("");
@@ -66,6 +72,7 @@ export default function Signup() {
       setError("Username must be at least 3 characters.");
       return;
     }
+
     if (password.length < 8) {
       setError("Password must be at least 8 characters.");
       return;
@@ -74,96 +81,163 @@ export default function Signup() {
     setBusy(true);
 
     try {
-      await signUp({ email: cleanEmail, password, username: cleanUsername });
+      await signUp({
+        email: cleanEmail,
+        password,
+        username: cleanUsername,
+      });
 
-      // ✅ Sanity check: do we have a session now?
-      const { data } = await supabase.auth.getSession();
+      const { data, error: sessionError } =
+        await supabase.auth.getSession();
+
+      if (sessionError) {
+        throw sessionError;
+      }
 
       if (data?.session) {
-        // Session exists → proceed normally
         navigate(fromPath, { replace: true });
         return;
       }
 
-      // No session → email confirmation is likely required
       setNeedsEmailConfirm(true);
     } catch (err) {
       setError(humanAuthError(err?.message));
     } finally {
       setBusy(false);
     }
-  };
+  }
 
   if (loading) {
     return (
-      <div className="mx-auto mt-10 max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <p className="text-sm font-semibold text-slate-900">Loading…</p>
-        <p className="mt-1 text-xs text-slate-600">Just setting things up.</p>
+      <div className="min-h-screen bg-slate-100 px-4 py-10">
+        <div className="mx-auto max-w-sm rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <p className="text-sm font-extrabold text-slate-900">
+            Loading…
+          </p>
+
+          <p className="mt-1 text-xs font-semibold text-slate-600">
+            Just setting things up.
+          </p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="mx-auto mt-10 max-w-sm rounded-2xl bg-white p-6 shadow-sm">
-      <h1 className="text-xl font-semibold text-slate-900">Join Golfers Unite</h1>
-      <p className="mt-1 text-sm text-slate-600">Leagues, rounds, and proper golf banter.</p>
+    <div className="relative min-h-screen overflow-hidden bg-slate-100 px-4 py-8 sm:py-12">
+      <div className="pointer-events-none absolute -top-36 left-1/2 h-[420px] w-[420px] -translate-x-1/2 rounded-full bg-emerald-500/10 blur-3xl" />
 
-      {needsEmailConfirm ? (
-        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">
-          Account created ✅ Now check your email to confirm your address, then come back and log in.
+      <div className="relative mx-auto w-full max-w-sm">
+        <div className="mb-6 flex flex-col items-center text-center">
+          <div className="relative grid h-16 w-16 place-items-center overflow-hidden rounded-3xl bg-emerald-600 text-3xl text-white shadow-lg ring-1 ring-emerald-700/20">
+            <span className="relative z-10">⛳</span>
+            <span className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/25 to-transparent" />
+          </div>
+
+          <h1 className="mt-4 text-2xl font-black tracking-tight text-slate-950">
+            Join Golfers Unite
+          </h1>
+
+          <p className="mt-2 max-w-xs text-sm font-semibold leading-6 text-slate-600">
+            Create your profile, join a league, submit rounds and enjoy proper golf banter.
+          </p>
         </div>
-      ) : null}
 
-      <form onSubmit={handleSubmit} className="mt-6 space-y-4">
-        <input
-          type="text"
-          required
-          placeholder="Username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          autoComplete="username"
-        />
+        <div className="rounded-3xl border border-slate-200/80 bg-white p-6 shadow-[0_20px_50px_rgba(15,23,42,0.10)]">
+          {needsEmailConfirm ? (
+            <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold leading-5 text-amber-900">
+              Account created ✅ Check your email to confirm your address, then return and log in.
+            </div>
+          ) : null}
 
-        <input
-          type="email"
-          required
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          autoComplete="email"
-          inputMode="email"
-        />
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+                Username
+              </label>
 
-        <input
-          type="password"
-          required
-          placeholder="Password (8+ characters)"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          autoComplete="new-password"
-        />
+              <input
+                type="text"
+                required
+                minLength={3}
+                placeholder="Choose a username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:bg-white focus:ring-4 focus:ring-emerald-100"
+                autoComplete="username"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </div>
 
-        {error ? <p className="text-sm text-red-600">{error}</p> : null}
+            <div>
+              <label className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+                Email
+              </label>
 
-        <button
-          disabled={busy}
-          className="w-full rounded-xl bg-emerald-600 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
-        >
-          {busy ? "Creating account…" : "Sign up"}
-        </button>
-      </form>
+              <input
+                type="email"
+                required
+                placeholder="you@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:bg-white focus:ring-4 focus:ring-emerald-100"
+                autoComplete="email"
+                inputMode="email"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </div>
 
-      <p className="mt-4 text-sm text-slate-600">
-        Already have an account?{" "}
-        <Link to="/login" className="font-semibold text-emerald-600">
-          Log in
-        </Link>
-      </p>
+            <div>
+              <label className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+                Password
+              </label>
+
+              <input
+                type="password"
+                required
+                minLength={8}
+                placeholder="At least 8 characters"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:bg-white focus:ring-4 focus:ring-emerald-100"
+                autoComplete="new-password"
+              />
+            </div>
+
+            {error ? (
+              <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-900">
+                {error}
+              </div>
+            ) : null}
+
+            <button
+              type="submit"
+              disabled={busy}
+              className="w-full rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-extrabold text-white shadow-sm transition hover:bg-emerald-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy ? "Creating account…" : "Create account"}
+            </button>
+          </form>
+
+          <p className="mt-5 text-center text-sm font-semibold text-slate-600">
+            Already have an account?{" "}
+            <Link
+              to="/login"
+              className="font-extrabold text-emerald-700 hover:text-emerald-800"
+            >
+              Log in
+            </Link>
+          </p>
+        </div>
+
+        <p className="mt-5 text-center text-xs font-semibold text-slate-500">
+          Golf-only leagues, scores and banter.
+        </p>
+      </div>
     </div>
   );
 }
-
-
