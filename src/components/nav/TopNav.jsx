@@ -4,16 +4,15 @@ import { useAuth } from "../../auth/useAuth";
 import { signOut, hardSignOut } from "../../auth/auth";
 
 const main = [
-  { to: "/", label: "Feed" },
   { to: "/leagues", label: "Leagues" },
-  { to: "/post", label: "Post" },
+  { to: "/post", label: "Post Round" },
   { to: "/friends", label: "Friends" },
   { to: "/profile", label: "Profile" },
 ];
 
 const secondary = [
   { to: "/rules", label: "Rules", icon: "📜" },
-  { to: "/majors", label: "Majors", icon: "🏟️" },
+  { to: "/majors", label: "Majors", icon: "🏆" },
 ];
 
 function isActivePath(to, pathname) {
@@ -22,127 +21,153 @@ function isActivePath(to, pathname) {
 }
 
 function isAuthRoute(pathname) {
-  return pathname === "/login" || pathname === "/signup";
+  return (
+    pathname === "/login" ||
+    pathname === "/signup" ||
+    pathname === "/forgot-password" ||
+    pathname === "/reset-password"
+  );
 }
 
 export default function TopNav() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
-  const { user, loading } = useAuth();
+  const { user, loading, profile } = useAuth();
 
-  // Hide top nav on auth pages (cleaner auth UI)
   if (isAuthRoute(pathname)) return null;
 
-  const handleLogout = async () => {
+  const displayName =
+    profile?.display_name ||
+    profile?.username ||
+    user?.email?.split("@")?.[0] ||
+    "Golfer";
+
+  const initial = String(displayName).charAt(0).toUpperCase();
+
+  async function handleLogout() {
     try {
       await signOut();
-      // Replace so you can’t “Back” into protected pages
       navigate("/login", { replace: true });
-    } catch (e) {
-      console.error("Logout failed, forcing hard sign out:", e);
-      // ✅ guaranteed cleanup + redirect
+    } catch (error) {
+      console.error("Logout failed, forcing hard sign out:", error);
       await hardSignOut();
     }
-  };
+  }
 
   return (
-    <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/92 backdrop-blur">
+    <header className="sticky top-0 z-40 border-b border-slate-200/80 bg-white/95 shadow-sm backdrop-blur-xl">
       <div className="mx-auto w-full max-w-3xl px-4 py-3 sm:px-5">
         <div className="flex items-center justify-between gap-3">
-          {/* Brand */}
-          <div className="flex items-center gap-2">
-            <div className="relative grid h-9 w-9 place-items-center rounded-xl bg-emerald-600 text-white shadow-sm ring-1 ring-emerald-700/20">
+          <NavLink
+            to="/leagues"
+            className="flex min-w-0 items-center gap-3"
+          >
+            <div className="relative grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-2xl bg-emerald-600 text-lg text-white shadow-sm ring-1 ring-emerald-700/20">
               <span className="relative z-10">⛳</span>
-              <span className="pointer-events-none absolute inset-0 rounded-xl bg-gradient-to-b from-white/20 to-transparent" />
+              <span className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/25 to-transparent" />
             </div>
 
-            <div className="leading-tight">
-              <div className="text-sm font-extrabold tracking-tight text-slate-900">
+            <div className="min-w-0 leading-tight">
+              <div className="truncate text-sm font-black tracking-tight text-slate-950">
                 Golfers Unite
               </div>
-              <div className="text-[11px] font-semibold text-slate-500">
-                Golf-only banter & leagues
+
+              <div className="truncate text-[11px] font-semibold text-slate-500">
+                Leagues, scores and banter
               </div>
             </div>
-          </div>
+          </NavLink>
 
-          {/* Right side actions */}
           <div className="flex items-center gap-2">
-            {secondary.map((l) => {
-              const active = isActivePath(l.to, pathname);
-              return (
+            <div className="hidden items-center gap-2 sm:flex">
+              {secondary.map((item) => {
+                const active = isActivePath(item.to, pathname);
+
+                return (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    className={[
+                      "inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
+                      active
+                        ? "bg-emerald-600 text-white ring-emerald-600 shadow-sm"
+                        : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
+                    ].join(" ")}
+                  >
+                    <span className="text-sm leading-none">
+                      {item.icon}
+                    </span>
+                    {item.label}
+                  </NavLink>
+                );
+              })}
+            </div>
+
+            {user ? (
+              <>
                 <NavLink
-                  key={l.to}
-                  to={l.to}
+                  to="/profile"
+                  aria-label="Open profile"
+                  className="grid h-9 w-9 place-items-center rounded-full bg-slate-900 text-xs font-black text-white shadow-sm ring-2 ring-white"
+                >
+                  {initial}
+                </NavLink>
+
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  disabled={loading}
                   className={[
-                    "inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
-                    active
-                      ? "bg-emerald-600 text-white ring-emerald-600"
+                    "hidden rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition sm:inline-flex",
+                    loading
+                      ? "cursor-not-allowed bg-slate-100 text-slate-400 ring-slate-200"
                       : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
                   ].join(" ")}
                 >
-                  <span className="text-sm leading-none">{l.icon}</span>
-                  {l.label}
-                </NavLink>
-              );
-            })}
-
-            {!user ? (
+                  Log out
+                </button>
+              </>
+            ) : (
               <NavLink
                 to="/login"
-                className="inline-flex items-center rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white ring-1 ring-slate-900 transition hover:opacity-95"
+                className="inline-flex items-center rounded-full bg-slate-900 px-3 py-2 text-xs font-extrabold text-white shadow-sm transition hover:bg-slate-800"
               >
                 Log in
               </NavLink>
-            ) : (
-              <button
-                type="button"
-                onClick={handleLogout}
-                disabled={loading}
-                className={[
-                  "inline-flex items-center rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
-                  loading
-                    ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
-                    : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
-                ].join(" ")}
-              >
-                Log out
-              </button>
             )}
           </div>
         </div>
 
-        {/* Desktop main nav (only useful when logged in) */}
-        <div className="mt-3 hidden md:flex items-center gap-2">
-          {main.map((l) => {
-            const active = isActivePath(l.to, pathname);
-            if (!user) return null;
+        {user ? (
+          <div className="mt-3 hidden items-center gap-2 md:flex">
+            {main.map((item) => {
+              const active = isActivePath(item.to, pathname);
 
-            return (
-              <NavLink
-                key={l.to}
-                to={l.to}
-                className={[
-                  "rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
-                  active
-                    ? "bg-slate-900 text-white ring-slate-900"
-                    : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
-                ].join(" ")}
-              >
-                {l.label}
-              </NavLink>
-            );
-          })}
-        </div>
+              return (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  className={[
+                    "rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
+                    active
+                      ? "bg-slate-900 text-white ring-slate-900 shadow-sm"
+                      : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
+                  ].join(" ")}
+                >
+                  {item.label}
+                </NavLink>
+              );
+            })}
+
+            <div className="ml-auto text-xs font-semibold text-slate-500">
+              Signed in as{" "}
+              <span className="font-extrabold text-slate-800">
+                {displayName}
+              </span>
+            </div>
+          </div>
+        ) : null}
       </div>
-
-      <div className="pointer-events-none h-px w-full bg-gradient-to-r from-transparent via-slate-200 to-transparent" />
     </header>
   );
 }
-
-
-
-
-
-
