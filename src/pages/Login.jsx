@@ -51,7 +51,6 @@ export default function Login() {
 
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-
   const [authStuck, setAuthStuck] = useState(false);
 
   useEffect(() => {
@@ -118,103 +117,129 @@ export default function Login() {
 
   if (showLoadingGate) {
     return (
-      <div className="mx-auto mt-10 max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <p className="text-sm font-semibold text-slate-900">
-          Loading…
-        </p>
+      <div className="min-h-screen bg-slate-100 px-4 py-10">
+        <div className="mx-auto max-w-sm rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <p className="text-sm font-extrabold text-slate-900">
+            Loading…
+          </p>
 
-        <p className="mt-1 text-xs text-slate-600">
-          Just setting things up.
-        </p>
+          <p className="mt-1 text-xs font-semibold text-slate-600">
+            Just setting things up.
+          </p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="mx-auto mt-10 max-w-sm rounded-2xl bg-white p-6 shadow-sm">
-      <h1 className="text-xl font-semibold text-slate-900">
-        Welcome back
-      </h1>
+    <div className="relative min-h-screen overflow-hidden bg-slate-100 px-4 py-8 sm:py-12">
+      <div className="pointer-events-none absolute -top-36 left-1/2 h-[420px] w-[420px] -translate-x-1/2 rounded-full bg-emerald-500/10 blur-3xl" />
 
-      <p className="mt-1 text-sm text-slate-600">
-        Log in to post rounds and talk golf.
-      </p>
+      <div className="relative mx-auto w-full max-w-sm">
+        <div className="mb-6 flex flex-col items-center text-center">
+          <div className="relative grid h-16 w-16 place-items-center overflow-hidden rounded-3xl bg-emerald-600 text-3xl text-white shadow-lg ring-1 ring-emerald-700/20">
+            <span className="relative z-10">⛳</span>
+            <span className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/25 to-transparent" />
+          </div>
 
-      {authStuck ? (
-        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">
-          Auth is taking longer than expected. You can still log in.
-          This usually recovers after a refresh.
-        </div>
-      ) : null}
+          <h1 className="mt-4 text-2xl font-black tracking-tight text-slate-950">
+            Welcome back
+          </h1>
 
-      <form
-        onSubmit={handleSubmit}
-        className="mt-6 space-y-4"
-      >
-        <input
-          type="email"
-          required
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          autoComplete="email"
-          inputMode="email"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-        />
-
-        <input
-          type="password"
-          required
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          autoComplete="current-password"
-        />
-
-        <div className="text-right">
-          <Link
-            to="/forgot-password"
-            className="text-sm font-semibold text-emerald-600 hover:text-emerald-700"
-          >
-            Forgot password?
-          </Link>
-        </div>
-
-        {error ? (
-          <p className="text-sm text-red-600">
-            {error}
+          <p className="mt-2 max-w-xs text-sm font-semibold leading-6 text-slate-600">
+            Log in to manage your leagues, submit rounds and join the golf banter.
           </p>
-        ) : null}
+        </div>
 
-        <button
-          type="submit"
-          disabled={busy}
-          className="w-full rounded-xl bg-emerald-600 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
-        >
-          {busy ? "Logging in…" : "Log in"}
-        </button>
-      </form>
+        <div className="rounded-3xl border border-slate-200/80 bg-white p-6 shadow-[0_20px_50px_rgba(15,23,42,0.10)]">
+          {authStuck ? (
+            <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold leading-5 text-amber-900">
+              Authentication is taking longer than expected. You can still try logging in.
+            </div>
+          ) : null}
 
-      <p className="mt-4 text-sm text-slate-600">
-        New here?{" "}
-        <Link
-          to="/signup"
-          className="font-semibold text-emerald-600"
-        >
-          Create an account
-        </Link>
-      </p>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+                Email
+              </label>
 
-      {busy ? (
-        <p className="mt-3 text-xs font-semibold text-slate-500">
-          Signing you in… if this takes more than a few seconds,
-          refresh the page.
+              <input
+                type="email"
+                required
+                placeholder="you@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:bg-white focus:ring-4 focus:ring-emerald-100"
+                autoComplete="email"
+                inputMode="email"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between gap-3">
+                <label className="text-xs font-extrabold uppercase tracking-wide text-slate-500">
+                  Password
+                </label>
+
+                <Link
+                  to="/forgot-password"
+                  className="text-xs font-extrabold text-emerald-700 hover:text-emerald-800"
+                >
+                  Forgot password?
+                </Link>
+              </div>
+
+              <input
+                type="password"
+                required
+                placeholder="Enter your password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-400 focus:bg-white focus:ring-4 focus:ring-emerald-100"
+                autoComplete="current-password"
+              />
+            </div>
+
+            {error ? (
+              <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-900">
+                {error}
+              </div>
+            ) : null}
+
+            <button
+              type="submit"
+              disabled={busy}
+              className="w-full rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-extrabold text-white shadow-sm transition hover:bg-emerald-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy ? "Logging in…" : "Log in"}
+            </button>
+          </form>
+
+          <p className="mt-5 text-center text-sm font-semibold text-slate-600">
+            New to Golfers Unite?{" "}
+            <Link
+              to="/signup"
+              className="font-extrabold text-emerald-700 hover:text-emerald-800"
+            >
+              Create an account
+            </Link>
+          </p>
+
+          {busy ? (
+            <p className="mt-3 text-center text-xs font-semibold text-slate-500">
+              Signing you in…
+            </p>
+          ) : null}
+        </div>
+
+        <p className="mt-5 text-center text-xs font-semibold text-slate-500">
+          Golf-only leagues, scores and banter.
         </p>
-      ) : null}
+      </div>
     </div>
   );
 }
