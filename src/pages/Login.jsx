@@ -8,15 +8,26 @@ import { supabase } from "../lib/supabaseClient";
 function humanAuthError(message) {
   const msg = String(message || "").toLowerCase();
 
-  if (msg.includes("invalid login credentials")) return "Email or password is incorrect.";
-  if (msg.includes("email not confirmed")) return "Please confirm your email before logging in.";
-  if (msg.includes("too many requests")) return "Too many attempts. Try again in a moment.";
+  if (msg.includes("invalid login credentials")) {
+    return "Email or password is incorrect.";
+  }
+
+  if (msg.includes("email not confirmed")) {
+    return "Please confirm your email before logging in.";
+  }
+
+  if (msg.includes("too many requests")) {
+    return "Too many attempts. Try again in a moment.";
+  }
+
   if (msg.includes("network") || msg.includes("failed to fetch")) {
     return "Network issue — check your connection and try again.";
   }
+
   if (msg.includes("no session")) {
-    return "Login didn’t stick (no session created). Refresh and try again — if it keeps happening, we’ll fix the auth storage/redirect.";
+    return "Login didn’t stick. Refresh and try again.";
   }
+
   return "Login failed. Please try again.";
 }
 
@@ -27,7 +38,11 @@ export default function Login() {
 
   const fromPath = useMemo(() => {
     const maybe = location.state?.from?.pathname;
-    if (!maybe || maybe === "/login" || maybe === "/signup") return "/";
+
+    if (!maybe || maybe === "/login" || maybe === "/signup") {
+      return "/";
+    }
+
     return maybe;
   }, [location.state]);
 
@@ -37,7 +52,6 @@ export default function Login() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // ✅ If auth bootstrap hangs, don’t block the login screen forever
   const [authStuck, setAuthStuck] = useState(false);
 
   useEffect(() => {
@@ -46,73 +60,97 @@ export default function Login() {
       return;
     }
 
-    const t = setTimeout(() => {
+    const timer = setTimeout(() => {
       setAuthStuck(true);
     }, 3500);
 
-    return () => clearTimeout(t);
+    return () => clearTimeout(timer);
   }, [loading]);
 
-  // ✅ Redirect only when we truly have a user
   useEffect(() => {
     if (user) {
       navigate(fromPath, { replace: true });
     }
   }, [user, navigate, fromPath]);
 
-  const handleSubmit = async (e) => {
+  async function handleSubmit(e) {
     e.preventDefault();
+
     if (busy) return;
 
-    const e1 = email.trim();
-    if (!e1 || !password) return;
+    const cleanEmail = email.trim();
+
+    if (!cleanEmail || !password) {
+      setError("Enter your email and password.");
+      return;
+    }
 
     setError("");
     setBusy(true);
 
     try {
-      await signIn({ email: e1, password });
+      await signIn({
+        email: cleanEmail,
+        password,
+      });
 
-      // ✅ Sanity check: confirm we actually have a Supabase session.
-      // This prevents “sign in succeeded but user stays null forever”.
-      const { data } = await supabase.auth.getSession();
+      const { data, error: sessionError } =
+        await supabase.auth.getSession();
+
+      if (sessionError) {
+        throw sessionError;
+      }
+
       if (!data?.session) {
         throw new Error("No session created after login");
       }
 
-      // ✅ Do NOT navigate here. AuthProvider will set user, then effect redirects.
-      // However, if AuthProvider is slow, we allow the UI to stay responsive:
-      // busy remains true briefly, then we release after a short delay.
-      setTimeout(() => setBusy(false), 1200);
+      setTimeout(() => {
+        setBusy(false);
+      }, 1200);
     } catch (err) {
       setError(humanAuthError(err?.message));
       setBusy(false);
     }
-  };
+  }
 
   const showLoadingGate = loading && !authStuck;
 
   if (showLoadingGate) {
     return (
       <div className="mx-auto mt-10 max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <p className="text-sm font-semibold text-slate-900">Loading…</p>
-        <p className="mt-1 text-xs text-slate-600">Just setting things up.</p>
+        <p className="text-sm font-semibold text-slate-900">
+          Loading…
+        </p>
+
+        <p className="mt-1 text-xs text-slate-600">
+          Just setting things up.
+        </p>
       </div>
     );
   }
 
   return (
     <div className="mx-auto mt-10 max-w-sm rounded-2xl bg-white p-6 shadow-sm">
-      <h1 className="text-xl font-semibold text-slate-900">Welcome back</h1>
-      <p className="mt-1 text-sm text-slate-600">Log in to post rounds and talk golf.</p>
+      <h1 className="text-xl font-semibold text-slate-900">
+        Welcome back
+      </h1>
+
+      <p className="mt-1 text-sm text-slate-600">
+        Log in to post rounds and talk golf.
+      </p>
 
       {authStuck ? (
         <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">
-          Auth is taking longer than expected. You can still log in — this usually recovers after a refresh.
+          Auth is taking longer than expected. You can still log in.
+          This usually recovers after a refresh.
         </div>
       ) : null}
 
-      <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+      <form
+        onSubmit={handleSubmit}
+        className="mt-6 space-y-4"
+      >
         <input
           type="email"
           required
@@ -137,9 +175,23 @@ export default function Login() {
           autoComplete="current-password"
         />
 
-        {error ? <p className="text-sm text-red-600">{error}</p> : null}
+        <div className="text-right">
+          <Link
+            to="/forgot-password"
+            className="text-sm font-semibold text-emerald-600 hover:text-emerald-700"
+          >
+            Forgot password?
+          </Link>
+        </div>
+
+        {error ? (
+          <p className="text-sm text-red-600">
+            {error}
+          </p>
+        ) : null}
 
         <button
+          type="submit"
           disabled={busy}
           className="w-full rounded-xl bg-emerald-600 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
         >
@@ -149,14 +201,18 @@ export default function Login() {
 
       <p className="mt-4 text-sm text-slate-600">
         New here?{" "}
-        <Link to="/signup" className="font-semibold text-emerald-600">
+        <Link
+          to="/signup"
+          className="font-semibold text-emerald-600"
+        >
           Create an account
         </Link>
       </p>
 
       {busy ? (
         <p className="mt-3 text-xs font-semibold text-slate-500">
-          Signing you in… if this takes more than a few seconds, refresh the page.
+          Signing you in… if this takes more than a few seconds,
+          refresh the page.
         </p>
       ) : null}
     </div>
