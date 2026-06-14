@@ -72,13 +72,13 @@ export default function TopNav() {
                 Golfers Unite
               </div>
 
-              <div className="truncate text-[11px] font-semibold text-slate-500">
+              <div className="hidden truncate text-[11px] font-semibold text-slate-500 sm:block">
                 Leagues, scores and banter
               </div>
             </div>
           </NavLink>
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <div className="hidden items-center gap-2 sm:flex">
               {secondary.map((item) => {
                 const active = isActivePath(item.to, pathname);
@@ -108,7 +108,7 @@ export default function TopNav() {
                 <NavLink
                   to="/profile"
                   aria-label="Open profile"
-                  className="grid h-9 w-9 place-items-center rounded-full bg-slate-900 text-xs font-black text-white shadow-sm ring-2 ring-white"
+                  className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-900 text-xs font-black text-white shadow-sm ring-2 ring-white"
                 >
                   {initial}
                 </NavLink>
@@ -118,7 +118,7 @@ export default function TopNav() {
                   onClick={handleLogout}
                   disabled={loading}
                   className={[
-                    "hidden rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition sm:inline-flex",
+                    "inline-flex shrink-0 items-center rounded-full px-3 py-2 text-xs font-extrabold ring-1 transition",
                     loading
                       ? "cursor-not-allowed bg-slate-100 text-slate-400 ring-slate-200"
                       : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50",
