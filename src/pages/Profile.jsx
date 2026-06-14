@@ -366,43 +366,70 @@ export default function Profile() {
       : String(handicap);
 
   async function saveProfile() {
-    if (!myId) return;
+  if (!myId) return;
 
-    const nextName = String(draftName || "").trim();
-    const nextHandicapRaw = String(draftHandicap || "").trim();
-    const nextHandicap = nextHandicapRaw === "" ? null : safeNum(nextHandicapRaw, null);
+  const nextName = String(draftName || "").trim();
+  const nextHandicapRaw = String(draftHandicap || "").trim();
 
-    if (!nextName) {
-      setStatus({ type: "error", message: "Display name can’t be empty." });
-      return;
-    }
+  const nextHandicap =
+    nextHandicapRaw === ""
+      ? null
+      : Number(nextHandicapRaw.replace(",", "."));
 
-    setSaveLoading(true);
-    setStatus({ type: "", message: "" });
-
-    try {
-      const payload = {
-        id: myId,
-        display_name: nextName,
-        handicap_index: nextHandicap,
-      };
-
-      const { error } = await supabase.from("profiles").upsert(payload, { onConflict: "id" });
-
-      if (error) throw error;
-
-      await fetchLiveProfile();
-      await refreshProfile(myId);
-
-      setEditing(false);
-      setStatus({ type: "success", message: "Profile updated ✅" });
-    } catch (e) {
-      setStatus({ type: "error", message: humanErr(e) });
-    } finally {
-      setSaveLoading(false);
-    }
+  if (!nextName) {
+    setStatus({
+      type: "error",
+      message: "Display name can’t be empty.",
+    });
+    return;
   }
 
+  if (
+    nextHandicapRaw !== "" &&
+    !Number.isFinite(nextHandicap)
+  ) {
+    setStatus({
+      type: "error",
+      message: "Enter a valid handicap number.",
+    });
+    return;
+  }
+
+  setSaveLoading(true);
+  setStatus({ type: "", message: "" });
+
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .update({
+        display_name: nextName,
+        handicap_index: nextHandicap,
+      })
+      .eq("id", myId)
+      .select("id, username, display_name, handicap_index")
+      .single();
+
+    if (error) throw error;
+
+    setLiveProfile(data);
+
+    await refreshProfile(myId);
+
+    setEditing(false);
+
+    setStatus({
+      type: "success",
+      message: "Profile updated ✅",
+    });
+  } catch (e) {
+    setStatus({
+      type: "error",
+      message: humanErr(e),
+    });
+  } finally {
+    setSaveLoading(false);
+  }
+}
   async function deleteMyAccountData() {
     if (!myId) return;
 
